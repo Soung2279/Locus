@@ -130,3 +130,6 @@ ref
 AGENTS.md
 !prompt/python-sdk/agents.md
 testproject/
+
+# Local development notes
+/docs/development/

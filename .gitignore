@@ -79,6 +79,7 @@ site/
 .venv/
 .venv-docs/
 docs/.home.html
+/docs/development/
 src-tauri/gen/managed-python/windows-*/
 src-tauri/gen/managed-python/manifest.json
 src-tauri/gen/managed-python/pip.pyz

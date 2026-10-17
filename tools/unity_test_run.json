@@ -22,12 +22,12 @@
       "groups": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Optional Unity Test Framework group-name regular expressions."
+        "description": "Optional Unity Test Framework group-name regular expressions. Prefix with ! to exclude; anchor with ^...$ for one exact fixture or test (unanchored patterns also select [Explicit] tests)."
       },
       "categories": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Optional NUnit category names."
+        "description": "Optional NUnit category names. Prefix with ! to exclude, e.g. !SceneCombatE2E."
       },
       "timeout_ms": {
         "type": "integer",

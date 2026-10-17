@@ -607,7 +607,7 @@ namespace Locus.UnityTesting
                         root,
                         "",
                         new List<string>(),
-                        true,
+                        0,
                         modeName,
                         request,
                         response,
@@ -626,7 +626,7 @@ namespace Locus.UnityTesting
             ITestAdaptor node,
             string assemblyName,
             List<string> suitePath,
-            bool isRoot,
+            int depth,
             string modeName,
             UnityTestFilterRequest request,
             UnityTestListDto response,
@@ -634,17 +634,20 @@ namespace Locus.UnityTesting
         {
             if (node == null)
                 return;
-            if (node.IsTestAssembly)
+            if (IsAssemblySuite(node, depth))
             {
                 assemblyName = TrimAssemblyExtension(node.Name);
                 suitePath = new List<string>();
             }
-            else if (!isRoot && node.IsSuite && !string.IsNullOrWhiteSpace(node.Name))
+            else if (depth > 0 && node.IsSuite && !string.IsNullOrWhiteSpace(node.Name))
             {
                 suitePath = new List<string>(suitePath) { node.Name };
             }
 
-            if (!node.IsSuite && Matches(node, assemblyName, request))
+            string testAssemblyName = node.IsSuite
+                ? assemblyName
+                : ResolveTestAssemblyName(node, assemblyName);
+            if (!node.IsSuite && Matches(node, testAssemblyName, request))
             {
                 response.matched++;
                 if (response.tests.Count < maxResults)
@@ -656,7 +659,7 @@ namespace Locus.UnityTesting
                     {
                         name = node.Name ?? "",
                         full_name = node.FullName ?? node.Name ?? "",
-                        assembly = assemblyName ?? "",
+                        assembly = testAssemblyName ?? "",
                         mode = modeName,
                         path = testPath.ToArray(),
                         categories = node.Categories ?? new string[0]
@@ -675,11 +678,54 @@ namespace Locus.UnityTesting
                     child,
                     assemblyName,
                     suitePath,
-                    false,
+                    depth + 1,
                     modeName,
                     request,
                     response,
                     maxResults);
+        }
+
+        // NUnit replaces an assembly's TestAssembly suite with its global-namespace
+        // [SetUpFixture]. The replacement keeps the "*.dll" name below the project
+        // root but reports IsTestAssembly=false.
+        private static bool IsAssemblySuite(ITestAdaptor node, int depth)
+        {
+            if (node.IsTestAssembly)
+                return true;
+            return depth == 1 &&
+                   node.IsSuite &&
+                   (node.Name ?? "").Trim().EndsWith(".dll", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Falls back to the declaring type's assembly, the same source used by the
+        // Unity Test Framework assembly filter. Reflection keeps this assembly free of
+        // a compile-time NUnit reference.
+        private static readonly System.Reflection.PropertyInfo TestTypeInfoProperty =
+            typeof(ITestAdaptor).GetProperty("TypeInfo");
+        private static readonly Dictionary<Type, System.Reflection.PropertyInfo> TypeInfoAssemblyProperties =
+            new Dictionary<Type, System.Reflection.PropertyInfo>();
+
+        private static string ResolveTestAssemblyName(ITestAdaptor test, string inheritedAssemblyName)
+        {
+            if (!string.IsNullOrEmpty(inheritedAssemblyName))
+                return inheritedAssemblyName;
+            try
+            {
+                object typeInfo = TestTypeInfoProperty?.GetValue(test);
+                if (typeInfo == null)
+                    return "";
+                Type typeInfoType = typeInfo.GetType();
+                if (!TypeInfoAssemblyProperties.TryGetValue(typeInfoType, out System.Reflection.PropertyInfo property))
+                {
+                    property = typeInfoType.GetProperty("Assembly");
+                    TypeInfoAssemblyProperties[typeInfoType] = property;
+                }
+                return (property?.GetValue(typeInfo) as System.Reflection.Assembly)?.GetName().Name ?? "";
+            }
+            catch (Exception)
+            {
+                return "";
+            }
         }
 
         private static bool Matches(
@@ -695,17 +741,39 @@ namespace Locus.UnityTesting
             if (HasValues(request.tests) &&
                 !request.tests.Any(value => string.Equals(value, fullName, StringComparison.Ordinal)))
                 return false;
-            if (HasValues(request.groups) &&
-                !request.groups.Any(pattern => Regex.IsMatch(fullName, pattern)))
+            if (!MatchesIncludeExclude(request.groups, pattern => Regex.IsMatch(fullName, pattern)))
                 return false;
-            if (HasValues(request.categories))
-            {
-                string[] categories = test.Categories ?? new string[0];
-                if (!request.categories.Any(expected => categories.Any(actual =>
+            string[] categories = test.Categories ?? new string[0];
+            if (!MatchesIncludeExclude(request.categories, expected => categories.Any(actual =>
                     string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase))))
-                    return false;
-            }
+                return false;
             return true;
+        }
+
+        // Mirrors the Unity Test Framework run filter: values prefixed with "!" exclude,
+        // the remaining values include (any). Only exclusions means "everything except".
+        private static bool MatchesIncludeExclude(string[] values, Func<string, bool> matches)
+        {
+            if (!HasValues(values))
+                return true;
+            bool hasInclusion = false;
+            bool included = false;
+            foreach (string value in values)
+            {
+                if (string.IsNullOrWhiteSpace(value))
+                    continue;
+                if (value.StartsWith("!", StringComparison.Ordinal))
+                {
+                    if (matches(value.Substring(1)))
+                        return false;
+                }
+                else
+                {
+                    hasInclusion = true;
+                    included |= matches(value);
+                }
+            }
+            return !hasInclusion || included;
         }
 
         private static Filter BuildFilter(UnityTestFilterRequest request, TestMode mode)
@@ -828,7 +896,7 @@ namespace Locus.UnityTesting
             foreach (string pattern in patterns)
             {
                 if (!string.IsNullOrWhiteSpace(pattern))
-                    _ = new Regex(pattern);
+                    _ = new Regex(pattern.StartsWith("!", StringComparison.Ordinal) ? pattern.Substring(1) : pattern);
             }
         }
 

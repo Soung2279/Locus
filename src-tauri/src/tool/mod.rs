@@ -2,6 +2,7 @@ pub mod builtins;
 pub(crate) mod apply_patch;
 pub(crate) mod failure_log;
 pub(crate) mod output;
+pub(crate) mod path;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -20,6 +21,30 @@ pub struct ToolResult {
 #[derive(Debug, Default)]
 pub struct ToolRuntimeState;
 
+/// One structured progress step for the live tool-call panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolProgressUpdate {
+    pub title: String,
+    pub info: String,
+    /// Completion ratio in `0.0..=1.0`; `None` renders an indeterminate stage.
+    pub progress: Option<f32>,
+}
+
+impl ToolProgressUpdate {
+    /// One-line rendering used for text-only async task progress.
+    pub fn summary_text(&self) -> String {
+        let title = self.title.trim();
+        let info = self.info.trim();
+        match (title.is_empty(), info.is_empty()) {
+            (false, false) => format!("{title}: {info}"),
+            (false, true) => title.to_string(),
+            (true, _) => info.to_string(),
+        }
+    }
+}
+
+pub type ToolProgressReporter = Arc<dyn Fn(ToolProgressUpdate) + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct ToolExecutionContext {
     pub app_handle: Option<AppHandle>,
@@ -29,7 +54,10 @@ pub struct ToolExecutionContext {
     pub unity_connected: Option<bool>,
     pub runtime_state: Option<Arc<ToolRuntimeState>>,
     pub cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Text progress of a background async task.
     pub progress: Option<crate::async_tasks::TaskProgressReporter>,
+    /// Structured progress of a foreground tool call (title/info/ratio).
+    pub tool_progress: Option<ToolProgressReporter>,
     pub output: Option<crate::async_tasks::TaskOutputReporter>,
     pub output_path: Option<std::path::PathBuf>,
     pub background: bool,
@@ -44,6 +72,24 @@ impl ToolExecutionContext {
         if let Some(report) = self.progress.as_ref() {
             report(progress.into());
         }
+    }
+
+    /// Structured progress sink feeding the live tool-call panel and, for
+    /// background tasks, a one-line text rendering of the same step.
+    pub fn structured_progress(&self) -> Option<ToolProgressReporter> {
+        let task_progress = self.progress.clone();
+        let tool_progress = self.tool_progress.clone();
+        if task_progress.is_none() && tool_progress.is_none() {
+            return None;
+        }
+        Some(Arc::new(move |update: ToolProgressUpdate| {
+            if let Some(report) = task_progress.as_ref() {
+                report(update.summary_text());
+            }
+            if let Some(report) = tool_progress.as_ref() {
+                report(update);
+            }
+        }))
     }
 
     pub fn should_redirect_unity_asset_read(&self, file_path: &str) -> bool {
@@ -415,21 +461,42 @@ impl ToolRegistry {
         if let Some(execution) = context.execution.as_ref() {
             context.working_dir = Some(execution.root().to_string_lossy().to_string());
         }
+        if let Some(scope)=crate::llm::claude_code_cli::native_scope::NativeInvocation::current() {
+            if scope.call.locus_name==name && matches!(scope.call.tool.as_str(),"Write"|"Glob"|"Grep"|"TaskOutput"|"TaskStop") {
+                return crate::llm::claude_code_cli::native_executor::execute(self,context,scope).await;
+            }
+        }
         let project = context.working_dir.clone().unwrap_or_default();
         let cancel = context.cancel_rx.clone();
+        // A Unity main-thread call (running or queued) ends as soon as the user
+        // restarts that hung Editor, carrying the hang diagnosis to the agent.
+        let user_restart = (!project.trim().is_empty()
+            && (name == "unity_execute"
+                || crate::agent::tool_execution_policy::needs_unity_execution_barrier(name, arguments)))
+            .then(|| crate::unity_bridge::hang_diagnosis::user_restart_interruption(&project));
         crate::agent::unity_execution_scope::run(
             &project, name, arguments, cancel, context.background, async {
-                match self.get(name) {
-                    Some(def) => (def.execute)(arguments.clone(), context).await,
-                    None => match crate::commands::execute_skill_package_tool_by_api_name(
-                        name, arguments.clone(), context,
-                    ).await {
-                        Some(result) => result,
-                        None => ToolResult {
-                            output: format!("Tool '{}' not found", name),
-                            is_error: true,
+                let work = async {
+                    match self.get(name) {
+                        Some(def) => (def.execute)(arguments.clone(), context).await,
+                        None => match crate::commands::execute_skill_package_tool_by_api_name(
+                            name, arguments.clone(), context,
+                        ).await {
+                            Some(result) => result,
+                            None => ToolResult {
+                                output: format!("Tool '{}' not found", name),
+                                is_error: true,
+                            },
                         },
+                    }
+                };
+                match user_restart {
+                    Some(user_restart) => tokio::select! {
+                        biased;
+                        result = work => result,
+                        message = user_restart => ToolResult { output: message, is_error: true },
                     },
+                    None => work.await,
                 }
             },
         ).await.unwrap_or_else(|error| ToolResult { output: error.into(), is_error: true })

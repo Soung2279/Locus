@@ -654,7 +654,9 @@ async fn execute_workspace_tool(
 ) -> ToolCallOutcome {
     match crate::agent::unity_execution_scope::run(
         working_dir, name, arguments, None, false,
-        execute_workspace_tool_inner(app, name, arguments, working_dir, execution, tool_registry, runtime_state),
+        // Match the Agent entry: the execution scope must not embed every
+        // concrete tool Future in its own state machine.
+        Box::pin(execute_workspace_tool_inner(app, name, arguments, working_dir, execution, tool_registry, runtime_state)),
     ).await {
         Ok(outcome) => outcome,
         Err(error) => outcome_from_tool_result(err(error), None),
@@ -764,12 +766,12 @@ async fn execute_workspace_tool_inner(
                 .core()
                 .refresh_asset_db_if_missing(execution.root());
             outcome_from_tool_result(
-                AgentInstance::execute_unity_yaml_search(
+                Box::pin(AgentInstance::execute_unity_yaml_search(
                     app,
                     working_dir,
                     execution.workspace.core().asset_db(),
                     arguments,
-                )
+                ))
                 .await,
                 None,
             )
@@ -780,12 +782,12 @@ async fn execute_workspace_tool_inner(
                 .core()
                 .refresh_asset_db_if_missing(execution.root());
             outcome_from_tool_result(
-                AgentInstance::execute_unity_yaml_read(
+                Box::pin(AgentInstance::execute_unity_yaml_read(
                     app,
                     working_dir,
                     execution.workspace.core().asset_db(),
                     arguments,
-                )
+                ))
                 .await,
                 None,
             )
@@ -809,6 +811,7 @@ async fn execute_workspace_tool_inner(
                 runtime_state: Some(runtime_state),
                 cancel_rx: None,
                 progress: None,
+                tool_progress: None,
                 output: None,
                 output_path: None,
                 background: false,

@@ -390,6 +390,7 @@ pub(super) fn unity_test_run() -> ToolDef {
         mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
+                let progress = ctx.structured_progress();
                 let project_path = match ctx.working_dir {
                     Some(path) if !path.trim().is_empty() => path,
                     _ => {
@@ -419,7 +420,7 @@ pub(super) fn unity_test_run() -> ToolDef {
                     &args,
                     timeout,
                     ctx.cancel_rx,
-                    ctx.progress,
+                    progress,
                 )
                 .await
                 {
@@ -1207,14 +1208,25 @@ pub(super) fn unity_hot_reload() -> ToolDef {
         mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let project_path = match ctx.working_dir {
-                    Some(path) if !path.trim().is_empty() => path.trim().to_string(),
-                    _ => {
-                        return ToolResult {
-                            output: "Tool 'unity_hot_reload' requires a selected Unity project working directory.".to_string(),
-                            is_error: true,
-                        };
-                    }
+                let project_path = match super::code::require_workspace(&ctx) {
+                    Ok(path) => path,
+                    Err(result) => return result,
+                };
+
+                let paths = args
+                    .get("paths")
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str())
+                            .map(|path| super::filesystem::resolve_context_path(&ctx, path))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose();
+                let paths = match paths {
+                    Ok(paths) => paths,
+                    Err(result) => return result,
                 };
 
                 let (connected, _status, _scene) =
@@ -1225,17 +1237,6 @@ pub(super) fn unity_hot_reload() -> ToolDef {
                         is_error: true,
                     };
                 }
-
-                let paths = args
-                    .get("paths")
-                    .and_then(|value| value.as_array())
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(|value| value.as_str())
-                            .map(str::to_string)
-                            .collect::<Vec<_>>()
-                    });
 
                 match crate::code_tools::hot_reload_with_semantic_warnings(&project_path, paths)
                     .await
@@ -1264,7 +1265,7 @@ pub(super) fn unity_recompile() -> ToolDef {
         parameters: prompt.parameters,
         // Triggers compilation only; doesn't change tracked source files.
         mutates_workspace: false,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let claimed_status = match args.get("editor_status").and_then(|v| v.as_str()) {
                     Some(s) => s.to_string(),
@@ -1291,7 +1292,12 @@ pub(super) fn unity_recompile() -> ToolDef {
                 }
 
                 let project_path = match args.get("project_path").and_then(|v| v.as_str()) {
-                    Some(path) if !path.trim().is_empty() => path.trim().to_string(),
+                    Some(path) if !path.trim().is_empty() => {
+                        match super::filesystem::resolve_context_path(&ctx, path) {
+                            Ok(path) => path,
+                            Err(result) => return result,
+                        }
+                    },
                     _ => {
                         return ToolResult {
                             output: "Missing required parameter: project_path".to_string(),

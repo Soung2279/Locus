@@ -22,12 +22,12 @@
       "groups": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Optional regular expressions matching full test names, fixtures, or namespaces."
+        "description": "Optional regular expressions matching full test names, fixtures, or namespaces. Prefix with ! to exclude; anchor with ^...$ for one exact fixture or test."
       },
       "categories": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Optional NUnit category names."
+        "description": "Optional NUnit category names. Prefix with ! to exclude, e.g. !SceneCombatE2E."
       },
       "max_results": {
         "type": "integer",

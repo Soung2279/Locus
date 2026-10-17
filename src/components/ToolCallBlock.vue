@@ -16,7 +16,8 @@ import { t } from "../i18n";
 import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
 import { buildToolCallArgsSummary, toolCallDisplayName } from "./toolCallSummary";
 import { persistedOutputDisplay } from "./toolPersistedOutput";
-import { normalizeViewError, viewRun } from "../services/view";
+import { normalizeViewError } from "../services/view";
+import { useOpenView } from "../composables/useOpenView";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
@@ -61,6 +62,7 @@ const rootRef = ref<HTMLElement | null>(null);
 const headerRef = ref<HTMLElement | null>(null);
 const outputPre = ref<HTMLPreElement | null>(null);
 const notificationStore = useNotificationStore();
+const openViewPackage = useOpenView();
 const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
 const openFileInWorkbench = inject(WORKBENCH_FILE_OPEN_KEY, openWorkbenchFileTab);
@@ -369,8 +371,7 @@ const parsedArgs = computed(() => {
     if (typeof args !== "object" || args === null || Array.isArray(args)) return [];
     const isSubagent = props.toolCall.name === "subagent" || props.toolCall.name === "task";
     const isEdit = props.toolCall.name === "edit";
-    const isUnityTestTool = props.toolCall.name === "unity_test_list"
-      || props.toolCall.name === "unity_test_run";
+    const isUnityTestTool = props.toolCall.name === "unity_test_list";
     const editDiffKeys = ["oldString", "old_string", "newString", "new_string", "edits"];
     const unityTestFilterKeys = ["assemblies", "tests", "groups", "categories"];
     return Object.entries(args)
@@ -395,7 +396,7 @@ const parsedArgs = computed(() => {
 
 const rawArgsFallback = computed(() => {
   if (parsedArgs.value.length > 0) return "";
-  if (props.toolCall.name === "unity_test_list" || props.toolCall.name === "unity_test_run") {
+  if (props.toolCall.name === "unity_test_list") {
     try {
       const args = JSON.parse(props.toolCall.arguments);
       if (typeof args === "object" && args !== null && !Array.isArray(args)) return "";
@@ -460,7 +461,7 @@ async function openViewTool() {
   try {
     const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
     if (!workspaceRef) return;
-    await viewRun(workspaceRef, viewId);
+    await openViewPackage(workspaceRef, viewId);
   } catch (error) {
     const err = normalizeViewError(error);
     notificationStore.addNotice("error", err.message, {

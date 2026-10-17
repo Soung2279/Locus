@@ -4853,9 +4853,19 @@ pub fn read_skill_manifest_sync(
             .ok_or_else(|| format!("External skill not found: {}", dir_name))?;
         return super::skill_external::read_external_skill_manifest(&record);
     }
-    if source.unwrap_or("project") == "app" || source.unwrap_or("project").starts_with("plugin") {
+    let source = source.unwrap_or("project");
+    let document_path = resolve_skill_manifest_path_sync(
+        working_dir,
+        app_knowledge_dir,
+        dir_name,
+        Some(source),
+    );
+    // Project documents override same-name packages in list_skills_sync. Keep
+    // selection and reading consistent, while also supporting project packages.
+    let project_document = source == "project" && document_path.is_ok();
+    if !project_document && (matches!(source, "app" | "project") || source.starts_with("plugin")) {
         if let Ok(package_id) = normalize_package_id(dir_name) {
-            if let Ok(record) = find_skill_package_for_source(working_dir, &package_id, source) {
+            if let Ok(record) = find_skill_package_for_source(working_dir, &package_id, Some(source)) {
                 let root_doc = package_root_doc_rel_path(&record.manifest);
                 let path = package_file_path(&record.root, &root_doc)?;
                 return std::fs::read_to_string(&path)
@@ -4863,7 +4873,7 @@ pub fn read_skill_manifest_sync(
             }
         }
     }
-    let path = resolve_skill_manifest_path_sync(working_dir, app_knowledge_dir, dir_name, source)?;
+    let path = document_path?;
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to read skill: {}", e))
 }
 
@@ -8221,6 +8231,28 @@ Use Feishu safely.
         assert_eq!(
             resolved.storage_source,
             crate::knowledge_store::KnowledgeStorageSource::Project
+        );
+
+        let expected = std::fs::read_to_string(package_root.join("SKILL.md")).unwrap();
+        for source in [Some("project"), None] {
+            let content = read_skill_manifest_sync(&working_dir, None, "project-audit", source)
+                .expect("read the listed project package, including the default source");
+            assert_eq!(content, expected);
+        }
+        // An explicit app source must not silently select the project package.
+        assert!(read_skill_manifest_sync(&working_dir, None, "project-audit", Some("app")).is_err());
+
+        let document_dir = project.path().join("Locus/knowledge/skill");
+        std::fs::create_dir_all(&document_dir).unwrap();
+        let document = "---\nsummary: Override the project package.\n---\n\n# Project Audit\n\nUse the project document instead.\n";
+        std::fs::write(document_dir.join("project-audit.md"), document).unwrap();
+        let listed = list_skills_sync(&working_dir, None);
+        let selected = listed.iter().find(|skill| skill.dir_name == "project-audit").unwrap();
+        assert!(selected.package_id.is_none());
+        assert_eq!(selected.rel_path, "skill/project-audit.md");
+        assert_eq!(
+            read_skill_manifest_sync(&working_dir, None, "project-audit", Some("project")).unwrap(),
+            document,
         );
     }
 

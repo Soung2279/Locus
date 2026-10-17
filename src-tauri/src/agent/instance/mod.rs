@@ -9884,7 +9884,7 @@ impl AgentInstance {
         }
 
         format!(
-            "<system-reminder>\nThe user explicitly selected Skill workflows for this request. The injected Skill content is complete for the selected workflows. Use it directly.\n\n{}\n</system-reminder>",
+            "<system-reminder>\nThe user explicitly selected Skill workflows for this request. Each <selected-skill> block contains the complete workflow; use it directly. A <selected-skill-error> block means that workflow failed to load, not that its instructions were injected.\n\n{}\n</system-reminder>",
             blocks.join("\n\n"),
         )
     }
@@ -25909,11 +25909,56 @@ PrefabInstance:
     }
 
     #[test]
+    fn selected_skill_reminder_injects_project_package_content() {
+        let root = tempdir().unwrap();
+        let package = root.path().join("Locus/skills/create-release");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("skill.json"),
+            r#"{"schema":"locus.skill.v1","id":"create-release","name":"Create Release","version":"1.0.0","command":{"enabled":true,"trigger":"/create-release"}}"#,
+        ).unwrap();
+        let content = "---\nsummary: Prepare a release.\ntools:\n  - bash\n---\n\n# Create Release\n\nWait for approval before publishing.\n";
+        std::fs::write(package.join("SKILL.md"), content).unwrap();
+        let mut agent = test_agent_instance_with_prompts_and_app_knowledge_dir(
+            root.path().to_string_lossy().to_string(), "", "", None,
+        );
+        agent.tool_registry = Arc::new(ToolRegistry::with_builtins());
+        let mut intent = UserIntentPayload {
+            kind: "user_intent_v1".to_string(),
+            mode: "build".to_string(),
+            skills: vec![UserIntentSkill {
+                dir_name: "create-release".to_string(),
+                source: "project".to_string(),
+                name: "Create Release".to_string(),
+            }],
+            client_message_id: None,
+        };
+        let reminder = agent.build_selected_skill_reminder(&intent, "prepare a stable release");
+        assert!(reminder.contains("<selected-skill>\nName: Create Release\nSource: project\nPath: skill/create-release/SKILL.md"), "{reminder}");
+        assert!(reminder.contains(content.trim()), "{reminder}");
+        assert!(!reminder.contains("<selected-skill-error>\n"), "{reminder}");
+        assert_eq!(agent.selected_skill_package_ids(Some(&intent)), vec!["create-release"]);
+        assert!(agent.selected_skill_tool_names(Some(&intent)).contains("bash"));
+
+        intent.skills.push(UserIntentSkill {
+            dir_name: "missing-workflow".to_string(),
+            source: "project".to_string(),
+            name: "Missing Workflow".to_string(),
+        });
+        let mixed = agent.build_selected_skill_reminder(&intent, "");
+        assert!(mixed.contains(content.trim()));
+        assert!(mixed.contains("<selected-skill-error>\nName: Missing Workflow"));
+        assert!(!mixed.contains("The injected Skill content is complete for the selected workflows"));
+    }
+
+    #[test]
     fn selected_skill_reminder_injects_legacy_app_builtin_skill_content() {
         let root = tempdir().expect("temp dir");
         let workspace = root.path().join("workspace");
         let app_knowledge_dir = root.path().join("app-knowledge");
-        let skill_dir = app_knowledge_dir.join("skill");
+        // A saved legacy selection names "profiler"; the document now lives
+        // under builtin/. Frontmatter's old path field is not a filesystem alias.
+        let skill_dir = app_knowledge_dir.join("skill").join("builtin");
         std::fs::create_dir_all(&workspace).expect("create workspace");
         std::fs::create_dir_all(&skill_dir).expect("create skill dir");
         std::fs::write(

@@ -47,6 +47,13 @@ export function parseTodoWriteArguments(argumentsText: string): TodoItem[] | nul
   }
 }
 
+export function parseClaudeTodoOutput(outputText: string): TodoItem[] | null {
+  try {
+    const snapshot = JSON.parse(outputText)?.locusTodoSnapshot;
+    return snapshot?.version === 1 ? normalizeTodoItems(snapshot.items) : null;
+  } catch { return null; }
+}
+
 /** Compatibility for tool results created before todowrite stopped echoing its input. */
 export function parseLegacyTodoWriteOutput(outputText: string): TodoItem[] | null {
   const jsonStart = outputText.indexOf("[");

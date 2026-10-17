@@ -1,79 +1,77 @@
 use super::SessionStore;
-use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
 impl SessionStore {
     /// Logical stored bytes, excluding shared SQLite page/index/free-space overhead.
     /// Use a separate WAL reader: a large archive must never hold `self.conn`.
     pub fn archived_storage_bytes(&self, project_id: &str) -> Result<u64, String> {
-        let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| e.to_string())?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| e.to_string())?;
-        conn.execute_batch("BEGIN DEFERRED")
-            .map_err(|e| e.to_string())?;
-        let mut statement = conn
-            .prepare("SELECT id FROM sessions WHERE workspace_id = ?1 AND archived_at IS NOT NULL")
-            .map_err(|e| e.to_string())?;
-        let session_ids = statement
-            .query_map([project_id], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        if session_ids.is_empty() {
-            return Ok(0);
-        }
+        let (mut total, session_ids) = {
+            let conn = self.read_conn()?;
+            let mut statement = conn
+                .prepare(
+                    "SELECT id FROM sessions WHERE workspace_id = ?1 AND archived_at IS NOT NULL",
+                )
+                .map_err(|e| e.to_string())?;
+            let session_ids = statement
+                .query_map([project_id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            if session_ids.is_empty() {
+                return Ok(0);
+            }
 
-        // Read stored values, including compressed blobs, without loading/decompressing
-        // conversations. Discover session-owned tables so newer persistence modules
-        // (events, context attempts, async tasks, etc.) are counted as well.
-        let mut tables = conn
+            // Read stored values, including compressed blobs, without loading/decompressing
+            // conversations. Discover session-owned tables so newer persistence modules
+            // (events, context attempts, async tasks, etc.) are counted as well.
+            let mut tables = conn
             .prepare(
                 "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
             )
             .map_err(|e| e.to_string())?;
-        let tables = tables
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        let mut total = 0u64;
-        for table in tables {
-            let quoted_table = quote_identifier(&table);
-            let mut columns = conn
-                .prepare(&format!("PRAGMA table_info({quoted_table})"))
-                .map_err(|e| e.to_string())?;
-            let columns = columns
-                .query_map([], |row| row.get::<_, String>(1))
+            let tables = tables
+                .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
-            let predicate = if table == "sessions" {
-                "r.workspace_id = ?1 AND r.archived_at IS NOT NULL".to_string()
-            } else if columns.iter().any(|c| c == "session_id") {
-                "r.session_id IN (SELECT id FROM sessions WHERE workspace_id = ?1 AND archived_at IS NOT NULL)".to_string()
-            } else if table == "response_request_payloads" {
-                // DISTINCT membership counts deduplicated request payloads once.
-                "r.id IN (SELECT m.response_request_id FROM messages m JOIN sessions s ON s.id = m.session_id WHERE s.workspace_id = ?1 AND s.archived_at IS NOT NULL)".to_string()
-            } else {
-                continue;
-            };
-            let sizes = columns.iter().map(|column| {
+            let mut total = 0u64;
+            for table in tables {
+                let quoted_table = quote_identifier(&table);
+                let mut columns = conn
+                    .prepare(&format!("PRAGMA table_info({quoted_table})"))
+                    .map_err(|e| e.to_string())?;
+                let columns = columns
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                let predicate = if table == "sessions" {
+                    "r.workspace_id = ?1 AND r.archived_at IS NOT NULL".to_string()
+                } else if columns.iter().any(|c| c == "session_id") {
+                    "r.session_id IN (SELECT id FROM sessions WHERE workspace_id = ?1 AND archived_at IS NOT NULL)".to_string()
+                } else if table == "response_request_payloads" {
+                    // DISTINCT membership counts deduplicated request payloads once.
+                    "r.id IN (SELECT m.response_request_id FROM messages m JOIN sessions s ON s.id = m.session_id WHERE s.workspace_id = ?1 AND s.archived_at IS NOT NULL)".to_string()
+                } else {
+                    continue;
+                };
+                let sizes = columns.iter().map(|column| {
                 let column = format!("r.{}", quote_identifier(column));
                 format!("CASE typeof({column}) WHEN 'null' THEN 0 WHEN 'integer' THEN 8 WHEN 'real' THEN 8 ELSE length(CAST({column} AS BLOB)) END")
             }).collect::<Vec<_>>().join(" + ");
-            let bytes: i64 = conn
-                .query_row(
-                    &format!(
+                let bytes: i64 = conn
+                    .query_row(
+                        &format!(
                         "SELECT COALESCE(SUM({sizes}), 0) FROM {quoted_table} r WHERE {predicate}"
                     ),
-                    [project_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            total = total.saturating_add(bytes.max(0) as u64);
-        }
-        conn.execute_batch("ROLLBACK").map_err(|e| e.to_string())?;
+                        [project_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                total = total.saturating_add(bytes.max(0) as u64);
+            }
+            (total, session_ids)
+        };
         for session_id in session_ids {
             total = total.saturating_add(directory_bytes(
                 &self.session_tool_results_dir(&session_id),

@@ -1,10 +1,9 @@
 /**
- * Claude Code CLI provider rollout switch. The backend is not yet stable, so
- * release builds keep the whole feature hidden (settings card, model list,
- * and the opt-in toggle in model configuration). Flip to true to expose it;
- * users still have to explicitly enable its models in model configuration.
+ * Claude Code CLI is available through the native TUI bridge. Its models and
+ * settings stay hidden until the user enables it in experimental settings
+ * (see `services/claudeCodeCli`).
  */
-export const claudeCodeProviderReleased = false;
+export const claudeCodeProviderReleased = true;
 
 export const hiddenProviderIds = new Set<string>(
   claudeCodeProviderReleased ? [] : ["claude_code"],

@@ -5,7 +5,7 @@ import {
   sortedAssistantRenderParts,
 } from "./assistantRenderParts";
 import { INTERRUPTED_TOOL_RESULT, resolveToolCallDisplayShape } from "./toolCallBatches";
-import { parseLegacyTodoWriteOutput, parseTodoWriteArguments } from "./todoWrite";
+import { parseClaudeTodoOutput, parseLegacyTodoWriteOutput, parseTodoWriteArguments } from "./todoWrite";
 import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
 
 export interface StreamState {
@@ -65,7 +65,7 @@ export type StreamMutation =
   | { type: "setQuestion"; question: PendingQuestion | null }
   | { type: "enqueueToolConfirm"; confirm: PendingToolConfirm }
   | { type: "addUndoable"; messageId: string }
-  | { type: "setTodos"; runId: string; todos: TodoItem[] }
+  | { type: "setTodos"; runId: string; todos: TodoItem[]; sessionScoped?: boolean }
   | { type: "setStreaming"; value: boolean }
   | { type: "setCompacting"; value: boolean };
 
@@ -625,6 +625,10 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           mutations.push({ type: "setTodos", runId: event.runId, todos: parsed });
         }
       }
+      if (["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"].includes(event.toolName) && event.outcome === "done") {
+        const parsed = parseClaudeTodoOutput(event.output);
+        if (parsed !== null) mutations.push({ type: "setTodos", runId: event.runId, todos: parsed, sessionScoped: event.toolName !== "TodoWrite" });
+      }
       break;
     }
 
@@ -780,6 +784,10 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           contextLimit: event.contextLimit > 0 ? event.contextLimit : state.tokenUsage.contextLimit,
         },
       });
+      break;
+
+    case "historySynchronized":
+      mutations.push({ type: "replaceMessages", messages: event.messages });
       break;
 
     case "compactDone":

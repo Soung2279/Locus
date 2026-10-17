@@ -27,6 +27,9 @@ let unlistenPayload: UnlistenFn | null = null;
 let loadSequence = 0;
 
 const snapshotNotice = computed(() => {
+  if (output.value?.compactionKind === "claudeNative") {
+    return output.value.snapshotStatus === "partial" ? t("chat.compactedContext.nativeUnavailable") : "";
+  }
   if (output.value?.snapshotStatus === "reconstructed") {
     return t("chat.compactedContext.reconstructed");
   }
@@ -159,7 +162,7 @@ onUnmounted(() => {
 <template>
   <div class="compacted-context-window-root">
     <div class="compacted-context-titlebar">
-      <span class="compacted-context-title">{{ t("chat.compactedContext.windowTitle") }}</span>
+      <span class="compacted-context-title">{{ t(output?.compactionKind === "claudeNative" ? "chat.compactedContext.claudeNativeTitle" : "chat.compactedContext.windowTitle") }}</span>
       <button
         type="button"
         class="compacted-context-close"
@@ -175,6 +178,18 @@ onUnmounted(() => {
       <div v-else-if="loading && !output" class="compacted-context-state">
         {{ t("common.loading") }}
       </div>
+      <template v-else-if="output?.compactionKind === 'claudeNative'">
+        <div v-if="snapshotNotice" class="compacted-context-state">{{ snapshotNotice }}</div>
+        <div v-else class="compacted-context-entry-body">
+          <MarkdownRenderer
+            v-for="message in output.messages"
+            :key="message.id"
+            class="compacted-context-markdown"
+            :content="message.content"
+            enable-file-refs
+          />
+        </div>
+      </template>
       <template v-else-if="output">
         <div v-if="snapshotNotice" class="compacted-context-notice">{{ snapshotNotice }}</div>
 

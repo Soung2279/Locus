@@ -43,6 +43,7 @@ rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
 uuid = { version = "1.24.1", features = ["v4", "v5", "serde"] }
 zstd = "0.13"
 imagesize = "0.15"
+png = "0.18.1"
 futures = "0.3.34"
 fs4 = "1.1.0"
 walkdir = "2.5.0"
@@ -83,6 +84,7 @@ blake3 = "1.8.6"
 notify = "8.2.0"
 dunce = "1.0.5"
 keyring = "4.1.6"
+zeroize = "1"
 anyhow = "1.0.104"
 thiserror = "2.0.20"
 similar = "3.1.2"
@@ -114,14 +116,16 @@ rodio = "0.22.2"
 # multi-threaded small-object churn; mimalloc is the standard replacement.
 mimalloc = "0.1.52"
 tempfile = "3.27.0"
+portable-pty = "0.9.0"
 
 # Keep this pinned to rc.11. fastembed 5.13.2 is the matching upstream
 # release; newer fastembed versions require a newer ort/ort-sys pair.
 [target.'cfg(windows)'.dependencies]
+locus_gpu_transport = { path = "../locus_gpu_transport" }
 junction = "2.0.0"
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 tauri-winrt-notification = "0.8.1"
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 windows-core = "0.61.2"
 # Keep these aligned with Tauri/Wry; newer lines generate incompatible COM types.
 webview2-com = "0.38.2"

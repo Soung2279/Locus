@@ -258,10 +258,14 @@ fn workspace_knowledge_index(
     app_handle: &AppHandle,
     scope: &crate::workspace_service::ResolvedWorkspaceScope,
     operation: &'static str,
-) -> Result<Arc<KnowledgeIndexState>, AppError> {
+) -> Result<Option<Arc<KnowledgeIndexState>>, AppError> {
+    if !crate::workspace::knowledge_enabled(&scope.runtime().root().to_string_lossy()) {
+        return Ok(None);
+    }
     scope
         .runtime()
         .knowledge_index(app_handle)
+        .map(Some)
         .map_err(|detail| {
             AppError::new(
                 "knowledge.index_unavailable",
@@ -276,9 +280,10 @@ async fn sync_knowledge_after_undo(
     app_handle: &AppHandle,
     event_scope: &crate::workspace_service::event::WorkspaceEventScope,
     working_dir: &str,
-    knowledge_index_state: Arc<KnowledgeIndexState>,
+    knowledge_index_state: Option<Arc<KnowledgeIndexState>>,
     files: &[ChangedFile],
 ) {
+    let Some(knowledge_index_state) = knowledge_index_state else { return; };
     match knowledge_undo_sync_plan(files) {
         KnowledgeUndoSyncPlan::None => {}
         KnowledgeUndoSyncPlan::Incremental(targets) => {
@@ -353,6 +358,7 @@ pub async fn undo_perform(
     let event_scope =
         crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime());
     let knowledge_index_state = workspace_knowledge_index(&app_handle, &scope, "undo_perform")?;
+    let native_rewind=crate::llm::claude_code_cli::rewind::prepare(store.inner(),&session_id,crate::llm::claude_code_cli::rewind::Target::Before(&assistant_message_id)).await?;
     let result = match undo_manager
         .perform_undo_checked(
             &session_id,
@@ -368,7 +374,9 @@ pub async fn undo_perform(
         Ok(entry) => entry,
         Err(error) => return Err(undo_perform_error_to_app_error(error, store.inner())),
     };
-    if let Err(e) = store.truncate_from_message(&session_id, &result.entry.assistant_message_id) {
+    if let Some(prepared)=native_rewind {
+        prepared.commit(store.inner()).await?;
+    } else if let Err(e) = store.truncate_from_message(&session_id, &result.entry.assistant_message_id) {
         eprintln!("[undo_perform] failed to truncate messages: {}", e);
     } else {
         if let Err(e) = store.set_latest_completed_run_id(&session_id, None) {
@@ -428,6 +436,7 @@ pub async fn undo_perform_to_message(
         crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime());
     let knowledge_index_state =
         workspace_knowledge_index(&app_handle, &scope, "undo_perform_to_message")?;
+    let native_rewind=crate::llm::claude_code_cli::rewind::prepare(store.inner(),&session_id,crate::llm::claude_code_cli::rewind::Target::After(&truncate_message_id)).await?;
     let result = match undo_manager
         .perform_undo_checked(
             &session_id,
@@ -444,7 +453,9 @@ pub async fn undo_perform_to_message(
         Err(error) => return Err(undo_perform_error_to_app_error(error, store.inner())),
     };
 
-    if let Err(e) = store.truncate_after_message(&session_id, &truncate_message_id) {
+    if let Some(prepared)=native_rewind {
+        prepared.commit(store.inner()).await?;
+    } else if let Err(e) = store.truncate_after_message(&session_id, &truncate_message_id) {
         eprintln!(
             "[undo_perform_to_message] failed to truncate messages after {}: {}",
             truncate_message_id, e

@@ -3,6 +3,14 @@ import { createPinia, setActivePinia } from "pinia";
 import { nextTick } from "vue";
 import { useModelStore } from "../stores/model";
 import { useAuthStore } from "../stores/auth";
+import { loadClaudeCodeCliEnabled, setClaudeCodeCliEnabled } from "../services/claudeCodeCli";
+
+const ipcMocks = vi.hoisted(() => ({
+  claudeCodeCliEnabled: false,
+  ipcInvoke: vi.fn(),
+}));
+
+vi.mock("../services/ipc", () => ({ ipcInvoke: ipcMocks.ipcInvoke }));
 
 const modelServiceMocks = vi.hoisted(() => ({
   getModelDefaults: vi.fn(),
@@ -13,6 +21,7 @@ const modelServiceMocks = vi.hoisted(() => ({
   getCustomProviders: vi.fn(),
   getCodexModelConfig: vi.fn(),
   getCodexAvailableModels: vi.fn(),
+  getClaudeCodeModels: vi.fn(),
   saveLastModel: vi.fn(),
   saveLastEffort: vi.fn(),
   saveAgentModelPreference: vi.fn(),
@@ -22,9 +31,16 @@ const modelServiceMocks = vi.hoisted(() => ({
 vi.mock("../services/model", () => modelServiceMocks);
 
 describe("useModelStore OpenAI effort mapping", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     setActivePinia(createPinia());
     vi.clearAllMocks();
+    ipcMocks.claudeCodeCliEnabled = false;
+    ipcMocks.ipcInvoke.mockImplementation(async (command: string, args?: { value?: boolean }) => {
+      if (command === "get_claude_code_cli_enabled") return ipcMocks.claudeCodeCliEnabled;
+      if (command === "set_claude_code_cli_enabled") ipcMocks.claudeCodeCliEnabled = args?.value === true;
+      return undefined;
+    });
+    await loadClaudeCodeCliEnabled();
     modelServiceMocks.getModelDefaults.mockResolvedValue({
       mainModel: "",
       planModel: "",
@@ -39,10 +55,35 @@ describe("useModelStore OpenAI effort mapping", () => {
     modelServiceMocks.getCustomProviders.mockResolvedValue([]);
     modelServiceMocks.getCodexModelConfig.mockResolvedValue({ transport: "websocket" });
     modelServiceMocks.getCodexAvailableModels.mockResolvedValue([]);
+    modelServiceMocks.getClaudeCodeModels.mockResolvedValue([]);
     modelServiceMocks.saveLastModel.mockResolvedValue(undefined);
     modelServiceMocks.saveLastEffort.mockResolvedValue(undefined);
     modelServiceMocks.saveAgentModelPreference.mockResolvedValue(undefined);
     modelServiceMocks.saveCodexFastMode.mockResolvedValue(undefined);
+  });
+
+  it("discovers configured Claude gateway models without adding historical session models to the catalog", async () => {
+    useAuthStore().claudeCodeAvailable = true;
+    const store = useModelStore();
+    ipcMocks.claudeCodeCliEnabled = true;
+    const configured = "claude_code/thinkingmachines/inkling-small:free";
+    modelServiceMocks.getClaudeCodeModels.mockResolvedValue([{ id: configured, provider: "claude_code" }]);
+    await store.loadModelDefaults();
+    expect(store.availableModels.some(model => model.id === configured)).toBe(true);
+    store.applySessionModel(configured);
+    await nextTick();
+    expect(store.selectedModelId).toBe(configured);
+    expect(store.allModels.find(model => model.id === store.selectedModelId)).toMatchObject({ id: configured, name: "thinkingmachines/inkling-small:free", provider: "claude_code" });
+    const historical = "claude_code/vendor/previous-model";
+    store.applySessionModel(historical);
+    await nextTick();
+    expect(store.selectedModelId).toBe(historical);
+    expect(store.availableModels.filter(model => model.id === historical)).toHaveLength(0);
+    store.applySessionModel(historical);
+    expect(store.availableModels.filter(model => model.id === historical)).toHaveLength(0);
+    useAuthStore().claudeCodeAvailable = false;
+    await nextTick();
+    expect(store.selectedModelId).toBe(historical);
   });
 
   it("includes Astra and the GPT-5.6 family in the Codex fallback catalog", () => {
@@ -295,14 +336,35 @@ describe("useModelStore OpenAI effort mapping", () => {
     expect(modelStore.availableEfforts).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
   });
 
-  it("keeps Claude Code 1m model ids unchanged when selected", () => {
+  it("keeps Claude CLI models hidden until the experimental setting is enabled", async () => {
+    useAuthStore().claudeCodeAvailable = true;
     const modelStore = useModelStore();
+    await modelStore.loadModelDefaults();
+    expect(modelStore.allModels.some(model => model.provider === "claude_code")).toBe(false);
 
-    modelStore.selectModel("claude_code/claude-opus-4.8[1m]");
+    await setClaudeCodeCliEnabled(true);
+    expect(modelStore.availableModels.some(model => model.id === "claude_code/claude-opus-5-5")).toBe(true);
+    modelStore.selectModel("claude_code/claude-opus-5-5");
 
-    expect(modelStore.selectedModelId).toBe("claude_code/claude-opus-4.8[1m]");
+    await setClaudeCodeCliEnabled(false);
+    await nextTick();
+    expect(modelStore.allModels.some(model => model.provider === "claude_code")).toBe(false);
+    expect(modelStore.selectedModelId.startsWith("claude_code/")).toBe(false);
+  });
+
+  it("uses stable Claude CLI IDs and the established display name format", async () => {
+    const modelStore = useModelStore();
+    await setClaudeCodeCliEnabled(true);
+    expect(modelStore.allModels.filter(model => model.provider === 'claude_code').map(({ id, name }) => ({ id, name }))).toEqual([
+      { id: 'claude_code/claude-opus-5-5', name: 'Claude Opus 5.5' },
+      { id: 'claude_code/claude-fable-5-1', name: 'Claude Fable 5.1' },
+      { id: 'claude_code/claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
+      { id: 'claude_code/claude-haiku-5-5', name: 'Claude Haiku 5.5' },
+    ]);
+    modelStore.selectModel("claude_code/claude-opus-5-5");
+    expect(modelStore.selectedModelId).toBe("claude_code/claude-opus-5-5");
     expect(modelServiceMocks.saveLastModel).toHaveBeenCalledWith(
-      "claude_code/claude-opus-4.8[1m]",
+      "claude_code/claude-opus-5-5",
     );
   });
 

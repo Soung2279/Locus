@@ -7,6 +7,7 @@ struct ClaimedInput {
     // None is connection-owned or awaiting an acknowledgement. The bool
     // places committed input before or after the returned provider response.
     ready: Option<bool>,
+    claude_receipt: Option<serde_json::Value>,
 }
 
 pub(super) struct RunSteering<'a> {
@@ -58,6 +59,7 @@ impl<'a> RunSteering<'a> {
                 self.env_prefix,
                 item.input.clone(),
                 Some(item.suffix.clone()),
+                item.claude_receipt.as_ref(),
             )?;
             self.queue
                 .lock()
@@ -69,8 +71,21 @@ impl<'a> RunSteering<'a> {
     }
 }
 
-impl SteeringSource for RunSteering<'_> {
-    fn claim(&self) -> Result<Option<SteeringInput>, String> {
+impl RunSteering<'_> {
+    pub(super) fn committed_claude(&self, id: &str, checkpoint: &serde_json::Value) -> Result<(), String> {
+        crate::llm::claude_code_cli::recovery::validate_input_checkpoint(checkpoint)?;
+        let mut claimed = self.claimed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(item) = claimed.iter_mut().find(|item| item.input.id == id) {
+            item.claude_receipt = Some(checkpoint.clone());
+            item.ready = Some(true);
+        }
+        drop(claimed);
+        self.persist_ready(true)
+    }
+    pub(super) fn claim_for_claude(&self) -> Result<Option<SteeringInput>, String> {
+        self.claim_with_runtime_updates(true)
+    }
+    fn claim_with_runtime_updates(&self, update_runtime: bool) -> Result<Option<SteeringInput>, String> {
         let input = {
             let mut queue = self.queue.lock().map_err(|e| e.to_string())?;
             // Switching into Plan changes tool permissions and request settings.
@@ -83,7 +98,7 @@ impl SteeringSource for RunSteering<'_> {
                         && AgentInstance::pending_input_mode(input) == "plan"
                         && self.instance.plan_runtime_snapshot().is_none()
                 });
-            if changes_mode {
+            if changes_mode && !update_runtime {
                 return Ok(None);
             }
             queue.claim_for_steering(&self.instance.session_id, self.run_id)
@@ -91,12 +106,38 @@ impl SteeringSource for RunSteering<'_> {
         let Some(input) = input else {
             return Ok(None);
         };
+        if update_runtime {
+            let setup = self.instance.maybe_enter_plan_mode(self.app,self.store,self.run_id,&AgentInstance::pending_input_mode(&input));
+            if let Err(error)=setup {
+                self.queue.lock().map_err(|e|e.to_string())?.restore_claimed(vec![input]);
+                return Err(error);
+            }
+            let names=self.instance.selected_skill_tool_names(input.user_intent.as_ref());
+            self.instance.activate_document_skill_tool_names(&names.into_iter().collect::<Vec<_>>());
+            for package in self.instance.selected_skill_package_ids(input.user_intent.as_ref()) {
+                self.instance.activate_skill_package_runtime(&package);
+            }
+        }
         let suffix = self.instance.build_user_prompt_suffix(
             self.app,
             self.store,
             input.user_intent.as_ref(),
             &input.text,
         );
+        let suffix = match self.store.prepare_capture_prompt_suffix(
+            &self.instance.session_id,
+            input.images.as_deref(),
+            suffix.as_deref(),
+        ) {
+            Ok(suffix) => suffix,
+            Err(error) => {
+                self.queue
+                    .lock()
+                    .map_err(|e| e.to_string())?
+                    .restore_claimed(vec![input]);
+                return Err(error);
+            }
+        };
         let wire = codex::steering::user_input(
             &format!("{}{}", input.text, suffix.as_deref().unwrap_or_default()),
             input.images.as_deref(),
@@ -120,8 +161,15 @@ impl SteeringSource for RunSteering<'_> {
                 input,
                 suffix,
                 ready: None,
+                claude_receipt: None,
             });
         Ok(Some(result))
+    }
+}
+
+impl SteeringSource for RunSteering<'_> {
+    fn claim(&self) -> Result<Option<SteeringInput>, String> {
+        self.claim_with_runtime_updates(false)
     }
 
     fn committed(&self, id: &str, before_response: bool) -> Result<(), String> {

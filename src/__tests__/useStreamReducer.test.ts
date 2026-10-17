@@ -48,6 +48,12 @@ function makeState(overrides?: Partial<StreamState>): StreamState {
 }
 
 describe("reduceStreamEvent", () => {
+  it("replaces recovered history without resetting the current run", () => {
+    const state = makeState({ isStreaming: true });
+    const messages = [{ id: "native-recovered", role: "assistant" as const, content: "saved answer", createdAt: 1 }];
+    const mutations = reduceStreamEvent(state, { type: "historySynchronized", sessionId: "s1", runId: "current", messages });
+    expect(mutations).toEqual([{ type: "replaceMessages", messages }]);
+  });
   describe("buildToolResultMessages", () => {
     it("materializes completed tool outputs as hidden tool result messages", () => {
       expect(buildToolResultMessages([
@@ -648,6 +654,14 @@ describe("reduceStreamEvent", () => {
         runId: "test-run",
         todos,
       });
+    });
+
+    it.each(["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"])("synchronizes %s from the acknowledged native snapshot", (toolName) => {
+      const state=makeState({isStreaming:true,activeToolCalls:[{id:"native",name:toolName,arguments:"{}",status:"running"}]});
+      const todos=[{content:"native task",status:"completed",priority:"medium"}];
+      const event:StreamEvent={type:"toolCallDone",runId:"run",sessionId:"s1",toolCallId:"native",toolName,outcome:"done",output:JSON.stringify({locusTodoSnapshot:{version:1,items:todos}})};
+      expect(reduceStreamEvent(state,event)).toContainEqual({type:"setTodos",runId:"run",todos,sessionScoped:toolName!=="TodoWrite"});
+      expect(reduceStreamEvent(state,{...event,outcome:"error"}).some(m=>m.type==="setTodos")).toBe(false);
     });
 
   });

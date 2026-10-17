@@ -159,9 +159,9 @@ pub async fn get_providers(
     let openrouter_key = api_key_state.read().await.clone();
     let keys = provider_keys.read().await;
     let auth_guard = auth.lock().await;
-    let (claude_code_available, claude_code_hint) =
+    let (mut claude_code_available, mut claude_code_hint) =
         crate::llm::claude_code_cli::claude_cli_status();
-    let claude_code_logged_in = if claude_code_available {
+    let mut claude_code_logged_in = if claude_code_available {
         match crate::llm::claude_code_cli::claude_cli_login_status().0 {
             crate::llm::claude_code_cli::ClaudeCliLoginState::LoggedIn => Some(true),
             crate::llm::claude_code_cli::ClaudeCliLoginState::LoggedOut => Some(false),
@@ -171,6 +171,18 @@ pub async fn get_providers(
         None
     };
 
+    match crate::llm::claude_code_cli::ssh::load_settings() {
+        Ok(connection) => if let Some(remote) = connection.remote {
+            claude_code_available = connection.info.as_ref().is_some_and(|info| info.cli_supported);
+            claude_code_logged_in = connection.info.as_ref().map(|info| info.authenticated);
+            claude_code_hint = format!("SSH · {}", remote.target);
+        },
+        Err(error) => {
+            claude_code_available = false;
+            claude_code_logged_in = Some(false);
+            claude_code_hint = error;
+        }
+    }
     let mut providers = vec![
         ProviderStatus {
             id: "openrouter".to_string(),
@@ -235,6 +247,15 @@ pub async fn get_providers(
 /// human-readable error explaining why the turn could not complete.
 #[tauri::command]
 pub async fn test_claude_code_cli() -> Result<String, AppError> {
+    let mut connection = crate::llm::claude_code_cli::ssh::load_settings()?;
+    if let Some(remote) = &connection.remote {
+        let info = crate::llm::claude_code_cli::ssh::probe(remote, false).await?;
+        let message = format!("SSH · {} · {}", remote.target, info.cli_version.as_deref().unwrap_or("Claude unavailable"));
+        let ready = info.cli_supported && info.authenticated;
+        connection.info = Some(info);
+        crate::llm::claude_code_cli::ssh::save_settings(&connection)?;
+        return if ready { Ok(message) } else { Err("Remote Claude is not installed or authenticated".into()) };
+    }
     crate::llm::claude_code_cli::run_login_test()
         .await
         .map_err(|e| e.into())

@@ -3,6 +3,12 @@ import { defineStore } from "pinia";
 import { useAuthStore } from "./auth";
 import { pickPreferredModelId } from "./modelSelection";
 import * as modelService from "../services/model";
+import { claudeCodeModelCatalogScope } from "../services/claudeConnection";
+import {
+  claudeCodeCliDisabled,
+  claudeCodeCliEnabled,
+  loadClaudeCodeCliEnabled,
+} from "../services/claudeCodeCli";
 import type {
   ModelOption,
   ModelDefaults,
@@ -89,32 +95,28 @@ const builtinModels: ModelOption[] = [
     supportedEfforts: CLAUDE_STANDARD_EFFORTS,
   },
   {
-    id: "claude_code/claude-fable-5",
-    name: "Claude Fable 5[1m]",
+    id: "claude_code/claude-opus-5-5",
+    name: "Claude Opus 5.5",
     provider: "claude_code",
-    contextWindow: CLAUDE_CONTEXT_1M,
-    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
-  },
-  {
-    id: "claude_code/claude-opus-4.8[1m]",
-    name: "Claude Opus 4.8[1m]",
-    provider: "claude_code",
-    contextWindow: CLAUDE_CONTEXT_1M,
     supportedEfforts: CLAUDE_XHIGH_EFFORTS,
     isDefault: true,
   },
   {
-    id: "claude_code/claude-sonnet-5",
-    name: "Claude Sonnet 5[1m]",
+    id: "claude_code/claude-fable-5-1",
+    name: "Claude Fable 5.1",
     provider: "claude_code",
-    contextWindow: CLAUDE_CONTEXT_1M,
     supportedEfforts: CLAUDE_XHIGH_EFFORTS,
   },
   {
-    id: "claude_code/claude-opus-4.6[1m]",
-    name: "Claude Opus 4.6[1m]",
+    id: "claude_code/claude-sonnet-5-5",
+    name: "Claude Sonnet 5.5",
     provider: "claude_code",
-    contextWindow: CLAUDE_CONTEXT_1M,
+    supportedEfforts: CLAUDE_XHIGH_EFFORTS,
+  },
+  {
+    id: "claude_code/claude-haiku-5-5",
+    name: "Claude Haiku 5.5",
+    provider: "claude_code",
     supportedEfforts: CLAUDE_STANDARD_EFFORTS,
   },
 ];
@@ -299,6 +301,8 @@ export const useModelStore = defineStore("model", () => {
 
   const customProviders = ref<CustomProvider[]>([]);
   const codexRemoteModels = ref<ModelOption[]>([]);
+  const claudeCodeModels = ref<ModelOption[]>([]);
+  let claudeCodeCatalogRequest = 0;
   const codexTransport = ref<CodexTransportMode>("websocket");
   const codexContextWindow = ref(CODEX_DEFAULT_CONTEXT_WINDOW);
   const codexFastMode = ref(false);
@@ -348,8 +352,8 @@ export const useModelStore = defineStore("model", () => {
         customModelName: model.name || provider.name,
       })),
     );
-    // Claude Code CLI models are opt-in: they only join the list after the
-    // user explicitly enables them in model configuration.
+    // Claude Code CLI models are experimental: they only join the list after
+    // the user enables them in experimental settings.
     const mocks: ModelOption[] = debugModeEnabled.value
       ? [
           {
@@ -372,8 +376,8 @@ export const useModelStore = defineStore("model", () => {
           },
         ]
       : [];
-    const models = [...builtinModels, ...codexModels.value, ...customs, ...mocks].filter(
-      (m) => m.provider !== "claude_code" || modelDefaults.value.claudeCodeEnabled === true,
+    const models = [...builtinModels, ...claudeCodeModels.value.filter(model => !builtinModels.some(item => item.id === model.id)), ...codexModels.value, ...customs, ...mocks].filter(
+      (m) => m.provider !== "claude_code" || claudeCodeCliEnabled.value,
     );
     return filterVisibleModels(models);
   });
@@ -409,10 +413,6 @@ export const useModelStore = defineStore("model", () => {
 
   const selectedCustomModel = computed(() => findCustomModel(selectedModelId.value));
 
-  const selectedModelOption = computed<ModelOption | null>(() =>
-    allModels.value.find((model) => model.id === selectedModelId.value) ?? null
-  );
-
   function modelSupportsCodexFastMode(modelId: string): boolean {
     const model = allModels.value.find((candidate) => candidate.id === modelId);
     return model ? modelSupportsFastMode(model) : false;
@@ -438,20 +438,30 @@ export const useModelStore = defineStore("model", () => {
     return null;
   });
 
-  const availableEfforts = computed<EffortLevel[]>(() => {
-    const m = selectedModelId.value.toLowerCase();
-    if (selectedModelId.value.startsWith("custom/")) {
-      const custom = selectedCustomModel.value;
+  function openAiReasoningModelFor(modelId: string): string | null {
+    if (modelId.startsWith("openai/")) return modelId.slice("openai/".length);
+    const custom = findCustomModel(modelId);
+    if (custom && custom.provider.apiFormat === "openai_responses") return custom.model.apiModel;
+    return null;
+  }
+
+  /** Reasoning levels a model accepts; empty when it has no effort control. */
+  function effortsForModel(modelId: string): EffortLevel[] {
+    const m = modelId.toLowerCase();
+    if (modelId.startsWith("custom/")) {
+      const custom = findCustomModel(modelId);
       if (!custom || custom.model.reasoningParamFormat === "none") return [];
       return normalizeCustomReasoningEfforts(custom.model.supportedReasoningEfforts);
     }
-    const catalogEfforts = selectedModelOption.value?.supportedEfforts ?? [];
+    const catalogEfforts = allModels.value.find((model) => model.id === modelId)?.supportedEfforts ?? [];
     if (catalogEfforts.length > 0) return catalogEfforts;
     if (m.includes("claude")) return ["none", "low", "medium", "high"];
-    const openAiModel = selectedOpenAiReasoningModel.value;
+    const openAiModel = openAiReasoningModelFor(modelId);
     if (!openAiModel || !supportsOpenAiReasoningModel(openAiModel)) return [];
     return openAiReasoningLevels(openAiModel);
-  });
+  }
+
+  const availableEfforts = computed<EffortLevel[]>(() => effortsForModel(selectedModelId.value));
 
   const effortSupported = computed(() => availableEfforts.value.length > 0);
 
@@ -481,6 +491,9 @@ export const useModelStore = defineStore("model", () => {
 
   // Keep the selector valid when provider availability changes.
   watch(availableModels, (models) => {
+    // A CLI session remains a CLI session when auth/catalog discovery is
+    // pending or unavailable. Never silently switch its next turn to an API.
+    if (selectedModelId.value.startsWith("claude_code/")) return;
     if (models.length === 0) {
       selectedModelId.value = "";
       return;
@@ -497,10 +510,41 @@ export const useModelStore = defineStore("model", () => {
 
   // -- Actions --
 
+  async function loadClaudeCodeModels() {
+    const request = ++claudeCodeCatalogRequest;
+    try {
+      const models = await modelService.getClaudeCodeModels();
+      if (request !== claudeCodeCatalogRequest) return;
+      const ids = [...new Set(models.map(model => model.id.trim()))]
+        .filter(id => id.startsWith("claude_code/") && id.slice(12).trim());
+      claudeCodeModels.value = ids.map(id => ({ id, name: id.slice(12), provider: "claude_code" }));
+    } catch {
+      // Discovery is optional, but an older connection's models are never a fallback.
+      if (request === claudeCodeCatalogRequest) claudeCodeModels.value = [];
+    }
+  }
+
+  watch(claudeCodeModelCatalogScope, () => {
+    claudeCodeModels.value = [];
+    void loadClaudeCodeModels();
+  }, { flush: "sync" });
+
+  // Turning the experimental provider off releases a selected CLI model.
+  // Individual CLI sessions still restore their model through applySessionModel.
+  watch(claudeCodeCliDisabled, (disabled) => {
+    if (disabled && selectedModelId.value.startsWith("claude_code/")) {
+      resolveSelectedModel(true);
+    }
+  });
+
   async function loadModelDefaults() {
+    const claudeCodeCliGate = loadClaudeCodeCliEnabled().catch((e: unknown) => {
+      console.warn("[model] get_claude_code_cli_enabled:", e);
+    });
     try {
       applyModelDefaults(await modelService.getModelDefaults());
     } catch { /* ignore */ }
+    await Promise.all([claudeCodeCliGate, loadClaudeCodeModels()]);
   }
 
   async function loadDebugMode() {
@@ -586,6 +630,7 @@ export const useModelStore = defineStore("model", () => {
   }
 
   function resolveSelectedModel(force = false) {
+    if (!force && selectedModelId.value.startsWith("claude_code/")) return;
     const models = availableModels.value;
     if (models.length === 0) {
       selectedModelId.value = "";
@@ -658,9 +703,35 @@ export const useModelStore = defineStore("model", () => {
     persistActiveAgentPreference();
   }
 
+  /** Mirrors a selection the backend just remembered, without saving again. */
+  function noteRememberedSelection(agentId: string, modelId: string, selectedEffort?: EffortLevel | null) {
+    const model = modelId.trim();
+    const agent = agentId.trim();
+    if (!model) return;
+    lastModelId.value = model;
+    if (agent && selectedEffort && isEffortLevel(selectedEffort)) {
+      agentModelPreferences.value = {
+        ...agentModelPreferences.value,
+        [agent]: { modelId: model, effort: selectedEffort },
+      };
+    }
+  }
+
+  /** Applies a resolved new-session selection (not an explicit user choice). */
+  function applyNewSessionSelection(selection: {
+    modelId: string;
+    effort: EffortLevel;
+    fastMode: boolean;
+  }) {
+    if (selection.modelId) selectedModelId.value = selection.modelId;
+    effort.value = clampEffortForSelectedModel(selection.effort);
+    codexFastMode.value = selection.fastMode;
+  }
+
   function applySessionModel(id: string | null | undefined) {
     const normalized = id?.trim();
-    if (!normalized || !availableModels.value.some((model) => model.id === normalized)) return;
+    if (!normalized) return;
+    if (!normalized.startsWith("claude_code/") && !availableModels.value.some((model) => model.id === normalized)) return;
     selectedModelId.value = normalized;
   }
 
@@ -757,6 +828,9 @@ export const useModelStore = defineStore("model", () => {
     loadCodexModelConfig,
     loadCodexAvailableModels,
     resolveSelectedModel,
+    effortsForModel,
+    noteRememberedSelection,
+    applyNewSessionSelection,
     selectModel,
     activateAgentPreference,
     applySessionModel,

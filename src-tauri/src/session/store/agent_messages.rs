@@ -30,7 +30,7 @@ impl SessionStore {
         Ok(id)
     }
 
-    fn agent_message_reminder(sender: &str, body: &str) -> String {
+    pub(super) fn agent_message_reminder(sender: &str, body: &str) -> String {
         let data = serde_json::json!({"from": sender, "message": body})
             .to_string()
             .replace('<', "\\u003c")

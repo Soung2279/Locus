@@ -286,6 +286,23 @@ fn default_unity_multi_agent_editor_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
+fn default_claude_code_cli_enabled() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+const CLAUDE_CODE_CLI_ENABLED_KEY: &str = "claude_code_cli_enabled";
+const LEGACY_MODEL_DEFAULTS_FILE_NAME: &str = "model_defaults.json";
+
+/// Before the experimental setting existed, the Claude Code CLI opt-in lived
+/// in `model_defaults.json` as `claudeCodeEnabled`.
+fn legacy_claude_code_cli_enabled(config_dir: &Path) -> bool {
+    fs::read_to_string(config_dir.join(LEGACY_MODEL_DEFAULTS_FILE_NAME))
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .and_then(|value| value.get("claudeCodeEnabled").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
 fn default_unity_background_hook_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(true))
 }
@@ -567,6 +584,13 @@ pub struct AppConfig {
         with = "serde_atomic_bool"
     )]
     pub unity_multi_agent_editor_enabled: Arc<AtomicBool>,
+    /// Experimental Claude Code CLI provider. Default off; the frontend lists
+    /// its models and connection settings only after the user opts in.
+    #[serde(
+        default = "default_claude_code_cli_enabled",
+        with = "serde_atomic_bool"
+    )]
+    pub claude_code_cli_enabled: Arc<AtomicBool>,
     #[serde(default = "default_close_behavior", with = "serde_close_behavior")]
     pub close_behavior: Arc<Mutex<AppCloseBehavior>>,
     #[serde(
@@ -768,6 +792,11 @@ impl AppConfig {
             async_tasks_enabled: default_async_tasks_enabled(),
             async_tasks_default_enabled_migrated: true,
             unity_multi_agent_editor_enabled: default_unity_multi_agent_editor_enabled(),
+            claude_code_cli_enabled: Arc::new(AtomicBool::new(
+                primary_path
+                    .parent()
+                    .is_some_and(legacy_claude_code_cli_enabled),
+            )),
             close_behavior: default_close_behavior(),
             dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
             dynamic_tool_loading_native_migrated: true,
@@ -813,7 +842,7 @@ impl AppConfig {
 
     fn try_load_file(path: &Path) -> Option<Self> {
         let content = fs::read_to_string(path).ok()?;
-        let (config, rewritten) = Self::parse_content(&content).ok()?;
+        let (config, rewritten) = Self::parse_content(&content, path.parent()).ok()?;
         if rewritten {
             if let Err(err) = Self::persist_to_path(&config, path) {
                 eprintln!(
@@ -831,7 +860,9 @@ impl AppConfig {
         Some(config)
     }
 
-    fn parse_content(content: &str) -> Result<(Self, bool), String> {
+    /// `config_dir` locates sibling legacy settings files for one-time
+    /// migrations; `None` skips reading them.
+    fn parse_content(content: &str, config_dir: Option<&Path>) -> Result<(Self, bool), String> {
         let mut value: Value =
             serde_json::from_str(content).map_err(|e| format!("failed to parse config: {}", e))?;
         let scrubbed_legacy_secret = Self::remove_legacy_api_key(&mut value);
@@ -839,6 +870,8 @@ impl AppConfig {
         let migrated_workspace_service_ttl =
             Self::apply_workspace_service_ttl_hour_migration(&mut value);
         let migrated_async_tasks = Self::apply_async_tasks_default_migration(&mut value);
+        let migrated_claude_code_cli =
+            Self::apply_claude_code_cli_enabled_migration(&mut value, config_dir);
         let config = serde_json::from_value::<AppConfig>(value)
             .map_err(|e| format!("failed to deserialize config: {}", e))?;
         Ok((
@@ -846,8 +879,27 @@ impl AppConfig {
             scrubbed_legacy_secret
                 || migrated_native_tool_loading
                 || migrated_workspace_service_ttl
-                || migrated_async_tasks,
+                || migrated_async_tasks
+                || migrated_claude_code_cli,
         ))
+    }
+
+    /// Carries an existing Claude Code CLI opt-in from model configuration into
+    /// the experimental setting once. The persisted key then keeps later user
+    /// choices authoritative.
+    fn apply_claude_code_cli_enabled_migration(
+        value: &mut Value,
+        config_dir: Option<&Path>,
+    ) -> bool {
+        let Some(obj) = value.as_object_mut() else {
+            return false;
+        };
+        if obj.contains_key(CLAUDE_CODE_CLI_ENABLED_KEY) {
+            return false;
+        }
+        let enabled = config_dir.is_some_and(legacy_claude_code_cli_enabled);
+        obj.insert(CLAUDE_CODE_CLI_ENABLED_KEY.to_string(), Value::Bool(enabled));
+        true
     }
 
     /// Rewrites `dynamic_tool_loading_mode` to `native` exactly once per
@@ -1020,6 +1072,21 @@ impl AppConfig {
             return Err(error);
         }
         crate::unity_editor_lock::set_enabled(value);
+        Ok(())
+    }
+
+    pub fn claude_code_cli_enabled(&self) -> bool {
+        self.claude_code_cli_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_claude_code_cli_enabled(&self, value: bool) -> Result<(), String> {
+        let previous = self.claude_code_cli_enabled();
+        self.claude_code_cli_enabled.store(value, Ordering::Relaxed);
+        if let Err(error) = self.persist() {
+            self.claude_code_cli_enabled
+                .store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1704,7 +1771,7 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
         assert!(config.async_tasks_enabled());
         let saved = fs::read_to_string(&config_path).unwrap();
-        let (_, rewritten) = AppConfig::parse_content(&saved).unwrap();
+        let (_, rewritten) = AppConfig::parse_content(&saved, None).unwrap();
         assert!(!rewritten, "loading a migrated configuration must be idempotent");
         config.set_async_tasks_enabled(false).unwrap();
         assert!(!AppConfig::load_from_path(&config_path).async_tasks_enabled());
@@ -1733,6 +1800,59 @@ mod tests {
         let reloaded = AppConfig::load_from_path(&config_path);
         assert!(reloaded.unity_multi_agent_editor_enabled());
         crate::unity_editor_lock::set_enabled(false);
+    }
+
+    #[test]
+    fn claude_code_cli_defaults_to_disabled_and_persists_opt_in() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(&config_path, r#"{ "model": "legacy-model", "debug": false }"#)
+            .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+        assert!(!config.claude_code_cli_enabled());
+
+        config
+            .set_claude_code_cli_enabled(true)
+            .expect("persist Claude Code CLI opt-in");
+        assert!(AppConfig::load_from_path(&config_path).claude_code_cli_enabled());
+    }
+
+    #[test]
+    fn claude_code_cli_migrates_model_defaults_opt_in_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let defaults_path = temp.path().join(LEGACY_MODEL_DEFAULTS_FILE_NAME);
+        fs::write(&config_path, r#"{ "model": "legacy-model", "debug": false }"#)
+            .expect("legacy config");
+        fs::write(&defaults_path, r#"{ "mainModel": "", "claudeCodeEnabled": true }"#)
+            .expect("legacy model defaults");
+
+        let config = AppConfig::load_from_path(&config_path);
+        assert!(config.claude_code_cli_enabled());
+        let saved: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(saved[CLAUDE_CODE_CLI_ENABLED_KEY], true);
+
+        // Later choices win over the legacy model configuration value.
+        config.set_claude_code_cli_enabled(false).unwrap();
+        let saved = fs::read_to_string(&config_path).unwrap();
+        let (_, rewritten) = AppConfig::parse_content(&saved, Some(temp.path())).unwrap();
+        assert!(!rewritten, "loading a migrated configuration must be idempotent");
+        assert!(!AppConfig::load_from_path(&config_path).claude_code_cli_enabled());
+    }
+
+    #[test]
+    fn claude_code_cli_fresh_config_inherits_model_defaults_opt_in() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            temp.path().join(LEGACY_MODEL_DEFAULTS_FILE_NAME),
+            r#"{ "claudeCodeEnabled": true }"#,
+        )
+        .expect("legacy model defaults");
+
+        assert!(AppConfig::load_from_path(&config_path).claude_code_cli_enabled());
     }
 
     #[test]

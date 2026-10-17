@@ -4,6 +4,7 @@ import * as authService from "../services/auth";
 import { filterVisibleProviders } from "../config/providerVisibility";
 import { normalizeAppError } from "../services/errors";
 import type { AppErrorPayload } from "../types";
+import { getClaudeConnection } from "../services/claudeConnection";
 
 export interface AuthStatusLoadFailure {
   target: "providers" | "codex";
@@ -47,6 +48,11 @@ export const useAuthStore = defineStore("auth", () => {
 
   async function loadProviderStatus(): Promise<AuthStatusLoadFailure[]> {
     const failures: AuthStatusLoadFailure[] = [];
+    // Connection metadata is local configuration; updating selector labels
+    // must not start SSH, unlock a keychain or contact a model endpoint.
+    const connection = getClaudeConnection().catch((error) => {
+      console.warn("get_claude_connection failed:", error);
+    });
     try {
       const providers = filterVisibleProviders(await authService.getProviders());
       const or = providers.find((p) => p.id === "openrouter");
@@ -75,6 +81,7 @@ export const useAuthStore = defineStore("auth", () => {
         error: normalizeAppError(e),
       });
     }
+    await connection;
     return failures;
   }
 

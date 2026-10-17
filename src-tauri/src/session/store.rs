@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,11 +35,26 @@ mod codex_reasoning;
 mod upstream_model;
 mod timing;
 mod history_query;
+pub use history_query::SessionTitleMatch;
+mod claude_history;
+mod claude_recovery;
+mod claude_queued_inputs;
+mod claude_notifications;
+mod claude_archive;
 mod archive_storage;
+mod captures;
+mod connections;
+mod usage_retry;
+#[cfg(test)]
+mod isolation_tests;
+use connections::{SessionWriter, SessionReaders};
+pub(crate) use usage_retry::ModelUsageRecord;
+use usage_retry::{UsageBusyTimeout, UsageWriteError};
 
 #[derive(Clone)]
 pub struct SessionStore {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<SessionWriter>,
+    readers: Arc<SessionReaders>,
     db_path: PathBuf,
     tool_results_root: PathBuf,
     event_writer: Arc<SessionEventWriter>,
@@ -98,7 +113,8 @@ pub struct CompactedContextOutput {
     /// itself remains provable.
     pub snapshot_status: String,
     /// checkpoint for OpenCode V2-style summary/recent state; readable for
-    /// legacy local handoffs; codexEncrypted for canonical server compaction.
+    /// legacy local handoffs; codexEncrypted for canonical server compaction;
+    /// claudeNative for the original text returned by Claude Code.
     pub compaction_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_content_chars: Option<usize>,
@@ -178,7 +194,7 @@ impl SessionEventWriter {
     const FLUSH_INTERVAL: Duration = Duration::from_millis(25);
     const MAX_BATCH_SIZE: usize = 128;
 
-    fn new(conn: Arc<Mutex<Connection>>) -> Self {
+    fn new(conn: Arc<SessionWriter>) -> Self {
         let (sender, receiver) = mpsc::channel::<SessionEventWriterCommand>();
         thread::Builder::new()
             .name("locus-session-event-writer".to_string())
@@ -203,7 +219,7 @@ impl SessionEventWriter {
             .map_err(|e| format!("Timed out waiting for session event flush: {}", e))?
     }
 
-    fn run(conn: Arc<Mutex<Connection>>, receiver: mpsc::Receiver<SessionEventWriterCommand>) {
+    fn run(conn: Arc<SessionWriter>, receiver: mpsc::Receiver<SessionEventWriterCommand>) {
         let mut batch = Vec::with_capacity(Self::MAX_BATCH_SIZE);
         let mut unreported_error: Option<String> = None;
         while let Ok(command) = receiver.recv() {
@@ -260,19 +276,27 @@ impl SessionEventWriter {
     }
 
     fn persist_batch(
-        conn: &Arc<Mutex<Connection>>,
+        conn: &Arc<SessionWriter>,
         batch: &[QueuedSessionEvent],
     ) -> Result<(), String> {
         let mut errors = Vec::new();
         let coalesced = Self::coalesce_batch(batch);
-        let events = coalesced
-            .iter()
-            .map(|item| item.event.clone())
-            .collect::<Vec<_>>();
-
-        if let Err(error) = SessionStore::append_session_events_batch_on_conn(conn, &events) {
-            eprintln!("[Locus] failed to flush session event batch: {}", error);
-            errors.push(error);
+        // A malformed/failed event for one session must not roll back another
+        // session's queued events. Preserve order within each session.
+        let mut groups: Vec<Vec<SessionEventAppend>> = Vec::new();
+        let mut indices = HashMap::new();
+        for item in &coalesced {
+            let index = *indices.entry(item.event.session_id.clone()).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[index].push(item.event.clone());
+        }
+        for events in groups {
+            if let Err(error) = SessionStore::append_session_events_batch_on_conn(conn, &events) {
+                eprintln!("[Locus] failed to flush session {} event batch: {}", events[0].session_id, error);
+                errors.push(error);
+            }
         }
 
         for status in coalesced.iter().flat_map(|item| item.status_updates.iter()) {
@@ -902,7 +926,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 48;
+    const SCHEMA_VERSION: i32 = 51;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -965,14 +989,17 @@ impl SessionStore {
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
 
+        connections::configure_writer(&conn)?;
         Self::run_migrations(&conn, &tool_results_root)?;
+        connections::enable_wal(&conn)?;
         Self::mark_nonterminal_runs_cancelled(&conn)?;
 
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Arc::new(SessionWriter::new(conn, db_path.clone()));
         let event_writer = Arc::new(SessionEventWriter::new(conn.clone()));
 
         Ok(SessionStore {
             conn,
+            readers: Arc::new(SessionReaders::new()),
             db_path,
             tool_results_root,
             event_writer,
@@ -1005,10 +1032,11 @@ impl SessionStore {
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|e| format!("Failed to configure session export snapshot: {}", e))?;
 
-        let conn = Arc::new(Mutex::new(destination));
+        let conn = Arc::new(SessionWriter::new(destination, PathBuf::new()));
         let event_writer = Arc::new(SessionEventWriter::new(conn.clone()));
         Ok(Self {
             conn,
+            readers: Arc::new(SessionReaders::new()),
             db_path: PathBuf::new(),
             tool_results_root: self.tool_results_root.clone(),
             event_writer,
@@ -1466,7 +1494,16 @@ impl SessionStore {
         if current < 48 {
             Self::migrate(conn, 48, "recover upstream response model declarations", Self::migrate_upstream_model_declarations)?;
         }
-        debug_assert_eq!(Self::SCHEMA_VERSION, 48, "add a new migration block above");
+        if current < 49 {
+            Self::migrate(conn, 49, "persist screenshot snapshots and session attachment access", Self::migrate_capture_attachments)?;
+        }
+        if current < 50 {
+            Self::migrate(conn,50,"persist incremental Claude native archives",Self::migrate_claude_native_archives)?;
+        }
+        if current < 51 {
+            Self::migrate(conn,51,"persist authoritative Claude resume identities",Self::migrate_claude_native_identity)?;
+        }
+        debug_assert_eq!(Self::SCHEMA_VERSION, 51, "add a new migration block above");
         Ok(())
     }
 
@@ -1888,6 +1925,8 @@ impl SessionStore {
         .and_then(|_| Self::create_prompt_prefix_cache_schema(conn))
         .and_then(|_| Self::create_prompt_cache_check_schema(conn))
         .and_then(|_| Self::create_async_task_schema(conn))
+        .and_then(|_| Self::create_capture_schema(conn))
+        .and_then(|_| Self::migrate_claude_native_identity(conn))
     }
 
     fn create_workspace_persistence_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -2093,7 +2132,8 @@ impl SessionStore {
             );
             CREATE INDEX IF NOT EXISTS idx_session_events_run ON session_events(run_id, seq);
             CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, seq);",
-        )
+        )?;
+        Self::migrate_claude_native_archives(conn)
     }
 
     fn table_has_column(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
@@ -2134,7 +2174,7 @@ impl SessionStore {
     where
         F: FnOnce(&Connection) -> rusqlite::Result<()>,
     {
-        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).map_err(|e| {
             format!(
                 "migration v{} ({}): failed to begin transaction: {}",
                 to_version, label, e
@@ -2158,7 +2198,7 @@ impl SessionStore {
                 )
             })?;
 
-        conn.execute_batch("COMMIT").map_err(|e| {
+        tx.commit().map_err(|e| {
             format!(
                 "migration v{} ({}): failed to commit: {}",
                 to_version, label, e
@@ -3205,7 +3245,7 @@ impl SessionStore {
             return Err("Project and operation identities are required".to_string());
         }
         let conn = self.conn.lock().map_err(|error| error.to_string())?;
-        conn.execute("BEGIN IMMEDIATE", [])
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("Failed to begin explorer transaction: {error}"))?;
         let result = (|| {
             Self::ensure_project_explorer_layout_with_conn(&conn, project_id)?;
@@ -3239,7 +3279,7 @@ impl SessionStore {
         })();
         match result {
             Ok(snapshot) => {
-                conn.execute("COMMIT", [])
+                tx.commit()
                     .map_err(|error| format!("Failed to commit explorer transaction: {error}"))?;
                 Ok(ProjectExplorerMutationResult {
                     operation_id: operation_id.to_string(),
@@ -3536,6 +3576,13 @@ impl SessionStore {
         agent_id: Option<&str>,
     ) -> Result<String, String> {
         let id = Uuid::new_v4().to_string();
+        self.create_session_scoped_with_id(&id, title, parent_id, project_id, checkout_id, session_type, agent_id)
+    }
+
+    pub(crate) fn create_session_scoped_with_id(
+        &self, id: &str, title: &str, parent_id: Option<&str>, project_id: Option<&str>, checkout_id: Option<&str>, session_type: &str, agent_id: Option<&str>,
+    ) -> Result<String, String> {
+        Uuid::parse_str(id).map_err(|_| "Invalid reserved conversation ID")?;
         let now = Self::now_ts();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         if let Some(checkout_id) = checkout_id {
@@ -3582,7 +3629,7 @@ impl SessionStore {
             return Err(format!("Failed to create session: {error}"));
         }
         conn.execute_batch("RELEASE create_scoped_session").map_err(|e| e.to_string())?;
-        Ok(id)
+        Ok(id.to_string())
     }
 
     pub fn fork_session(&self, source_id: &str, title: Option<&str>) -> Result<String, String> {
@@ -3706,7 +3753,7 @@ impl SessionStore {
         let target_tool_dir = self.session_tool_results_dir(&new_id);
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
-        conn.execute("BEGIN IMMEDIATE", [])
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("Failed to begin session fork transaction: {}", e))?;
 
         let result = (|| -> Result<String, String> {
@@ -3991,7 +4038,7 @@ impl SessionStore {
 
         match result {
             Ok(id) => {
-                if let Err(e) = conn.execute("COMMIT", []) {
+                if let Err(e) = tx.commit() {
                     if target_tool_dir.is_dir() {
                         let _ = std::fs::remove_dir_all(&target_tool_dir);
                     }
@@ -4223,7 +4270,7 @@ impl SessionStore {
             .map(str::to_string)
             .unwrap_or_else(|| format!("{} (fork)", session.0));
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute("BEGIN IMMEDIATE", [])
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("Failed to begin snapshot fork transaction: {}", e))?;
 
         let result = (|| -> Result<(), String> {
@@ -4347,7 +4394,7 @@ impl SessionStore {
 
         match result {
             Ok(()) => {
-                if let Err(error) = conn.execute("COMMIT", []) {
+                if let Err(error) = tx.commit() {
                     if target_tool_dir.is_dir() {
                         let _ = std::fs::remove_dir_all(&target_tool_dir);
                     }
@@ -4414,7 +4461,7 @@ impl SessionStore {
         let now = Self::now_ts();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
-        conn.execute("BEGIN IMMEDIATE", [])
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("Failed to begin run transaction: {}", e))?;
 
         let result = (|| -> Result<(), String> {
@@ -4574,7 +4621,7 @@ impl SessionStore {
             return Err(error);
         }
 
-        conn.execute("COMMIT", [])
+        tx.commit()
             .map_err(|e| format!("Failed to commit run transaction: {}", e))?;
         self.runtime.start_run(session_id, run_id);
         Ok(())
@@ -4592,7 +4639,7 @@ impl SessionStore {
     }
 
     fn update_run_status_on_conn(
-        conn: &Arc<Mutex<Connection>>,
+        conn: &Arc<SessionWriter>,
         run_id: &str,
         status: &str,
         error_message: Option<&str>,
@@ -4637,7 +4684,7 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Result<Option<SessionRunSummary>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         conn.query_row(
             "SELECT run_id, session_id, status, started_at, updated_at, finished_at, error_message
              FROM session_runs
@@ -4670,7 +4717,7 @@ impl SessionStore {
     }
 
     pub fn run_by_id(&self, run_id: &str) -> Result<Option<SessionRunSummary>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         conn.query_row(
             "SELECT run_id, session_id, status, started_at, updated_at, finished_at, error_message
              FROM session_runs
@@ -4696,7 +4743,7 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<PersistedSessionRun>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT run_id, session_id, status, started_at, updated_at,
@@ -4716,7 +4763,7 @@ impl SessionStore {
     }
 
     pub fn get_run_scope(&self, run_id: &str) -> Result<Option<SessionRunScopeSnapshot>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let row = conn
             .query_row(
                 "SELECT project_id, checkout_id, workspace_generation,
@@ -4839,7 +4886,7 @@ impl SessionStore {
     /// turn. This is intentionally broader than the UI predicate so a resume
     /// click received before the async event writer flushes is still valid.
     pub fn latest_run_is_interrupted(&self, session_id: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let Some((_, status, _)) = Self::latest_run_record_with_conn(&conn, session_id)? else {
             return Ok(false);
         };
@@ -4854,7 +4901,7 @@ impl SessionStore {
     /// Runs recovered after an application restart carry an explicit error and
     /// remain resumable even when the final stream event was not flushed.
     pub fn session_resume_available(&self, session_id: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let Some((run_id, status, error_message)) =
             Self::latest_run_record_with_conn(&conn, session_id)?
         else {
@@ -4875,8 +4922,8 @@ impl SessionStore {
             .map_err(|e| format!("Failed to inspect interrupted user turn: {}", e))
         };
 
-        match status.as_str() {
-            RUN_STATUS_ERROR => has_persisted_user_turn(),
+        let available = match status.as_str() {
+            RUN_STATUS_ERROR => has_persisted_user_turn()?,
             RUN_STATUS_CANCELLED => {
                 if error_message
                     .as_deref()
@@ -4884,17 +4931,29 @@ impl SessionStore {
                 {
                     return Ok(true);
                 }
-                has_persisted_user_turn()
+                has_persisted_user_turn()?
             }
-            _ => Ok(false),
-        }
+            _ => return Ok(false),
+        };
+        if available { return Ok(true); }
+        let claude: bool = conn.query_row(
+            "SELECT COALESCE(last_model_id LIKE 'claude_code/%',0) FROM sessions WHERE id=?1",
+            [session_id],|row|row.get(0)).map_err(|e|e.to_string())?;
+        drop(conn);
+        if !claude { return Ok(false); }
+        // A Claude retry reuses the saved user row. Its newest run therefore
+        // need not emit another userMessage, even though input is still pending.
+        let messages=self.get_messages(session_id)?;
+        let metadata=self.get_response_request_metadata(session_id)?;
+        let pending=self.claude_recovery_pending_messages(session_id,&messages,&metadata,None)?;
+        Ok(!pending.is_empty() && self.verify_claude_history_origin(session_id,&messages,&metadata,&pending).is_ok())
     }
 
     pub fn active_descendant_runs(
         &self,
         root_session_id: &str,
     ) -> Result<Vec<SessionRunSummary>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare(
                 "WITH RECURSIVE descendants(id) AS (
@@ -4948,7 +5007,7 @@ impl SessionStore {
     }
 
     pub fn session_id_for_run(&self, run_id: &str) -> Result<Option<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         conn.query_row(
             "SELECT session_id FROM session_runs WHERE run_id = ?1",
             params![run_id],
@@ -4997,7 +5056,7 @@ impl SessionStore {
     }
 
     fn append_session_events_batch_on_conn(
-        conn: &Arc<Mutex<Connection>>,
+        conn: &Arc<SessionWriter>,
         records: &[SessionEventAppend],
     ) -> Result<Vec<i64>, String> {
         if records.is_empty() {
@@ -5007,7 +5066,7 @@ impl SessionStore {
         let now = Self::now_ts();
         let conn = conn.lock().map_err(|e| e.to_string())?;
 
-        conn.execute("BEGIN IMMEDIATE", [])
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("Failed to begin session event transaction: {}", e))?;
 
         let result = (|| -> Result<Vec<i64>, String> {
@@ -5070,7 +5129,7 @@ impl SessionStore {
             }
         };
 
-        conn.execute("COMMIT", [])
+        tx.commit()
             .map_err(|e| format!("Failed to commit session event transaction: {}", e))?;
 
         Ok(seqs)
@@ -5084,7 +5143,7 @@ impl SessionStore {
     ) -> Result<Vec<SessionEventRecord>, String> {
         let after_seq = after_seq.unwrap_or(0);
         let limit = i64::from(limit.unwrap_or(500).clamp(1, 2_000));
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT session_id, run_id, seq, event_type, payload_json, created_at
@@ -5184,7 +5243,7 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<SessionContextAttempt>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, session_id, run_id, iteration, attempt, attempt_kind, status,
@@ -5259,7 +5318,7 @@ impl SessionStore {
     }
 
     pub fn session_has_context_capture_gap(&self, session_id: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         conn.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM session_context_capture_gaps WHERE session_id = ?1
@@ -5272,7 +5331,7 @@ impl SessionStore {
     }
 
     pub fn session_tree_ids(&self, root_session_id: &str) -> Result<Vec<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare(
                 "WITH RECURSIVE session_tree(id, depth) AS (
@@ -5307,7 +5366,7 @@ impl SessionStore {
     ) -> Result<Vec<SessionEventRecord>, String> {
         let after_seq = after_seq.unwrap_or(0);
         let limit = i64::from(limit.unwrap_or(500).clamp(1, 2_000));
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT session_id, run_id, seq, event_type, payload_json, created_at
@@ -5369,7 +5428,7 @@ impl SessionStore {
         workspace_id: Option<&str>,
         archived: bool,
     ) -> Result<Vec<SessionSummary>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
 
         let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<SessionSummary> {
             Ok(SessionSummary {
@@ -5462,7 +5521,7 @@ impl SessionStore {
         if checkout_id.is_empty() {
             return Err("Checkout identity cannot be empty".to_string());
         }
-        let conn = self.conn.lock().map_err(|error| error.to_string())?;
+        let conn = self.read_conn()?;
         let sql = if archived {
             "SELECT id, title, agent_id, session_type, parent_session_id, updated_at, workspace_id, default_checkout_id
              FROM sessions
@@ -5563,7 +5622,7 @@ impl SessionStore {
     /// `exited_pending_notice` marks that the next persisted user message
     /// should carry the one-shot "exited plan mode" reminder.
     pub fn get_plan_mode_state(&self, session_id: &str) -> Result<PlanModeState, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         conn.query_row(
             "SELECT plan_mode_active, plan_exited_pending_notice FROM sessions WHERE id = ?1",
             params![session_id],
@@ -5626,7 +5685,7 @@ impl SessionStore {
     }
 
     pub fn load_session(&self, id: &str) -> Result<SessionDetail, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let (
             title,
             agent_id,
@@ -5699,7 +5758,7 @@ impl SessionStore {
         id: &str,
         message_limit: u32,
     ) -> Result<SessionViewSnapshot, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let (
             title,
             agent_id,
@@ -5746,6 +5805,7 @@ impl SessionStore {
         Self::defer_tool_result_images_for_display(&mut messages);
 
         Ok(SessionViewSnapshot {
+            remote_sync_warning: None,
             session: SessionDetail {
                 id: id.to_string(),
                 title,
@@ -5777,7 +5837,7 @@ impl SessionStore {
         session_id: &str,
         message_id: &str,
     ) -> Result<SessionTurnPreview, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let target_query = format!(
             "SELECT rowid, content, images
              FROM messages
@@ -5848,7 +5908,7 @@ impl SessionStore {
         before_row_id: i64,
         message_limit: u32,
     ) -> Result<SessionMessagePage, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let raw_page =
             Self::get_message_page_with_conn(&conn, id, Some(before_row_id), message_limit)?;
         drop(conn);
@@ -5883,7 +5943,7 @@ impl SessionStore {
         &self,
         message_id: &str,
     ) -> Result<Vec<super::models::ImageData>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let images_json = conn
             .query_row(
                 "SELECT images FROM messages WHERE id = ?1",
@@ -6005,7 +6065,7 @@ impl SessionStore {
     }
 
     pub fn get_session_agent_id(&self, id: &str) -> Result<Option<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         conn.query_row(
             "SELECT agent_id FROM sessions WHERE id = ?1",
             params![id],
@@ -6015,7 +6075,7 @@ impl SessionStore {
     }
 
     pub fn get_session_title(&self, id: &str) -> Result<Option<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         match conn.query_row(
             "SELECT title FROM sessions WHERE id = ?1",
             params![id],
@@ -6028,7 +6088,7 @@ impl SessionStore {
     }
 
     pub fn get_session_workspace_id(&self, id: &str) -> Result<Option<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         match conn.query_row(
             "SELECT workspace_id FROM sessions WHERE id = ?1",
             params![id],
@@ -6131,7 +6191,7 @@ impl SessionStore {
 
     /// All session ids across every workspace, including archived sessions.
     pub fn list_all_session_ids(&self) -> Result<Vec<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare("SELECT id FROM sessions")
             .map_err(|e| format!("Failed to list session ids: {}", e))?;
@@ -6199,7 +6259,7 @@ impl SessionStore {
     ) -> Result<u64, String> {
         let now = Self::now_ts();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute_batch("BEGIN IMMEDIATE")
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("Failed to begin message truncation: {}", e))?;
 
         let result = (|| -> Result<u64, String> {
@@ -6231,7 +6291,7 @@ impl SessionStore {
 
         match result {
             Ok(deleted) => {
-                conn.execute_batch("COMMIT")
+                tx.commit()
                     .map_err(|e| format!("Failed to commit message truncation: {}", e))?;
                 Ok(deleted)
             }
@@ -6245,7 +6305,7 @@ impl SessionStore {
     pub fn truncate_latest_conversation_turn(&self, session_id: &str) -> Result<u64, String> {
         let now = Self::now_ts();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute_batch("BEGIN IMMEDIATE")
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("Failed to begin latest turn truncation: {}", e))?;
 
         let result = (|| -> Result<u64, String> {
@@ -6285,7 +6345,7 @@ impl SessionStore {
 
         match result {
             Ok(deleted) => {
-                conn.execute_batch("COMMIT")
+                tx.commit()
                     .map_err(|e| format!("Failed to commit latest turn truncation: {}", e))?;
                 Ok(deleted)
             }
@@ -6343,6 +6403,18 @@ impl SessionStore {
         prompt_prefix: Option<&str>,
         prompt_suffix: Option<&str>,
     ) -> Result<String, String> {
+        self.add_message_with_images_asset_refs_signature_and_response(session_id, role, content, images,
+            asset_refs, thinking_signature, prompt_prefix, prompt_suffix, None)
+    }
+
+    /// Save the native delivery receipt in the same message INSERT. A crash
+    /// must never leave an acknowledged input without its source identity.
+    pub(crate) fn add_message_with_images_asset_refs_signature_and_response(
+        &self, session_id: &str, role: MessageRole, content: &str,
+        images: Option<&[super::models::ImageData]>, asset_refs: Option<&[super::models::AssetRefData]>,
+        thinking_signature: Option<&str>, prompt_prefix: Option<&str>, prompt_suffix: Option<&str>,
+        response_request: Option<&serde_json::Value>,
+    ) -> Result<String, String> {
         let images_json = images
             .filter(|imgs| !imgs.is_empty())
             .map(|imgs| serde_json::to_string(imgs))
@@ -6368,7 +6440,7 @@ impl SessionStore {
             prompt_prefix,
             prompt_suffix,
             None,
-            None,
+            response_request,
             None,
             None,
         )
@@ -7221,6 +7293,11 @@ impl SessionStore {
         let response_request_id =
             Self::persist_response_request_with_conn(&conn, response_request)?;
 
+        let capture_suffix = if role == MessageRole::User {
+            Self::capture_message_suffix(&conn, session_id, images_json, prompt_suffix)?
+        } else { prompt_suffix.map(str::to_owned) };
+        let prompt_suffix = capture_suffix.as_deref();
+
         conn.execute(
             "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, asset_refs, thinking_content, thinking_duration, thinking_signature, metadata_json, response_request_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
@@ -7256,7 +7333,7 @@ impl SessionStore {
     }
 
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         self.get_messages_with_conn_filtered(&conn, session_id, false)
     }
 
@@ -7264,14 +7341,14 @@ impl SessionStore {
     /// Internal user-role reminders remain available to prompt reconstruction
     /// while staying out of every UI refresh path, including compact events.
     pub fn get_messages_for_display(&self, session_id: &str) -> Result<Vec<ChatMessage>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let raw_messages = self.get_messages_with_conn_filtered(&conn, session_id, false)?;
         drop(conn);
         Ok(normalize_messages_for_display(&raw_messages))
     }
 
     pub fn get_messages_for_prompt(&self, session_id: &str) -> Result<Vec<ChatMessage>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         self.get_messages_with_conn_filtered(&conn, session_id, true)
     }
 
@@ -7340,6 +7417,33 @@ impl SessionStore {
                 serde_json::from_str(&response_request_json)
                     .map_err(|e| format!("Failed to parse compacted response request: {}", e))?,
             );
+        }
+
+        if let Some(provider) = metadata.response_request.as_ref().filter(|value|
+            value["claude_compaction"].is_object() || value["claude_native"]["compactSummary"] == true)
+        {
+            // Read the already persisted native receipt, not the generic local
+            // handoff or current prompt. This also supports historical receipts
+            // and summaries imported from Claude's transcript without rewriting
+            // their storage or inventing missing native fields.
+            let summary = provider["claude_compaction"]["summary"].as_str()
+                .filter(|text| !text.trim().is_empty()).map(str::to_owned)
+                .or_else(|| (provider["claude_native"]["compactSummary"] == true).then(||
+                    crate::llm::claude_code_cli::recovery::text_content(&provider["claude_native"]["content"]))
+                    .filter(|text| !text.trim().is_empty()));
+            return Ok(Some(CompactedContextOutput {
+                message_id: message_id.to_string(),
+                snapshot_status: if summary.is_some() { "complete" } else { "partial" }.to_string(),
+                compaction_kind: "claudeNative".to_string(),
+                encrypted_content_chars: None,
+                checkpoint: serde_json::Value::String("empty".to_string()),
+                messages: vec![CompactedContextMessageOutput {
+                    id: message_id.to_string(), role: MessageRole::User,
+                    content: summary.unwrap_or_else(|| "empty".to_string()),
+                    images: None, asset_refs: None,
+                    prompt_prefix_placeholder: false, prompt_suffix_placeholder: false,
+                }],
+            }));
         }
 
         let (mut snapshot_status, entries) = match metadata
@@ -7510,7 +7614,7 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Result<HashMap<String, serde_json::Value>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT m.id, m.metadata_json, r.payload_json
@@ -7556,7 +7660,7 @@ impl SessionStore {
     }
 
     pub fn first_user_message_id(&self, session_id: &str) -> Result<Option<String>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         conn.query_row(
             "SELECT id FROM messages
              WHERE session_id = ?1 AND include_in_prompt = 1 AND role = 'user' AND tool_call_id IS NULL
@@ -7811,7 +7915,7 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<SessionCacheInvalidation>, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT message_id, message, model_id, baseline_tokens,
@@ -7945,17 +8049,38 @@ impl SessionStore {
         context_tokens: Option<u32>,
         context_limit: Option<u32>,
     ) -> Result<(TokenUsage, Option<PromptCacheCheckOutcome>), String> {
+        Self::record_model_usage_on_conn(&self.conn, session_id, model_id, provider, request_kind, input_tokens, output_tokens, model_active_duration_ms, cache_read_tokens, cache_write_tokens, cost_usd, priced_rounds, context_tokens, context_limit, false).map_err(|error| error.message)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_model_usage_on_conn(
+        writer: &Arc<SessionWriter>,
+        session_id: &str,
+        model_id: &str,
+        provider: &str,
+        request_kind: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        model_active_duration_ms: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        cost_usd: f64,
+        priced_rounds: u64,
+        context_tokens: Option<u32>,
+        context_limit: Option<u32>,
+        best_effort: bool,
+    ) -> Result<(TokenUsage, Option<PromptCacheCheckOutcome>), UsageWriteError> {
         let model_id = model_id.trim();
         let provider = provider.trim();
         let request_kind = request_kind.trim();
         if model_id.is_empty() || provider.is_empty() || request_kind.is_empty() {
-            return Err("Model usage metadata must not be empty".to_string());
+            return Err("Model usage metadata must not be empty".to_string().into());
         }
 
-        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Failed to begin model usage transaction: {}", e))?;
+        let conn = writer.lock().map_err(|e| e.to_string())?;
+        let _timeout = if best_effort { Some(UsageBusyTimeout::new(&conn)?) } else { None };
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| UsageWriteError::transaction(e, "begin"))?;
         let previous_completion = if request_kind == "completion" {
             Self::latest_completion_server_baseline_with_conn(&tx, session_id)?
         } else {
@@ -8023,7 +8148,7 @@ impl SessionStore {
             None
         };
         tx.commit()
-            .map_err(|e| format!("Failed to commit model usage transaction: {}", e))?;
+            .map_err(|e| UsageWriteError::transaction(e, "commit"))?;
         Ok((usage, cache_check))
     }
 
@@ -8196,7 +8321,7 @@ impl SessionStore {
         let since = days.map(|days| {
             Self::now_ts().saturating_sub(i64::from(days).saturating_mul(24 * 60 * 60))
         });
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let usage = conn
             .query_row(
                 "SELECT
@@ -8285,7 +8410,7 @@ impl SessionStore {
     }
 
     pub fn get_token_usage(&self, session_id: &str) -> Result<TokenUsage, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let result = conn.query_row(
             "SELECT
                 total_input_tokens,
@@ -8364,7 +8489,7 @@ impl SessionStore {
     ) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
-        conn.execute("BEGIN", [])
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Deferred)
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
         conn.execute(
@@ -8396,14 +8521,14 @@ impl SessionStore {
             format!("Failed to update todo run boundary: {}", e)
         })?;
 
-        conn.execute("COMMIT", [])
+        tx.commit()
             .map_err(|e| format!("Failed to commit transaction: {}", e))?;
 
         Ok(())
     }
 
     pub fn get_todos(&self, session_id: &str) -> Result<TodoSnapshot, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare("SELECT content, status, priority FROM todos WHERE session_id = ?1 ORDER BY position ASC")
             .map_err(|e| format!("Failed to prepare todos query: {}", e))?;
@@ -8431,9 +8556,18 @@ impl SessionStore {
             .optional()
             .map_err(|e| format!("Failed to query todo run boundary: {}", e))?
             .flatten();
+        // Native Claude tasks outlive a single Locus run (including turns
+        // completed while disconnected). Derive scope from existing versioned
+        // metadata only when it describes the currently persisted todo list.
+        let native_todos:Option<String>=conn.query_row(
+            "SELECT json_extract(r.payload_json,'$.claude_todos') FROM messages m JOIN response_request_payloads r ON r.id=m.response_request_id WHERE m.session_id=?1 AND json_type(r.payload_json,'$.claude_todos')='object' ORDER BY m.created_at DESC,m.rowid DESC LIMIT 1",
+            [session_id],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
+        let session_scoped=native_todos.and_then(|s|serde_json::from_str::<serde_json::Value>(&s).ok()).is_some_and(|snapshot|
+            snapshot["version"]==1 && snapshot["kind"]=="tasks" && snapshot["items"]==serde_json::json!(todos));
         Ok(TodoSnapshot {
             items: todos,
             latest_run_id,
+            session_scoped,
         })
     }
 
@@ -8546,7 +8680,7 @@ impl SessionStore {
             )
             .map_err(|e| format!("Failed to count messages: {}", e))?;
 
-        conn.execute("BEGIN", [])
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Deferred)
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
         let response_request_id = Self::persist_response_request_with_conn(&conn, response_request)
@@ -8702,7 +8836,7 @@ impl SessionStore {
             },
         )?;
 
-        conn.execute("COMMIT", [])
+        tx.commit()
             .map_err(|e| format!("Failed to commit compact transaction: {}", e))?;
 
         let count_after: u32 = conn
@@ -10988,7 +11122,7 @@ mod tests {
         let session_id = store
             .create_session("turn index", None, None, "chat", None)
             .expect("create session");
-        let preview_image = ImageData {
+        let preview_image = ImageData { capture: None,
             data: "aW1hZ2U=".to_string(),
             mime_type: "image/png".to_string(),
         };
@@ -11144,7 +11278,7 @@ mod tests {
         store
             .add_assistant_with_tool_calls(&session_id, "", &[tool_call])
             .expect("add assistant");
-        let images = vec![ImageData {
+        let images = vec![ImageData { capture: None,
             data: "large-base64-payload".to_string(),
             mime_type: "image/png".to_string(),
         }];

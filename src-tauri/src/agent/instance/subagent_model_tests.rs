@@ -13,6 +13,8 @@ fn definition() -> AgentDef {
         env_template: String::new(),
         tools: Vec::new(),
         sub_agents: Vec::new(),
+        delegatable: true,
+        default_project_types: Vec::new(),
         default: false,
         default_effort: None,
         model_recommendation: None,
@@ -136,6 +138,7 @@ async fn request(child: &AgentInstance, store: &SessionStore) {
         Duration::from_secs(15),
         child.call_llm(
             store,
+            None,
             None,
             None,
             LlmRequestOptions::default(),

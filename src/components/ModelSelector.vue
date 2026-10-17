@@ -6,6 +6,7 @@ import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
 import { formatModelDisplayName } from "../utils/modelDisplay";
 import { groupModelsForSelector, modelListEntryName, type ModelSelectorGroup } from "../utils/modelGrouping";
+import { getClaudeConnection, isRemoteClaudeCode } from "../services/claudeConnection";
 
 const props = defineProps<{
   models: ModelOption[];
@@ -24,7 +25,7 @@ const selectedModel = () => props.models.find((m) => m.id === props.selectedId);
 
 const selectedDisplayName = computed(() => {
   const sel = selectedModel();
-  if (!sel) return "Model";
+  if (!sel) return props.selectedId.startsWith("claude_code/") ? props.selectedId.slice(12) : "Model";
   const displayName = optionDisplayName(sel);
   const duplicated = props.models.some((m) => m.id !== sel.id && optionDisplayName(m) === displayName);
   if (!duplicated) return displayName;
@@ -38,7 +39,7 @@ const selectedDisplayName = computed(() => {
 const providerLabels = computed<Record<string, string>>(() => ({
   openrouter: "OpenRouter",
   anthropic: t("model.provider.anthropic"),
-  claude_code: t("model.provider.claude_code"),
+  claude_code: t(isRemoteClaudeCode.value ? "model.provider.claude_code.remote" : "model.provider.claude_code"),
   openai_codex: t("model.provider.openai"),
   custom: t("model.provider.custom"),
   mock: t("model.provider.mock"),
@@ -47,7 +48,7 @@ const providerLabels = computed<Record<string, string>>(() => ({
 const providerShortLabels = computed<Record<string, string>>(() => ({
   openrouter: "OR",
   anthropic: t("model.provider.anthropic.short"),
-  claude_code: t("model.provider.claude_code.short"),
+  claude_code: t(isRemoteClaudeCode.value ? "model.provider.claude_code.remote" : "model.provider.claude_code.short"),
   openai_codex: t("model.provider.openai.short"),
   custom: t("model.provider.custom"),
   mock: t("model.provider.mock.short"),
@@ -60,6 +61,7 @@ const groupedModels = computed<ModelSelectorGroup[]>(() =>
 function toggle() {
   if (props.disabled) return;
   open.value = !open.value;
+  if (open.value) void getClaudeConnection().catch(error => console.warn("get_claude_connection failed:", error));
 }
 
 function select(id: string) {

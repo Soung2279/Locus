@@ -14,6 +14,8 @@ fn instance() -> AgentInstance {
             env_template: String::new(),
             tools: vec!["read".to_string()],
             sub_agents: Vec::new(),
+            delegatable: true,
+            default_project_types: Vec::new(),
             default: false,
             default_effort: None,
             model_recommendation: None,

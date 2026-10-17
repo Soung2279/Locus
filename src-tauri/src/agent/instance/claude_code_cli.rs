@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use super::{
     emit_parent_stream, emit_stream, finalize_tool_call_record, normalize_tool_args, AgentInstance,
@@ -17,10 +17,159 @@ use crate::llm::claude_code_cli::{
     self, ClaudeCodeAssistantMessage, ClaudeCodeCliOptions, ClaudeCodeHost, ClaudeCodeHostFuture,
     ClaudeCodeToolDefinition, ClaudeCodeToolResult,
 };
-use crate::session::models::{ImageData, MessageRole, ToolCallInfo};
+use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
 use crate::session::store::SessionStore;
 
 const CLAUDE_CODE_CLI_PROVIDER: &str = "claude_code";
+
+pub(super) fn pending_claude_resume_message(store: &SessionStore, session_id: &str) -> Result<Option<ChatMessage>, String> {
+    let messages = store.get_messages(session_id)?;
+    let metadata = store.get_response_request_metadata(session_id)?;
+    let pending = store.claude_recovery_pending_message(session_id, &messages, &metadata)?;
+    Ok(messages.into_iter().find(|message| Some(message.id.as_str()) == pending.as_deref()))
+}
+
+pub(super) fn persist_turn_user_message(
+    store: &SessionStore, session_id: &str, resume_claude: bool,
+    create: impl FnOnce() -> Result<String, String>,
+) -> Result<(String, bool), String> {
+    if resume_claude {
+        if let Some(message) = pending_claude_resume_message(store, session_id)? {
+            return Ok((message.id, true));
+        }
+    }
+    create().map(|id| (id, false))
+}
+
+fn duplicates_system_reminder(prefix: &str, system_prompt: &str) -> bool {
+    prefix.trim().strip_prefix("<system-reminder>")
+        .and_then(|text| text.strip_suffix("</system-reminder>"))
+        .map(str::trim).is_some_and(|text| !text.is_empty() && system_prompt.contains(text))
+}
+
+pub(super) fn claude_user_prompt(message: &ChatMessage, continuation: Option<&str>, system_prompt: &str) -> String {
+    let prefix = message.prompt_prefix.as_deref().filter(|text| !duplicates_system_reminder(text, system_prompt));
+    let mut prompt = crate::session::history::render_prompt_content(
+        &message.content, prefix, message.prompt_suffix.as_deref(),
+    );
+    if let Some(continuation) = continuation.filter(|text| !text.is_empty()
+        && message.prompt_suffix.as_deref().is_none_or(|suffix| suffix.trim() != text.trim())) {
+        if !prompt.is_empty() { prompt.push_str("\n\n"); }
+        prompt.push_str(continuation);
+    }
+    prompt
+}
+
+fn ensure_claude_history_origin(store: &SessionStore, session_id: &str, pending: Option<&str>) -> Result<(), String> {
+    let messages = store.get_messages(session_id)?;
+    let metadata = store.get_response_request_metadata(session_id)?;
+    let pending = store.claude_recovery_pending_messages(session_id,&messages,&metadata,pending)?;
+    store.verify_claude_history_origin(session_id, &messages, &metadata, &pending)
+}
+
+fn prepare_pending_claude_input(
+    store: &SessionStore, session_id: &str, current: Option<&str>, prompt: &str,
+    remote: &Option<claude_code_cli::ssh::SshConfig>, system_prompt: &str,
+) -> Result<serde_json::Value, String> {
+    let mut messages = store.get_messages(session_id)?;
+    let mut metadata = store.get_response_request_metadata(session_id)?;
+    let mut pending = store.claude_recovery_pending_messages(session_id,&messages,&metadata,current)?;
+    if pending.is_empty() {
+        // Native recovery can prove the input was accepted even when the last
+        // process missed its receipt. Continue that context without replaying it.
+        let previous = messages.iter().find(|m|Some(m.id.as_str())==current);
+        let rendered = previous.map(|m|claude_user_prompt(m,None,system_prompt));
+        let continuation = rendered.as_deref().and_then(|text|prompt.strip_prefix(text)).unwrap_or("").trim();
+        let continuation = if continuation.is_empty() { "Continue from the existing conversation context and finish the current request." } else { continuation };
+        let id = store.add_message(session_id,MessageRole::User,continuation)?;
+        pending.push(id);
+    }
+    let mut tokens = Vec::new();
+    for id in &pending {
+        let receipt = metadata.get(id).and_then(|v|v.get("claude_pending_input"));
+        let token = match receipt {
+            Some(value) if value["version"]==1 => value["token"].as_str().ok_or("Invalid Claude input receipt")?.to_string(),
+            Some(_) => return Err("Unsupported Claude input receipt version".into()),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        uuid::Uuid::parse_str(&token).map_err(|_|"Invalid Claude input receipt token")?;
+        tokens.push(token);
+    }
+    let last = pending.len()-1;
+    let notifications = store.bind_claude_notifications(session_id, &pending[last])?;
+    messages = store.get_messages(session_id)?;
+    let mut earlier = Vec::new();
+    let mut images = Vec::new();
+    let mut final_prompt = String::new();
+    for (index,id) in pending.iter().enumerate() {
+        let message = messages.iter().find(|m|&m.id==id).ok_or("Pending Claude input disappeared")?;
+        let mut value = metadata.remove(id).unwrap_or_else(||serde_json::json!({}));
+        value["backend"] = serde_json::json!("claude_code_cli");
+        value["claude_connection"] = serde_json::json!(remote);
+        value["claude_pending_input"] = serde_json::json!({"version":1,"token":tokens[index],
+            "carrier":if index<last {Some(&tokens[last])} else {None}});
+        store.set_message_response_request_metadata(session_id,id,&value)?;
+        let mut text = if index==last && Some(id.as_str())==current {prompt.to_string()} else {claude_user_prompt(message,None,system_prompt)};
+        if index == last {
+            for reminder in &notifications {
+                if !text.contains(reminder) { text.push_str("\n\n"); text.push_str(reminder); }
+            }
+        }
+        let text = claude_code_cli::recovery::pending_input_text(&tokens[index],&text);
+        if index==last { final_prompt=text; }
+        else { earlier.push(serde_json::json!({"id":id,"token":tokens[index],"text":text})); }
+        images.extend(message.images.iter().flatten().cloned());
+    }
+    let mut user = build_cli_user_message(&final_prompt,Some(&images));
+    user["locusMessageId"] = serde_json::json!(pending[last]);
+    user["locusPendingUsers"] = serde_json::json!(earlier);
+    Ok(user)
+}
+
+fn claude_response_duration_ms(timing: &serde_json::Value) -> u64 {
+    if timing["version"] != 1 || timing["source"] != "claude-turn-step" { return 0; }
+    let Some(start) = timing["requestStartedAtMs"].as_u64() else { return 0; };
+    let Some(stop) = timing["responseStoppedAtMs"].as_u64() else { return 0; };
+    let Some(ready) = timing["resultReadyAtMs"].as_u64() else { return 0; };
+    if ready < stop { return 0; }
+    stop.checked_sub(start).unwrap_or(0)
+}
+
+struct ClaudeQueuedInputs<'a> {
+    steering: super::codex_steering::RunSteering<'a>,
+    agent: &'a AgentInstance,
+    app: &'a AppHandle,
+    initial_skills: &'a HashSet<String>,
+}
+impl claude_code_cli::ClaudeCodeInputSource for ClaudeQueuedInputs<'_> {
+    fn claim(&self)->Result<Option<claude_code_cli::ClaudeCodeInput>,String>{
+        let Some(input)=self.steering.claim_for_claude()? else{return Ok(None);};
+        let mut content=Vec::new();
+        for block in input.input[0]["content"].as_array().ok_or("Invalid pending user input")? {
+            match block["type"].as_str() {
+                Some("input_text")=>content.push(serde_json::json!({"type":"text","text":claude_code_cli::recovery::pending_input_text(&input.id,block["text"].as_str().ok_or("Invalid pending text")?)})),
+                Some("input_image")=>{
+                    let url=block["image_url"].as_str().ok_or("Invalid pending image")?;
+                    let (mime,data)=url.strip_prefix("data:").and_then(|v|v.split_once(";base64,")).ok_or("Pending image is not embedded data")?;
+                    content.push(serde_json::json!({"type":"image","source":{"type":"base64","media_type":mime,"data":data}}));
+                }
+                _=>return Err("Unsupported pending Claude attachment".into()),
+            }
+        }
+        Ok(Some(claude_code_cli::ClaudeCodeInput{id:input.id,message:serde_json::json!({"role":"user","content":content})}))
+    }
+    fn accepted(&self,id:&str,checkpoint:&serde_json::Value)->Result<(),String>{
+        self.steering.committed_claude(id,checkpoint)
+    }
+    fn refresh_tools(&self)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<Option<Vec<claude_code_cli::ClaudeCodeToolDefinition>>,String>>+Send+'_>> {
+        Box::pin(async {
+            self.agent.prepare_active_skill_package_unity_runtimes_if_connected().await;
+            let active=self.agent.active_skill_tool_names(self.initial_skills);
+            let tools=self.agent.build_cli_api_tools(self.agent.dynamic_tool_loading_mode(self.app),&active).await;
+            Ok(Some(convert_api_tools_to_claude_code(&tools)))
+        })
+    }
+}
 
 struct PendingAssistantRound {
     message_id: String,
@@ -57,6 +206,7 @@ struct ClaudeCodeRoundHost<'a> {
     app_handle: &'a AppHandle,
     store: &'a SessionStore,
     run_id: &'a str,
+    input_message_id: Option<String>,
     mode: &'a str,
     active_skill_tool_names: &'a HashSet<String>,
     streamed_text: String,
@@ -67,6 +217,10 @@ struct ClaudeCodeRoundHost<'a> {
     pending_round: Option<PendingAssistantRound>,
     last_assistant: Option<ClaudeCodeAssistantMessage>,
     last_persisted_assistant_message_id: Option<String>,
+    cli_session_id: Option<String>,
+    response_metadata: serde_json::Value,
+    native_checkpoints: Vec<serde_json::Value>,
+    step_message_ids: Vec<String>,
     render_order: StreamRenderOrderTracker,
 }
 
@@ -88,6 +242,169 @@ fn save_claude_code_tool_result(
 }
 
 impl<'a> ClaudeCodeRoundHost<'a> {
+    fn save_assistant_message(&mut self, message: ClaudeCodeAssistantMessage, force_persist: bool) -> Result<(), String> {
+        if message.tool_calls.is_empty() && !force_persist {
+            self.last_assistant = Some(message);
+            return Ok(());
+        }
+
+        if let Some(existing) = self.pending_round.take() {
+            if !existing.remaining.is_empty() {
+                eprintln!(
+                    "[Agent {}] Claude Code CLI emitted a new tool round before the previous one finished",
+                    self.agent.id
+                );
+            }
+        }
+        let text_part = (!message.text.is_empty()).then(|| {
+            self.render_order
+                .mark_text(self.run_id, "claude-code-round-text")
+        });
+        let thinking_part = (!message.thinking_text.is_empty()).then(|| {
+            self.render_order
+                .mark_thinking(self.run_id, "claude-code-round-thinking")
+        });
+        let content_order = text_part.as_ref().map(|part| part.seq);
+        let thinking_order = thinking_part.as_ref().map(|part| part.seq);
+        let ordered_tool_calls = self
+            .render_order
+            .assign_tool_orders_for_run(self.run_id, &message.tool_calls);
+        let render_parts = super::assistant_render_parts_for_response(
+            self.run_id,
+            text_part,
+            &message.text,
+            thinking_part,
+            &message.thinking_text,
+            None,
+            (!message.thinking_signature.is_empty()).then_some(message.thinking_signature.as_str()),
+            &[],
+            &ordered_tool_calls,
+        );
+
+        for tool_call in &ordered_tool_calls {
+            self.emit_tool_call_start(&tool_call.id, &tool_call.name, &tool_call.arguments);
+            self.started_tool_calls
+                .retain(|(id, _)| id != &tool_call.id);
+            if !self.completed_tool_ids.contains(&tool_call.id)
+                && !self.known_tool_calls.iter().any(|tc| tc.id == tool_call.id)
+            {
+                self.known_tool_calls.push_back(tool_call.clone());
+            }
+        }
+
+        let thinking_text = if message.thinking_text.is_empty() {
+            None
+        } else {
+            Some(message.thinking_text.as_str())
+        };
+        let thinking_signature = if message.thinking_signature.is_empty() {
+            None
+        } else {
+            Some(message.thinking_signature.as_str())
+        };
+        let message_id = self.store.add_assistant_with_tool_calls_and_render_parts(
+            &self.agent.session_id,
+            &message.text,
+            &ordered_tool_calls,
+            thinking_text,
+            None,
+            thinking_signature,
+            None,
+            Some(&self.response_metadata),
+            content_order,
+            thinking_order,
+            &render_parts,
+        )?;
+        self.step_message_ids.push(message_id.clone());
+        if let Some(session_id)=self.cli_session_id.as_deref() {
+            self.store.set_message_cli_session_id(&self.agent.session_id,&message_id,CLAUDE_CODE_CLI_PROVIDER,session_id)?;
+        }
+        self.partial_assistant.mark_persisted(
+            message_id.clone(),
+            message.text.clone(),
+            thinking_text.map(str::to_string),
+            None,
+        );
+
+        let remaining: HashSet<String> = ordered_tool_calls
+            .iter()
+            .filter(|tc| !self.completed_tool_ids.contains(&tc.id))
+            .map(|tc| tc.id.clone())
+            .collect();
+
+        self.pending_round = Some(PendingAssistantRound {
+            message_id: message_id.clone(),
+            text: message.text,
+            tool_calls: ordered_tool_calls,
+            remaining,
+            content_order,
+            thinking_order,
+            thinking_text: message.thinking_text,
+            thinking_signature: message.thinking_signature,
+            undo_checked: false,
+            undo_guard: None,
+            has_unity_execute: false,
+            unity_edit_session_started: false,
+            queued_unity_asset_paths: Vec::new(),
+            workspace_guard: None,
+            confirmations_prepared: false,
+            confirmation_preapproved: HashSet::new(),
+            confirmation_rejections: HashMap::new(),
+            subagent_phase_prepared: false,
+            precompleted_subagent_results: HashMap::new(),
+        });
+        self.last_persisted_assistant_message_id = Some(message_id);
+        self.streamed_text.clear();
+        self.maybe_finish_pending_round();
+        self.flush_native_checkpoints()?;
+        Ok(())
+    }
+
+    fn save_response_metadata(&self, id: &str) -> Result<(), String> {
+        let mut value=self.response_metadata.clone();
+        value["claude_run_id"]=serde_json::json!(self.run_id);
+        value["claude_plan_active"]=serde_json::json!(self.agent.plan_mode_main_active());
+        if let Some(saved)=self.store.get_response_request_metadata(&self.agent.session_id)?.get(id) {
+            // Session startup updates model/run metadata before input is
+            // accepted; it must not discard the stable delivery receipt.
+            for key in ["claude_checkpoint","claude_pending_input"] {
+                if let Some(saved)=saved.get(key) {value[key]=saved.clone();}
+            }
+        }
+        self.store.set_message_response_request_metadata(&self.agent.session_id,id,&value)
+    }
+    fn flush_native_checkpoints(&mut self) -> Result<(),String> {
+        let messages=self.store.get_messages(&self.agent.session_id)?;
+        let metadata=self.store.get_response_request_metadata(&self.agent.session_id)?;
+        let notifications=self.store.claude_notification_ids(&self.agent.session_id,&messages,&metadata)?;
+        let current_user=messages.iter().rposition(|message|message.role==MessageRole::User && !notifications.contains(&message.id)).unwrap_or(0);
+        let mut waiting=Vec::new();
+        for event in std::mem::take(&mut self.native_checkpoints) {
+            let tools=event["tools"].as_array().cloned().unwrap_or_default();
+            let results=event["results"].as_array().cloned().unwrap_or_default();
+            let found=messages.iter().enumerate().rev().find(|(index,message)| {
+                if !results.is_empty() {return message.tool_call_id.as_ref().is_some_and(|id|results.iter().any(|v|v.as_str()==Some(id)));}
+                if !tools.is_empty() {return message.tool_calls.as_ref().is_some_and(|calls|calls.iter().any(|call|tools.iter().any(|v|v.as_str()==Some(call.id.as_str()))));}
+                if event["user"]==true {
+                    if message.role!=MessageRole::User || notifications.contains(&message.id) { return false; }
+                    if let Some(submission)=event["submissionId"].as_str() {
+                        return metadata.get(&message.id).is_some_and(|value|value["claude_pending_input"]["token"]==submission);
+                    }
+                    return event["messageId"].as_str().map_or(*index==current_user,|id|message.id==id);
+                }
+                event["role"]=="assistant" && *index>current_user && message.role==MessageRole::Assistant && !message.content.is_empty() && message.content==event["text"].as_str().unwrap_or("")
+            });
+            if let Some((_,message))=found {
+                let mut value=metadata.get(&message.id).cloned().unwrap_or_else(||self.response_metadata.clone());
+                if value.get("claude_plan_active").is_none() {value["claude_plan_active"]=serde_json::json!(self.agent.plan_mode_main_active());}
+                if value.get("claude_run_id").is_none() {value["claude_run_id"]=serde_json::json!(self.run_id);}
+                value["claude_checkpoint"]=serde_json::json!({"version":1,"uuid":event["uuid"],"sessionId":event["sessionId"]});
+                self.store.set_message_response_request_metadata(&self.agent.session_id,&message.id,&value)?;
+            } else if event["user"]==true || event["role"]=="assistant" || !results.is_empty() {waiting.push(event);}
+        }
+        self.native_checkpoints=waiting;
+        Ok(())
+    }
     fn emit_tool_call_start(&mut self, tool_call_id: &str, tool_name: &str, arguments: &str) {
         let mark = self.render_order.mark_tool(self.run_id, tool_call_id);
         emit_stream(
@@ -221,6 +538,19 @@ impl<'a> ClaudeCodeRoundHost<'a> {
     ) -> ToolCallInfo {
         let raw_arguments_str =
             serde_json::to_string(raw_arguments).unwrap_or_else(|_| "{}".to_string());
+
+        // Mods retain Claude's actual tool_use_id; prefer it over name/argument
+        // matching, especially when two parallel calls have identical inputs.
+        if let Some(index) = self
+            .known_tool_calls
+            .iter()
+            .position(|tc| tc.id == request_id)
+        {
+            return self
+                .known_tool_calls
+                .remove(index)
+                .expect("matched native tool call");
+        }
 
         if let Some(index) = self.known_tool_calls.iter().position(|tc| {
             tc.name == tool_name && equivalent_json_args(&tc.arguments, &raw_arguments_str)
@@ -424,7 +754,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             let store = self.store;
             let run_id = self.run_id;
             let mode = self.mode;
-            let active_skill_tool_names = self.active_skill_tool_names;
+            let active_skill_tool_names = self.agent.active_skill_tool_names(self.active_skill_tool_names);
             pending.push(async move {
                 let result = agent
                     .execute_single_tool(
@@ -435,7 +765,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
                         run_id,
                         assistant_message_id,
                         mode,
-                        active_skill_tool_names,
+                        &active_skill_tool_names,
                         false,
                     )
                     .await;
@@ -842,6 +1172,51 @@ impl<'a> ClaudeCodeRoundHost<'a> {
 }
 
 impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
+    fn refresh_tools(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<ClaudeCodeToolDefinition>>, String>> + Send + '_>> {
+        Box::pin(async {
+            let active = self.agent.active_skill_tool_names(self.active_skill_tool_names);
+            let tools = self.agent.build_cli_api_tools(self.agent.dynamic_tool_loading_mode(self.app_handle), &active).await;
+            Ok(Some(convert_api_tools_to_claude_code(&tools)))
+        })
+    }
+    fn on_checkpoint(&mut self,event:&serde_json::Value)->Result<(),String>{
+        self.native_checkpoints.push(event.clone());
+        self.flush_native_checkpoints()?;
+        claude_code_cli::archive::schedule(self.store.clone(),self.agent.session_id.clone());
+        Ok(())
+    }
+    fn on_compaction(&mut self, event: &serde_json::Value) -> Result<(), String> {
+        let usage = self.store.get_token_usage(&self.agent.session_id)?;
+        if event["type"] == "compact_start" {
+            emit_stream(self.app_handle,self.run_id,StreamEvent::CompactStart {
+                session_id:self.agent.session_id.clone(),context_tokens:usage.context_tokens,context_limit:usage.context_limit,
+                trigger:Some(if event["trigger"]=="auto" {crate::commands::CompactTrigger::Auto} else {crate::commands::CompactTrigger::Manual}),
+            });
+        } else {
+            let tokens=event["tokens"].as_u64().or_else(||event["context"]["tokens"].as_u64()).map(|v|v.min(u32::MAX as u64) as u32);
+            let limit=event["context"]["window"].as_u64().map(|v|v.min(u32::MAX as u64) as u32);
+            let usage=self.store.record_token_usage(&self.agent.session_id,0,0,0,0,0.0,0,tokens,limit)?;
+            self.response_metadata["claude_compaction"] = event.clone();
+            if let Some(point)=event.get("checkpoint").filter(|value|value.is_object()) {
+                self.response_metadata["claude_checkpoint"]=point.clone();
+            }
+            let messages=self.store.get_messages_for_prompt(&self.agent.session_id)?;
+            if let Some(boundary)=messages.last() {
+                let summary=event["summary"].as_str().filter(|text|!text.is_empty()).ok_or("Claude compaction returned no summary")?;
+                let handoff=crate::compact::build_post_compact_message(summary,"",boundary.created_at,false,None);
+                self.store.compact_messages_with_response_request(&self.agent.session_id,&handoff,&boundary.id,0,Some(&self.response_metadata))?;
+                if let Some(session_id)=self.cli_session_id.as_deref() {
+                    self.store.set_message_cli_session_id(&self.agent.session_id,&handoff.id,CLAUDE_CODE_CLI_PROVIDER,session_id)?;
+                }
+            }
+            emit_stream(self.app_handle,self.run_id,StreamEvent::CompactDone {
+                session_id:self.agent.session_id.clone(),messages_before:event["before"].as_u64().unwrap_or(0) as u32,
+                messages_after:event["after"].as_u64().unwrap_or(0) as u32,context_tokens:usage.context_tokens,context_limit:usage.context_limit,
+                messages:self.store.get_messages_for_display(&self.agent.session_id)?,
+            });
+        }
+        Ok(())
+    }
     fn on_text_delta(&mut self, delta: String) {
         let mark = self
             .render_order
@@ -887,117 +1262,153 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
         self.started_tool_calls.push_back((tool_call_id, tool_name));
     }
 
-    fn on_assistant_message(&mut self, message: ClaudeCodeAssistantMessage) -> Result<(), String> {
-        if message.tool_calls.is_empty() {
-            self.last_assistant = Some(message);
-            return Ok(());
+    fn on_session_started(&mut self, session_id: &str) -> Result<(), String> {
+        self.cli_session_id=Some(session_id.to_string());
+        if let Some(remote)=self.response_metadata.get("claude_connection").filter(|v|!v.is_null()) {
+            let remote=serde_json::from_value(remote.clone()).map_err(|e|format!("Invalid Claude connection: {e}"))?;
+            self.store.bind_claude_native_session(&self.agent.session_id,&remote,session_id)?;
         }
-
-        if let Some(existing) = self.pending_round.take() {
-            if !existing.remaining.is_empty() {
-                eprintln!(
-                    "[Agent {}] Claude Code CLI emitted a new tool round before the previous one finished",
-                    self.agent.id
-                );
-            }
+        // The user row already exists before launch. Persist the provider resume
+        // point before inference, including a first turn that never completes.
+        if let Some(message_id)=self.input_message_id.as_deref() {
+            self.store.set_message_cli_session_id(&self.agent.session_id,message_id,CLAUDE_CODE_CLI_PROVIDER,session_id)?;
+            self.save_response_metadata(message_id)?;
         }
-        let text_part = (!message.text.is_empty()).then(|| {
-            self.render_order
-                .mark_text(self.run_id, "claude-code-round-text")
-        });
-        let thinking_part = (!message.thinking_text.is_empty()).then(|| {
-            self.render_order
-                .mark_thinking(self.run_id, "claude-code-round-thinking")
-        });
-        let content_order = text_part.as_ref().map(|part| part.seq);
-        let thinking_order = thinking_part.as_ref().map(|part| part.seq);
-        let ordered_tool_calls = self
-            .render_order
-            .assign_tool_orders_for_run(self.run_id, &message.tool_calls);
-        let render_parts = super::assistant_render_parts_for_response(
-            self.run_id,
-            text_part,
-            &message.text,
-            thinking_part,
-            &message.thinking_text,
-            None,
-            (!message.thinking_signature.is_empty()).then_some(message.thinking_signature.as_str()),
-            &[],
-            &ordered_tool_calls,
-        );
-
-        for tool_call in &ordered_tool_calls {
-            self.emit_tool_call_start(&tool_call.id, &tool_call.name, &tool_call.arguments);
-            self.started_tool_calls
-                .retain(|(id, _)| id != &tool_call.id);
-            if !self.completed_tool_ids.contains(&tool_call.id)
-                && !self.known_tool_calls.iter().any(|tc| tc.id == tool_call.id)
-            {
-                self.known_tool_calls.push_back(tool_call.clone());
-            }
-        }
-
-        let thinking_text = if message.thinking_text.is_empty() {
-            None
-        } else {
-            Some(message.thinking_text.as_str())
-        };
-        let thinking_signature = if message.thinking_signature.is_empty() {
-            None
-        } else {
-            Some(message.thinking_signature.as_str())
-        };
-        let message_id = self.store.add_assistant_with_tool_calls_and_render_parts(
-            &self.agent.session_id,
-            &message.text,
-            &ordered_tool_calls,
-            thinking_text,
-            None,
-            thinking_signature,
-            None,
-            None,
-            content_order,
-            thinking_order,
-            &render_parts,
-        )?;
-        self.partial_assistant.mark_persisted(
-            message_id.clone(),
-            message.text.clone(),
-            thinking_text.map(str::to_string),
-            None,
-        );
-
-        let remaining: HashSet<String> = ordered_tool_calls
-            .iter()
-            .filter(|tc| !self.completed_tool_ids.contains(&tc.id))
-            .map(|tc| tc.id.clone())
-            .collect();
-
-        self.pending_round = Some(PendingAssistantRound {
-            message_id: message_id.clone(),
-            text: message.text,
-            tool_calls: ordered_tool_calls,
-            remaining,
-            content_order,
-            thinking_order,
-            thinking_text: message.thinking_text,
-            thinking_signature: message.thinking_signature,
-            undo_checked: false,
-            undo_guard: None,
-            has_unity_execute: false,
-            unity_edit_session_started: false,
-            queued_unity_asset_paths: Vec::new(),
-            workspace_guard: None,
-            confirmations_prepared: false,
-            confirmation_preapproved: HashSet::new(),
-            confirmation_rejections: HashMap::new(),
-            subagent_phase_prepared: false,
-            precompleted_subagent_results: HashMap::new(),
-        });
-        self.last_persisted_assistant_message_id = Some(message_id);
-        self.streamed_text.clear();
-        self.maybe_finish_pending_round();
         Ok(())
+    }
+
+    fn on_model_resolved(&mut self, model: &str) -> Result<(), String> {
+        // Keep the requested model ID stable. The CLI's resolved model is
+        // request metadata, never a new composer selection or catalog entry.
+        self.response_metadata["upstream_model"] = serde_json::json!(model);
+        self.response_metadata["claude_timing"] = serde_json::Value::Null;
+        self.step_message_ids.clear();
+        Ok(())
+    }
+
+    fn on_step_usage(&mut self, usage: &serde_json::Value, context: &serde_json::Value, timing: &serde_json::Value) -> Result<(), String> {
+        if usage["model"].as_str().is_some_and(|value| !value.trim().is_empty()) {
+            self.response_metadata["upstream_model"] = usage["model"].clone();
+        }
+        self.response_metadata["claude_usage"] = usage.clone();
+        self.response_metadata["claude_timing"] = timing.clone();
+        if timing.is_object() {
+            self.response_metadata["claude_timing"]["outputTokens"] = usage["output_tokens"].clone();
+        }
+        for message_id in std::mem::take(&mut self.step_message_ids) {
+            self.save_response_metadata(&message_id)?;
+        }
+        if usage.is_null() { return Ok(()); }
+        let count = |name: &str| usage[name].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
+        let input_tokens = count("input_tokens");
+        let output_tokens = count("output_tokens");
+        let cache_read_tokens = count("cache_read_input_tokens");
+        let cache_write_tokens = count("cache_creation_input_tokens");
+        // A turn may contain many responses. Context is only the latest
+        // response's input, while billing counters accumulate every response.
+        let context_tokens = input_tokens.saturating_add(cache_read_tokens).saturating_add(cache_write_tokens);
+        let context_limit = context["window"].as_u64().filter(|value| *value > 0)
+            .unwrap_or(super::model_context_limit(&self.agent.effective_model) as u64).min(u32::MAX as u64) as u32;
+        let model = usage["model"].as_str().filter(|value| !value.trim().is_empty())
+            .or_else(|| self.response_metadata["upstream_model"].as_str())
+            .or_else(|| self.response_metadata["model"].as_str()).unwrap_or_default();
+        let Some((totals, check)) = self.store.record_model_usage_best_effort(crate::session::store::ModelUsageRecord {
+            session_id: self.agent.session_id.clone(), model_id: format!("claude_code/{model}"),
+            provider: "Claude Code CLI".into(), request_kind: "completion".into(),
+            input_tokens: input_tokens as u64, output_tokens: output_tokens as u64,
+            model_active_duration_ms: claude_response_duration_ms(timing),
+            cache_read_tokens: cache_read_tokens as u64, cache_write_tokens: cache_write_tokens as u64,
+            cost_usd: 0.0, priced_rounds: 0, context_tokens: Some(context_tokens), context_limit: Some(context_limit),
+        }) else {
+            // Raw usage is already retained in response_metadata. Statistics
+            // use bounded retries and must not abort the final answer.
+            return Ok(());
+        };
+        emit_stream(self.app_handle, self.run_id, StreamEvent::UsageUpdate {
+            session_id: self.agent.session_id.clone(), input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+            cache_invalidated: check.as_ref().is_some_and(|check| check.invalidated),
+            cache_baseline_tokens: check.as_ref().map(|check| check.baseline_tokens).unwrap_or(0),
+            cache_invalidation_reason: check.filter(|check| check.invalidated).map(|check| check.reason),
+            total_input_tokens: totals.total_input_tokens, total_output_tokens: totals.total_output_tokens,
+            total_cache_read_tokens: totals.total_cache_read_tokens, total_cache_write_tokens: totals.total_cache_write_tokens,
+            timed_output_tokens: totals.timed_output_tokens, model_active_duration_ms: totals.model_active_duration_ms,
+            total_cost_usd: totals.total_cost_usd, priced_rounds: totals.priced_rounds, context_tokens, context_limit,
+        });
+        Ok(())
+    }
+
+    fn on_assistant_message(&mut self, message: ClaudeCodeAssistantMessage) -> Result<(), String> {
+        self.save_assistant_message(message, false)
+    }
+
+    fn on_interrupted_message(&mut self, message: ClaudeCodeAssistantMessage) -> Result<(), String> {
+        self.last_assistant = None;
+        if message.text.is_empty() && message.thinking_text.is_empty() { return Ok(()); }
+        self.save_assistant_message(message, true)
+    }
+    fn on_external_tool_result<'b>(
+        &'b mut self,
+        id: &'b str,
+        output: String,
+        is_error: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'b>> {
+        Box::pin(async move {
+            // Bridged/MCP executions already persisted their result. This path
+            // records CLI session tools and Mod refusals without executing them.
+            if self.completed_tool_ids.contains(id) {
+                return Ok(());
+            }
+            if self.agent.is_cancel_requested() {
+                return Ok(());
+            }
+            let call = self.known_tool_calls.iter().position(|call| call.id == id)
+                .and_then(|index|self.known_tool_calls.remove(index))
+                .or_else(||self.pending_round.as_ref().and_then(|round|round.tool_calls.iter().find(|call|call.id==id).cloned()));
+            let Some(call)=call else {return Ok(());};
+            let result =
+                ExecutedToolResult::from_tool_result(crate::tool::ToolResult { output, is_error });
+            let output = self.store.rewrite_tool_result_for_storage(
+                &self.agent.session_id,
+                id,
+                &call.name,
+                &result.output,
+            )?;
+            let message_id=save_claude_code_tool_result(
+                self.store,
+                &self.agent.session_id,
+                self.run_id,
+                id,
+                &output,
+                None,
+            )?;
+            let Some(message_id)=message_id else {return Ok(());};
+            if !is_error {
+                if let Some(snapshot)=serde_json::from_str::<serde_json::Value>(&result.output).ok().and_then(|value|value.get("locusTodoSnapshot").cloned()) {
+                    self.store.record_claude_todos(&self.agent.session_id,&message_id,self.run_id,&snapshot)?;
+                }
+            }
+            self.emit_tool_call_done(
+                id,
+                &call.name,
+                &output,
+                result.outcome.as_stream_outcome(),
+                None,
+            );
+            self.completed_tool_ids.insert(id.to_string());
+            if let Some(round) = self.pending_round.as_mut() {
+                if let Some(record) = round.tool_calls.iter_mut().find(|call| call.id == id) {
+                    *record = finalize_tool_call_record(record, Some(&result));
+                }
+                round.remaining.remove(id);
+            }
+            let completion = self.take_cli_mutation_completion_if_ready();
+            self.maybe_finish_pending_round();
+            if let Some(completion) = completion {
+                self.finish_cli_round_external_side_effects(completion)
+                    .await;
+            }
+            Ok(())
+        })
     }
 
     fn execute_tool<'b>(
@@ -1015,7 +1426,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                     Ok((target_name, mut target_args)) => {
                         let allowed = self
                             .agent
-                            .allowed_tool_set_for_active_skills(self.active_skill_tool_names)
+                            .allowed_tool_set_for_active_skills(&self.agent.active_skill_tool_names(self.active_skill_tool_names))
                             .await;
                         if let Some(canonical) =
                             self.agent.canonical_tool_name(&target_name).filter(|name| {
@@ -1219,7 +1630,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                         self.run_id,
                         &assistant_message_id,
                         self.mode,
-                        self.active_skill_tool_names,
+                        &self.agent.active_skill_tool_names(self.active_skill_tool_names),
                         confirmation_preapproved,
                     )
                     .await
@@ -1262,7 +1673,14 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 &stored_output,
                 result.images.as_deref(),
             ) {
-                Ok(Some(_)) => {}
+                Ok(Some(message_id)) => {
+                    if tool_call.name=="todowrite" && !result.is_error {
+                        let snapshot=self.store.get_todos(&self.agent.session_id).map(|todos|serde_json::json!({"version":1,"kind":"todos","items":todos.items}));
+                        if let Err(error)=snapshot.and_then(|snapshot|self.store.record_claude_todos(&self.agent.session_id,&message_id,self.run_id,&snapshot)) {
+                            return ClaudeCodeToolResult{output:format!("Todo update completed but its history snapshot could not be saved: {error}"),is_error:true,images:None};
+                        }
+                    }
+                }
                 Ok(None) => {
                     eprintln!(
                         "[Agent {}] discarding stale Claude Code CLI tool result before save: session={} run={} tool_call_id={}",
@@ -1318,11 +1736,16 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 let manager = self
                     .app_handle
                     .state::<Arc<crate::async_tasks::AsyncTaskManager>>();
-                match manager.deliver_notifications(&self.agent.session_id, self.store) {
+                let delivery = manager.deliver_notifications(&self.agent.session_id, self.store).and_then(|_| {
+                    let messages = self.store.get_messages(&self.agent.session_id)?;
+                    let carrier = messages.iter().find(|message| message.tool_call_id.as_deref() == Some(&tool_call.id))
+                        .ok_or("Missing Claude tool result for notifications")?;
+                    self.store.bind_claude_notifications(&self.agent.session_id, &carrier.id)
+                });
+                match delivery {
                     Ok(reminders) => {
                         for reminder in reminders {
-                            output.push_str("\n\n");
-                            output.push_str(&reminder);
+                            if !output.contains(&reminder) { output.push_str("\n\n"); output.push_str(&reminder); }
                         }
                     }
                     Err(error) => {
@@ -1340,6 +1763,19 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
 }
 
 impl AgentInstance {
+    async fn build_cli_api_tools(
+        &self,
+        dynamic_mode: crate::config::DynamicToolLoadingMode,
+        active_skill_tool_names: &HashSet<String>,
+    ) -> Vec<serde_json::Value> {
+        if self.cached_lazy_tool_renderer() == super::LazyToolRenderer::ClaudeCliNative {
+            let plan = self.build_native_request_tool_plan(super::LazyToolRenderer::ClaudeCliNative, active_skill_tool_names).await;
+            return self.build_api_tools_for_plan(super::LazyToolRenderer::ClaudeCliNative, &plan).await;
+        }
+        let names = self.build_cli_request_tool_names(dynamic_mode, active_skill_tool_names).await;
+        self.build_api_tools(&names).await
+    }
+
     async fn build_cli_request_tool_names(
         &self,
         dynamic_tool_loading_mode: crate::config::DynamicToolLoadingMode,
@@ -1380,59 +1816,92 @@ impl AgentInstance {
         initial_mode: &str,
         run_id: &str,
         active_skill_tool_names: &HashSet<String>,
+        current_user_message_id: Option<&str>,
     ) -> Result<String, String> {
         let dynamic_tool_loading_mode = self.dynamic_tool_loading_mode(app_handle);
         if dynamic_tool_loading_mode == crate::config::DynamicToolLoadingMode::Direct {
             let messages = store.get_messages_for_prompt(&self.session_id)?;
             self.seed_loaded_tools_from_history(&messages).await;
         }
-        let request_tools = self
-            .build_cli_request_tool_names(dynamic_tool_loading_mode, active_skill_tool_names)
+        let api_tools = self
+            .build_cli_api_tools(dynamic_tool_loading_mode, active_skill_tool_names)
             .await;
-        let api_tools = self.build_api_tools(&request_tools).await;
 
-        // The persisted per-message session id is authoritative: it follows
-        // Locus history surgery (rollback, regenerate, message deletion),
-        // while the in-process cache may still point at a Claude session that
-        // contains rolled-back turns. Only fall back to the cache when the
-        // store cannot be read at all, and keep the cache mirroring the
-        // authoritative value so the degraded path stays close to correct.
+        claude_code_cli::tui::prewarm::wait_for(&self.session_id).await?;
+        let pending = if initial_mode == "compact" { None } else { current_user_message_id.map(str::to_owned) };
+        if claude_code_cli::archive::transfer_check(store,&self.session_id)?.is_some() {
+            return Err("The SSH server has changed. Confirm restoring this conversation in the input area before sending.".into());
+        }
+        let compact = initial_mode == "compact";
+        let recovered = if compact {
+            claude_code_cli::recovery::synchronize_for_compaction(store, &self.session_id).await?
+        } else {
+            claude_code_cli::recovery::synchronize(store, &self.session_id, pending.as_deref()).await?
+        };
+        let recovery_required = recovered.warning.is_some() || recovered.resume_context.is_some();
+        if recovered.changed {
+            emit_stream(app_handle, run_id, StreamEvent::HistorySynchronized {
+                session_id: self.session_id.clone(),
+                messages: store.get_messages_for_display(&self.session_id)?,
+            });
+        }
+        if !compact {
+            if let Some(warning) = recovered.warning { return Err(warning); }
+        }
+        ensure_claude_history_origin(store, &self.session_id, pending.as_deref())?;
+        // The durable native binding survives replacement of the display
+        // history and is updated atomically on rewind. Message IDs are only
+        // a legacy fallback; the in-process cache is never the authority.
+        // A failed read must never silently start a replacement conversation.
         let resume_session_id =
-            match store.latest_cli_session_id(&self.session_id, CLAUDE_CODE_CLI_PROVIDER) {
+            match claude_code_cli::recovery::native_session_id(store, &self.session_id) {
                 Ok(persisted) => {
                     match persisted.as_deref() {
                         Some(session_id) => {
                             claude_code_cli::store_session_id(&self.session_id, session_id).await;
                         }
                         None => {
-                            claude_code_cli::clear_session_id(&self.session_id).await;
+                            claude_code_cli::clear_stale_session_id_for_turn(&self.session_id).await;
                         }
                     }
                     persisted
                 }
-                Err(error) => {
-                    eprintln!(
-                        "[Agent {}] failed to load persisted Claude Code CLI session id for {}: {}",
-                        self.id, self.session_id, error
-                    );
-                    claude_code_cli::cached_session_id(&self.session_id).await
-                }
+                Err(error) => return Err(format!("Cannot verify the saved Claude conversation identity: {error}")),
             };
-        if resume_session_id.is_none() && store.get_messages_for_prompt(&self.session_id)?.len() > 1
+        if resume_session_id.is_none() && store.get_messages_for_prompt(&self.session_id)?.iter().any(|m| m.role == MessageRole::Assistant)
         {
-            eprintln!(
-                "[Agent {}] Claude Code CLI session '{}' has no cached Claude session id; existing Locus history will not be replayed",
-                self.id, self.session_id
-            );
+            return Err("This conversation has no verifiable Claude Code session. Create a new Claude Code conversation; existing history was not sent.".into());
         }
 
-        let user_message = build_cli_user_message(prompt_text, images);
+        let recorded_connection = claude_code_cli::recovery::recorded_connection(store,&self.session_id)?;
+        let remote = claude_code_cli::ssh::session_connection(&self.session_id, resume_session_id.is_some(), recorded_connection)?;
+        if !compact {
+            use tauri::Manager;
+            // Synchronize old receipts before deciding which notifications
+            // still need a carrier. Local persistence is not a native ACK.
+            app_handle.state::<Arc<crate::async_tasks::AsyncTaskManager>>()
+                .deliver_notifications(&self.session_id, store)?;
+        }
+        let mut user_message = if initial_mode=="compact" {build_cli_user_message(prompt_text,images)} else {
+            prepare_pending_claude_input(store,&self.session_id,pending.as_deref(),prompt_text,&remote,system_prompt)?
+        };
+        if let Some(context)=recovered.resume_context {
+            if let Some(text)=user_message["content"].as_str() {
+                user_message["content"]=serde_json::json!(format!("{text}\n\n{context}"));
+            } else {
+                user_message["content"].as_array_mut().ok_or("Invalid Claude input content")?.push(serde_json::json!({"type":"text","text":context}));
+            }
+        }
+        if initial_mode == "compact" {
+            user_message["locusControl"] = serde_json::json!("compact");
+        }
         let tools = convert_api_tools_to_claude_code(&api_tools);
         let mut host = ClaudeCodeRoundHost {
             agent: self,
             app_handle,
             store,
             run_id,
+            input_message_id: user_message["locusMessageId"].as_str().map(str::to_owned),
             mode: initial_mode,
             active_skill_tool_names,
             streamed_text: String::new(),
@@ -1443,10 +1912,15 @@ impl AgentInstance {
             pending_round: None,
             last_assistant: None,
             last_persisted_assistant_message_id: None,
+            cli_session_id: None,
+            response_metadata: serde_json::json!({"backend":"claude_code_cli", "model": self.effective_model, "upstream_model": null, "claude_connection": remote, "claude_native_tool_search": self.cached_lazy_tool_renderer() == super::LazyToolRenderer::ClaudeCliNative}),
+            native_checkpoints: Vec::new(),
+            step_message_ids: Vec::new(),
             render_order: StreamRenderOrderTracker::default(),
         };
 
         let options = ClaudeCodeCliOptions {
+            remote,
             locus_session_id: self.session_id.clone(),
             cwd: if self.has_selected_working_dir() {
                 self.working_dir.clone()
@@ -1459,9 +1933,8 @@ impl AgentInstance {
             model: self.effective_model.clone(),
             effort: self.effort.clone(),
             resume_session_id,
-            server_name: "locus".to_string(),
             tools,
-            debug: self.debug,
+            native_tool_search: self.cached_lazy_tool_renderer() == super::LazyToolRenderer::ClaudeCliNative,
         };
         let fallback_request = serde_json::json!({
             "backend": "claude_code_cli",
@@ -1477,8 +1950,19 @@ impl AgentInstance {
             "raw_stdin": user_message,
         });
         let mut cancel_rx = self.cancel_waiter();
+        let input_prefix=store.get_messages_for_prompt(&self.session_id)?.into_iter().find_map(|message|message.prompt_prefix);
+        let input_prefix = input_prefix.filter(|text| !duplicates_system_reminder(text, system_prompt));
+        let inputs=ClaudeQueuedInputs{steering:super::codex_steering::RunSteering::new(self,app_handle,store,run_id,input_prefix.as_deref()),agent:self,app:app_handle,initial_skills:active_skill_tool_names};
         let turn_result = tokio::select! {
-            result = claude_code_cli::run_turn(options, user_message, &mut host) => Some(result),
+            result = async {
+                if compact {
+                    // Queued conversation input must not turn this summary-only
+                    // operation into inference over unresolved tool dispatches.
+                    claude_code_cli::run_turn(options, user_message, &mut host).await
+                } else {
+                    claude_code_cli::run_turn_with_inputs(options, user_message, &mut host, &inputs).await
+                }
+            } => Some(result),
             _ = cancel_rx.changed() => {
                 eprintln!(
                     "[Agent {}] Claude Code CLI turn cancelled before completion: session={} run={}",
@@ -1487,6 +1971,12 @@ impl AgentInstance {
                 None
             }
         };
+        if compact && recovery_required {
+            // A healthy TUI is normally reused without synchronization. Do not
+            // let successful compaction bypass the interrupted-tool guard on
+            // the next ordinary turn. Leave the process alive to flush its rows.
+            claude_code_cli::tui::require_recovery(&self.session_id);
+        }
         let turn = match turn_result {
             Some(Ok(turn)) => turn,
             Some(Err(error)) => {
@@ -1525,76 +2015,6 @@ impl AgentInstance {
 
         if let Some(claude_session_id) = turn.claude_session_id.as_deref() {
             claude_code_cli::store_session_id(&self.session_id, claude_session_id).await;
-        }
-
-        if turn.input_tokens > 0
-            || turn.output_tokens > 0
-            || turn.cache_read_tokens > 0
-            || turn.cache_write_tokens > 0
-        {
-            let context_tokens = turn.input_tokens
-                + turn.output_tokens
-                + turn.cache_read_tokens
-                + turn.cache_write_tokens;
-            let context_limit = super::model_context_limit(&self.effective_model);
-            match store.record_model_usage_with_cache_check(
-                &self.session_id,
-                &self.effective_model,
-                "Claude Code CLI",
-                "completion",
-                turn.input_tokens as u64,
-                turn.output_tokens as u64,
-                0,
-                turn.cache_read_tokens as u64,
-                turn.cache_write_tokens as u64,
-                turn.cost_usd,
-                0,
-                Some(context_tokens),
-                Some(context_limit),
-            ) {
-                Ok((totals, cache_check)) => {
-                    let cache_invalidated =
-                        cache_check.as_ref().is_some_and(|check| check.invalidated);
-                    let cache_baseline_tokens = cache_check
-                        .as_ref()
-                        .map(|check| check.baseline_tokens)
-                        .unwrap_or(0);
-                    let cache_invalidation_reason = cache_check
-                        .as_ref()
-                        .filter(|check| check.invalidated)
-                        .map(|check| check.reason.clone());
-                    emit_stream(
-                        app_handle,
-                        run_id,
-                        StreamEvent::UsageUpdate {
-                            session_id: self.session_id.clone(),
-                            input_tokens: turn.input_tokens,
-                            output_tokens: turn.output_tokens,
-                            cache_read_tokens: turn.cache_read_tokens,
-                            cache_write_tokens: turn.cache_write_tokens,
-                            cache_invalidated,
-                            cache_baseline_tokens,
-                            cache_invalidation_reason,
-                            total_input_tokens: totals.total_input_tokens,
-                            total_output_tokens: totals.total_output_tokens,
-                            total_cache_read_tokens: totals.total_cache_read_tokens,
-                            total_cache_write_tokens: totals.total_cache_write_tokens,
-                            timed_output_tokens: totals.timed_output_tokens,
-                            model_active_duration_ms: totals.model_active_duration_ms,
-                            total_cost_usd: totals.total_cost_usd,
-                            priced_rounds: totals.priced_rounds,
-                            context_tokens,
-                            context_limit,
-                        },
-                    );
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[Agent {}] failed to record Claude Code CLI token usage: {}",
-                        self.id, err
-                    );
-                }
-            }
         }
 
         self.record_captured_attempt(
@@ -1692,7 +2112,7 @@ impl AgentInstance {
                 None,
                 thinking_signature,
                 None,
-                None,
+                Some(&host.response_metadata),
                 done_content_order,
                 done_thinking_order,
                 &done_render_parts,
@@ -1723,6 +2143,12 @@ impl AgentInstance {
             }
         }
 
+        host.flush_native_checkpoints()?;
+        if let Err(error)=claude_code_cli::archive::backup(store,&self.session_id).await {
+            crate::error::AppError::emit_background(app_handle,&crate::error::AppError::new(
+                "claude.archive_failed","Claude session backup was not updated; the previous backup was retained.")
+                .detail(error).operation("claudeArchive").severity(crate::error::ErrorSeverity::Warning));
+        }
         store.close_run_pending_input_queue(run_id)?;
 
         if let Err(error) = store.set_latest_completed_run_id(&self.session_id, Some(run_id)) {
@@ -1778,6 +2204,10 @@ fn convert_api_tools_to_claude_code(
         .filter_map(|tool| {
             let function = tool.get("function")?;
             let name = function.get("name")?.as_str()?.to_string();
+            // Claude's native Read keeps its schema and is executed by Locus.
+            if name == "read" {
+                return None;
+            }
             let description = function
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -1791,6 +2221,7 @@ fn convert_api_tools_to_claude_code(
                 name,
                 description,
                 input_schema,
+                defer_loading: tool.get("defer_loading").and_then(serde_json::Value::as_bool).unwrap_or(false),
             })
         })
         .collect()
@@ -1854,6 +2285,172 @@ fn sanitize_request_id(request_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_notifications_keep_the_real_user_identity_and_retry_payload() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(root.path()).unwrap());
+        let id = store.create_session("notify input", None, None, "chat", None).unwrap();
+        let user = store.add_message(&id, MessageRole::User, "先不要继续跑测试，汇报修改").unwrap();
+        let manager = crate::async_tasks::AsyncTaskManager::new(store.clone()).unwrap();
+        let task = manager.create_task(&id, "unity_test_run", true);
+        manager.prepare_task(&task.task_id, None).unwrap();
+        manager.finish(&task.task_id, &crate::tool::ToolResult { output: "Task cancelled.".into(), is_error: true });
+        let reminders = manager.deliver_notifications(&id, &store).unwrap();
+        assert_eq!(reminders.len(), 1);
+        assert_ne!(store.get_messages(&id).unwrap().last().unwrap().id, user);
+        ensure_claude_history_origin(&store, &id, Some(&user)).unwrap();
+        let wire = prepare_pending_claude_input(&store, &id, Some(&user), "先不要继续跑测试，汇报修改", &None, "").unwrap();
+        assert_eq!(wire["locusMessageId"], user);
+        assert!(wire["locusPendingUsers"].as_array().unwrap().is_empty());
+        let text = wire["content"].as_str().unwrap();
+        assert!(text.contains("先不要继续跑测试，汇报修改"));
+        assert_eq!(text.matches("Task cancelled.").count(), 1);
+        let retry = prepare_pending_claude_input(&store, &id, Some(&user), "先不要继续跑测试，汇报修改", &None, "").unwrap();
+        assert_eq!(wire, retry);
+        assert_eq!(store.get_messages(&id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn claude_prompt_removes_only_repeated_environment_and_continuation_reminders() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let id = store.create_session("native prompt", None, None, "chat", None).unwrap();
+        let environment = "<system-reminder>\nLocal tool host: Windows, F:/project\n</system-reminder>\n";
+        let attachment = "<system-reminder>\nAttached file context\n</system-reminder>";
+        let content = "Keep my literal <system-reminder>Local tool host: Windows, F:/project</system-reminder> text.";
+        store.add_message_with_images_asset_refs_and_signature(&id, MessageRole::User, content,
+            None, None, None, Some(environment), Some(attachment)).unwrap();
+        let message = store.get_messages(&id).unwrap().remove(0);
+        let system = "Locus Agent rules\nLocal tool host: Windows, F:/project";
+        let prompt = claude_user_prompt(&message, Some(attachment), system);
+        assert_eq!(prompt, format!("{content}{attachment}"));
+        assert_eq!(store.get_messages(&id).unwrap()[0].prompt_prefix.as_deref(), Some(environment));
+        let unrelated = claude_user_prompt(&message, Some("Continue"), "Other system context");
+        assert!(unrelated.starts_with(environment.trim_end()));
+        assert!(unrelated.ends_with("Continue"));
+        assert_eq!(unrelated.matches("Attached file context").count(), 1);
+    }
+
+    #[test]
+    fn claude_pending_batch_keeps_order_attachments_and_retries_without_duplicate_rows() {
+        use super::*;
+        use serde_json::json;
+        let root=tempfile::tempdir().unwrap(); let store=SessionStore::new(root.path()).unwrap();
+        let id=store.create_session("pending batch",None,None,"chat",None).unwrap();
+        store.set_session_last_model_id(&id,"claude_code/opus").unwrap();
+        let mut ids=Vec::new();
+        for (i,text) in ["先不要直接合并，向我汇报方案","向我汇报方案"].iter().enumerate() {
+            let run=format!("failed-{i}"); store.try_start_run(&id,&run).unwrap();
+            let image=ImageData{data:format!("image-{i}"),mime_type:"image/png".into(),capture:None};
+            let message=store.add_message_with_images_asset_refs_and_signature(&id,MessageRole::User,text,
+                Some(&[image]),None,None,None,Some("saved attachment context")).unwrap();
+            store.append_session_event(&id,&run,"userMessage",&json!({"message":{"id":message}}).to_string()).unwrap();
+            store.update_run_status(&run,"error",Some("before send")).unwrap(); ids.push(message);
+        }
+        store.try_start_run(&id,"retry").unwrap();
+        ensure_claude_history_origin(&store,&id,Some(&ids[1])).unwrap();
+        let wire=prepare_pending_claude_input(&store,&id,Some(&ids[1]),"向我汇报方案",&None,"").unwrap();
+        assert_eq!(wire["role"],"user"); assert_eq!(wire["locusMessageId"],ids[1]);
+        assert_eq!(wire["locusPendingUsers"][0]["id"],ids[0]);
+        assert!(wire["locusPendingUsers"][0]["text"].as_str().unwrap().contains("先不要直接合并"));
+        assert!(wire["locusPendingUsers"][0]["text"].as_str().unwrap().contains("saved attachment context"));
+        assert_eq!(wire["content"][0]["source"]["data"],"image-0");
+        assert_eq!(wire["content"][1]["source"]["data"],"image-1");
+        let mut metadata=store.get_response_request_metadata(&id).unwrap();
+        // Earlier text was appended, but the final image-bearing prompt was
+        // interrupted. Keep the whole pending batch until that carrier arrives.
+        metadata.get_mut(&ids[0]).unwrap()["claude_checkpoint"]=json!({"version":1,"uuid":uuid::Uuid::new_v4(),"sessionId":uuid::Uuid::new_v4()});
+        store.set_message_response_request_metadata(&id,&ids[0],&metadata[&ids[0]]).unwrap();
+        assert_eq!(store.claude_recovery_pending_messages(&id,&store.get_messages(&id).unwrap(),&metadata,None).unwrap(),ids);
+        let retry=prepare_pending_claude_input(&store,&id,Some(&ids[1]),"向我汇报方案",&None,"").unwrap();
+        assert_eq!(wire,retry);
+        assert_eq!(store.get_messages(&id).unwrap().len(),2);
+        store.update_run_status("retry","error",Some("retry before submission")).unwrap();
+        assert!(store.session_resume_available(&id).unwrap());
+        metadata.get_mut(&ids[1]).unwrap()["claude_checkpoint"]=json!({"version":1,"uuid":uuid::Uuid::new_v4(),"sessionId":uuid::Uuid::new_v4()});
+        store.set_message_response_request_metadata(&id,&ids[1],&metadata[&ids[1]]).unwrap();
+        assert!(store.claude_recovery_pending_messages(&id,&store.get_messages(&id).unwrap(),&metadata,None).unwrap().is_empty());
+        assert!(!store.session_resume_available(&id).unwrap());
+        let resumed=prepare_pending_claude_input(&store,&id,Some(&ids[1]),"向我汇报方案",&None,"").unwrap();
+        assert!(!resumed.to_string().contains("向我汇报方案"));
+        assert!(resumed["locusPendingUsers"].as_array().unwrap().is_empty());
+        assert_ne!(resumed["locusMessageId"],ids[1]);
+    }
+
+    #[test]
+    fn claude_resume_sends_saved_user_text_and_attachments_after_starting_retry() {
+        use super::*;
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let id = store.create_session("resume",None,None,"chat",None).unwrap();
+        let old = store.add_message(&id,MessageRole::Assistant,"already completed work").unwrap();
+        store.set_message_response_request_metadata(&id,&old,&json!({"backend":"claude_code_cli"})).unwrap();
+        store.try_start_run(&id,"failed").unwrap();
+        let image = ImageData { data:"aQ==".into(),mime_type:"image/png".into(),capture:None };
+        let pending = store.add_message_with_images_asset_refs_and_signature(&id,MessageRole::User,
+            "先不要直接合并，向我汇报方案",Some(&[image.clone()]),None,Some("saved intent"),
+            Some("workspace context"),Some("attached file context")).unwrap();
+        store.append_session_event(&id,"failed","userMessage",&json!({"message":{"id":pending}}).to_string()).unwrap();
+        store.update_run_status("failed","error",Some("failed before submission")).unwrap();
+        store.try_start_run(&id,"retry").unwrap();
+
+        for _ in 0..2 {
+            let (message_id, reused) = persist_turn_user_message(&store,&id,true,|| {
+                store.add_message(&id,MessageRole::User,"")
+            }).unwrap();
+            assert!(reused);
+            assert_eq!(message_id,pending);
+            let message = pending_claude_resume_message(&store,&id).unwrap().unwrap();
+            assert_eq!(message.id,pending);
+            let prompt = claude_user_prompt(&message,Some("<system-reminder>Continue</system-reminder>"),"");
+            let wire = build_cli_user_message(&prompt,message.images.as_deref());
+            assert_eq!(wire["role"],"user");
+            assert_eq!(wire["content"][0]["source"]["data"],image.data);
+            let text = wire["content"][1]["text"].as_str().unwrap();
+            for expected in ["先不要直接合并，向我汇报方案","workspace context","attached file context","<system-reminder>Continue"] {
+                assert!(text.contains(expected),"{expected}");
+            }
+            assert!(!text.contains("already completed work"));
+            ensure_claude_history_origin(&store,&id,Some(&message.id)).unwrap();
+            assert_eq!(store.get_messages(&id).unwrap().len(),2);
+            assert_eq!(store.get_messages(&id).unwrap().last().unwrap().thinking_signature.as_deref(),Some("saved intent"));
+        }
+        // Once the native user checkpoint exists, continuing must not resend it.
+        store.set_message_response_request_metadata(&id,&pending,&json!({"backend":"claude_code_cli",
+            "claude_checkpoint":{"uuid":uuid::Uuid::new_v4(),"sessionId":uuid::Uuid::new_v4()}})).unwrap();
+        assert!(pending_claude_resume_message(&store,&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn claude_cli_refuses_api_or_mixed_history() {
+        let root = tempfile::tempdir().unwrap();
+        let store = super::SessionStore::new(root.path()).unwrap();
+        let id = store.create_session("origin", None, None, "chat", None).unwrap();
+        let user = store.add_message(&id, super::MessageRole::User, "new input").unwrap();
+        assert!(super::ensure_claude_history_origin(&store, &id, Some(&user)).is_ok());
+        store.set_message_response_request_metadata(&id, &user, &serde_json::json!({"backend":"claude_code_cli"})).unwrap();
+        let assistant = store.add_message(&id, super::MessageRole::Assistant, "API answer").unwrap();
+        let next = store.add_message(&id, super::MessageRole::User, "continue").unwrap();
+        assert!(super::ensure_claude_history_origin(&store, &id, Some(&next)).is_err());
+        store.set_message_response_request_metadata(&id, &assistant, &serde_json::json!({"backend":"claude_code_cli"})).unwrap();
+        assert!(super::ensure_claude_history_origin(&store, &id, Some(&next)).is_ok());
+        store.add_message(&id, super::MessageRole::Assistant, "foreign answer").unwrap();
+        assert!(super::ensure_claude_history_origin(&store, &id, Some(&next)).is_err());
+    }
+
+    #[test]
+    fn response_timing_ends_at_model_stop_not_tool_completion() {
+        let timing = serde_json::json!({"version":1,"source":"claude-turn-step","requestStartedAtMs":100,"firstOutputAtMs":300,"responseStoppedAtMs":1100,"resultReadyAtMs":21100});
+        assert_eq!(super::claude_response_duration_ms(&timing), 1000);
+        for invalid in [serde_json::Value::Null, serde_json::json!({"version":1}), {
+            let mut value=timing.clone();value["responseStoppedAtMs"]=serde_json::json!(99);value
+        }, {
+            let mut value=timing.clone();value["responseStoppedAtMs"]=serde_json::Value::Null;value
+        }] { assert_eq!(super::claude_response_duration_ms(&invalid), 0); }
+    }
     use super::*;
     use tempfile::tempdir;
 

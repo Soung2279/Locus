@@ -5249,20 +5249,19 @@ async fn generate_commit_message_with_claude_code(
     cwd: &str,
     selected_model: &str,
     user_prompt: &str,
-    debug: bool,
 ) -> Result<String, AppError> {
     let mut host = GitClaudeCodeHost::default();
-    let turn = claude_code_cli::run_turn(
+    let turn = claude_code_cli::run_ephemeral_turn(
         ClaudeCodeCliOptions {
+            remote: claude_code_cli::ssh::load_settings()?.remote,
             locus_session_id: format!("git_commit_{}", uuid::Uuid::new_v4()),
             cwd: cwd.to_string(),
             system_prompt: "You are a git commit message generator.".to_string(),
             model: selected_model.to_string(),
             effort: None,
             resume_session_id: None,
-            server_name: "locus".to_string(),
             tools: Vec::new(),
-            debug,
+            native_tool_search: false,
         },
         serde_json::json!({
             "role": "user",
@@ -5517,7 +5516,6 @@ pub async fn git_generate_commit_message(
             &cwd,
             selected_model,
             &user_prompt,
-            config.debug_enabled(),
         )
         .await?
     } else if matches!(provider, Some(CommitMessageModelProvider::AnthropicDirect)) {

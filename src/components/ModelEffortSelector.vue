@@ -6,7 +6,13 @@ import { visibleProviderOrder } from "../config/providerVisibility";
 import { formatModelOptionDisplayName } from "../utils/modelDisplay";
 import { groupModelsForSelector, modelListEntryName, type ModelSelectorGroup } from "../utils/modelGrouping";
 import { agentProjectTypesLabel } from "../utils/agentProjectTypes";
+import { getClaudeConnection, isRemoteClaudeCode } from "../services/claudeConnection";
 import { createAnimationFrameResizeObserver } from "../composables/resizeObserver";
+import { Pin } from "lucide";
+import { normalizeAppError } from "../services/errors";
+import { useNotificationStore } from "../stores/notification";
+import { useSelectionMemoryStore } from "../stores/selectionMemory";
+import LucideIcon from "./icons/LucideIcon.vue";
 import BaseSwitch from "./ui/BaseSwitch.vue";
 import WorktreeSelectorPanel from "./chat/WorktreeSelectorPanel.vue";
 import type { WorkspaceRef } from "../services/project";
@@ -77,6 +83,7 @@ function positionDropdown() {
 
 watch(open, (isOpen, _previous, onCleanup) => {
   if (!isOpen) return;
+  void getClaudeConnection().catch(error => console.warn("get_claude_connection failed:", error));
   const ownerDocument = selectorRef.value?.ownerDocument;
   const ownerWindow = ownerDocument?.defaultView;
   if (!ownerDocument || !ownerWindow) return;
@@ -102,7 +109,7 @@ watch(() => props.align, positionDropdown, { flush: "post" });
 const providerLabels = computed<Record<string, string>>(() => ({
   openrouter: "OpenRouter",
   anthropic: t("model.provider.anthropic"),
-  claude_code: t("model.provider.claude_code"),
+  claude_code: t(isRemoteClaudeCode.value ? "model.provider.claude_code.remote" : "model.provider.claude_code"),
   openai_codex: t("model.provider.openai"),
   custom: t("model.provider.custom"),
   mock: t("model.provider.mock"),
@@ -111,7 +118,7 @@ const providerLabels = computed<Record<string, string>>(() => ({
 const providerShortLabels = computed<Record<string, string>>(() => ({
   openrouter: "OR",
   anthropic: t("model.provider.anthropic.short"),
-  claude_code: t("model.provider.claude_code.short"),
+  claude_code: t(isRemoteClaudeCode.value ? "model.provider.claude_code.remote" : "model.provider.claude_code.short"),
   openai_codex: t("model.provider.openai.short"),
   custom: t("model.provider.custom"),
   mock: t("model.provider.mock.short"),
@@ -127,7 +134,7 @@ const selectedAgent = computed(() =>
 
 const selectedDisplayName = computed(() => {
   const selected = selectedModel.value;
-  if (!selected) return "Model";
+  if (!selected) return props.selectedId.startsWith("claude_code/") ? props.selectedId.slice(12) : "Model";
   const displayName = optionDisplayName(selected);
   const duplicated = props.models.some((model) => model.id !== selected.id && optionDisplayName(model) === displayName);
   if (!duplicated) return displayName;
@@ -198,6 +205,23 @@ function selectAgent(id: string) {
   emit("selectAgent", id);
 }
 
+const defaultSavingAgentId = ref("");
+
+/** Makes the Agent this workspace's default; a new session also switches to it. */
+async function setWorkspaceDefaultAgent(agentId: string) {
+  const workspaceRef = props.workspaceRef;
+  if (!workspaceRef || defaultSavingAgentId.value || props.disabled || worktreeBusy.value) return;
+  defaultSavingAgentId.value = agentId;
+  try {
+    await useSelectionMemoryStore().setWorkspaceDefaultAgent({ ...workspaceRef }, agentId);
+    if (!props.agentLocked) emit("selectAgent", agentId);
+  } catch (error) {
+    useNotificationStore().addNotice("error", normalizeAppError(error).message);
+  } finally {
+    defaultSavingAgentId.value = "";
+  }
+}
+
 function modelDisplayName(model: ModelOption): string {
   return formatModelOptionDisplayName(model, props.fastModeEnabled === true);
 }
@@ -266,21 +290,37 @@ function onClickOutside(event: MouseEvent) {
         >
           <div v-if="hasAgentPanel" class="model-effort-agent-panel">
             <div class="model-effort-section-label">Agent</div>
-            <button
-              v-for="agent in agents"
-              :key="agent.id"
-              type="button"
-              class="model-effort-option ui-select-none"
-              :class="{ active: agent.id === selectedAgentId }"
-              :disabled="disabled || worktreeBusy || agentLocked"
-              :title="agent.description"
-              @click="selectAgent(agent.id)"
-            >
-              <span class="model-effort-option-name">{{ agent.name }}</span>
-              <span v-if="agentProjectTypesLabel(agent)" class="model-effort-option-meta">
-                {{ agentProjectTypesLabel(agent) }}
-              </span>
-            </button>
+            <div v-for="agent in agents" :key="agent.id" class="model-effort-agent-row">
+              <button
+                type="button"
+                class="model-effort-option ui-select-none"
+                :class="{ active: agent.id === selectedAgentId }"
+                :disabled="disabled || worktreeBusy || agentLocked"
+                :title="agent.description"
+                @click="selectAgent(agent.id)"
+              >
+                <span class="model-effort-option-name">{{ agent.name }}</span>
+                <span
+                  v-if="workspaceRef && agent.isDefault"
+                  class="model-effort-option-meta model-effort-default-badge"
+                  :title="t('agent.workspaceDefault')"
+                >{{ t("agent.selector.default") }}</span>
+                <span v-else-if="agentProjectTypesLabel(agent)" class="model-effort-option-meta">
+                  {{ agentProjectTypesLabel(agent) }}
+                </span>
+              </button>
+              <button
+                v-if="workspaceRef && !agent.isDefault"
+                type="button"
+                class="model-effort-agent-pin ui-select-none"
+                :title="t('agent.setWorkspaceDefault')"
+                :aria-label="t('agent.setWorkspaceDefault')"
+                :disabled="disabled || worktreeBusy || !!defaultSavingAgentId"
+                @click.stop="setWorkspaceDefaultAgent(agent.id)"
+              >
+                <LucideIcon :icon="Pin" :size="12" />
+              </button>
+            </div>
           </div>
 
           <div class="model-effort-model-panel">
@@ -621,6 +661,49 @@ function onClickOutside(event: MouseEvent) {
   color: var(--text-tertiary, var(--text-secondary));
   font-size: 10px;
   white-space: nowrap;
+}
+
+.model-effort-agent-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.model-effort-default-badge {
+  color: var(--accent-color);
+}
+
+.model-effort-agent-pin {
+  position: absolute;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: var(--bg-color);
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.model-effort-agent-row:hover .model-effort-agent-pin,
+.model-effort-agent-pin:focus-visible {
+  opacity: 1;
+}
+
+.model-effort-agent-pin:hover {
+  color: var(--accent-color);
+  background: var(--hover-bg);
+}
+
+.model-effort-agent-pin:disabled {
+  cursor: default;
+  opacity: 0;
 }
 
 .dropdown-enter-active,

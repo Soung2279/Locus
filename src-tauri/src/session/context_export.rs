@@ -20,7 +20,7 @@ mod message_tests;
 use message_turn::MessageTurnSelection;
 
 const EXPORT_FORMAT: &str = "locus.context_review";
-const EXPORT_FORMAT_VERSION: u32 = 10;
+const EXPORT_FORMAT_VERSION: u32 = 13;
 const EMPTY: &str = "empty";
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +93,7 @@ struct SourceMetadata {
 
 #[derive(Serialize)]
 struct SessionExport {
+    captures: Value,
     async_tasks: Value,
     agent_messages: Value,
     metadata: Value,
@@ -249,7 +250,9 @@ fn export_context_yaml(
         let usage = store.get_token_usage(session_id).ok();
         let mut cache_invalidations = store.list_cache_invalidations(session_id)?;
         let todos = store.get_todos(session_id).ok();
-        let mut messages = detail.messages.clone();
+        // Export persisted evidence, not the UI projection: display filtering
+        // hides internal notifications and may synthesize tool-round records.
+        let mut messages = store.get_messages(session_id)?;
         if let Some(selection) = &selection {
             messages.retain(|message| selection.message_ids.contains(&message.id));
             cache_invalidations.retain(|entry| selection.message_ids.contains(&entry.message_id));
@@ -267,11 +270,27 @@ fn export_context_yaml(
                     .filter(|value| !value.is_null()).cloned().unwrap_or_else(empty_value);
                 let upstream_model = response_metadata.get(&message.id)
                     .and_then(crate::llm::upstream_model::from_request);
+                let claude_connection = export_claude_connection(response_metadata.get(&message.id));
+                let claude_metadata = response_metadata.get(&message.id);
                 let mut exported = export_message(message)?;
                 exported["upstreamModel"] = upstream_model
                     .map(Value::String).unwrap_or_else(empty_value);
                 exported["codexResponse"] = response;
                 exported["codexReasoning"] = reasoning;
+                exported["claudeConnection"] = claude_connection;
+                for (export_key, metadata_key) in [
+                    ("claudeCheckpoint", "claude_checkpoint"),
+                    ("claudePendingInput", "claude_pending_input"),
+                    ("claudeQueuedInputMigration", "claude_queued_input_migration"),
+                    ("claudeTodos", "claude_todos"),
+                    ("claudePlanActive", "claude_plan_active"),
+                    ("claudeTiming", "claude_timing"),
+                    ("claudeNative", "claude_native"),
+                    ("locusClaudeNotification", "locus_claude_notification"),
+                ] {
+                    exported[export_key] = claude_metadata.and_then(|value| value.get(metadata_key))
+                        .filter(|value| !value.is_null()).cloned().unwrap_or_else(empty_value);
+                }
                 Ok::<_, String>(exported)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -325,6 +344,8 @@ fn export_context_yaml(
         };
 
         let metadata = json!({
+            "claudeNativeBinding":store.claude_native_binding(session_id)?.map(|(remote,native)|json!({"connection":remote,"nativeId":native.map(Value::String).unwrap_or_else(empty_value)})).unwrap_or_else(empty_value),
+            "claudeNativeArchive":store.claude_archive_info(session_id)?.map(|info|serde_json::to_value(info).unwrap_or_else(|_|empty_value())).unwrap_or_else(empty_value),
             "sessionId": detail.id,
             "title": non_empty_value(Some(&detail.title)),
             "agentId": non_empty_value(detail.agent_id.as_deref()),
@@ -360,7 +381,9 @@ fn export_context_yaml(
         let pending_inputs = if pending_inputs.is_empty() {
             empty_value()
         } else {
-            serde_json::to_value(pending_inputs).unwrap_or_else(|_| empty_value())
+            let mut value = serde_json::to_value(pending_inputs).unwrap_or_else(|_| empty_value());
+            normalize_capture_export(&mut value);
+            value
         };
         let runtime = live_session
             .and_then(|session| session.runtime.as_ref())
@@ -386,6 +409,12 @@ fn export_context_yaml(
             }
         }
         sessions.push(SessionExport {
+            captures: {
+                let mut ids=std::collections::BTreeSet::new();
+                collect_capture_ids(&json!(messages),&mut ids);
+                collect_capture_ids(&pending_inputs,&mut ids);
+                store.export_captures(&ids)?
+            },
             async_tasks,
             agent_messages: if selection.is_some() {
                 empty_value()
@@ -571,6 +600,30 @@ fn export_context_yaml(
     })
 }
 
+fn normalize_capture_export(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("mimeType") && map.contains_key("data") && map.get("capture").is_none_or(Value::is_null) { map.insert("capture".into(), empty_value()); }
+            for child in map.values_mut() { normalize_capture_export(child); }
+        }
+        Value::Array(items) => for child in items { normalize_capture_export(child); },
+        _ => {}
+    }
+}
+fn collect_capture_ids(value:&Value,ids:&mut std::collections::BTreeSet<String>) {
+    match value {
+        Value::Object(map)=>{if let Some(id)=map.get("capture").and_then(|c|c.get("id")).and_then(Value::as_str){ids.insert(id.into());}for child in map.values(){collect_capture_ids(child,ids);}},
+        Value::Array(items)=>{for child in items{collect_capture_ids(child,ids);}},
+        _=>{}
+    }
+}
+fn export_images(images:Option<Vec<crate::session::models::ImageData>>)->Result<Value,String>{
+    let Some(images)=images else{return Ok(empty_value());};
+    let mut images=serde_json::to_value(images).map_err(|e|e.to_string())?;
+    if let Some(values)=images.as_array_mut(){for image in values{if image.get("capture").is_none_or(Value::is_null){image["capture"]=empty_value();}}}
+    Ok(images)
+}
+
 fn export_message(message: ChatMessage) -> Result<Value, String> {
     fn optional_json<T: Serialize>(value: Option<T>) -> Result<Value, String> {
         value
@@ -621,7 +674,7 @@ fn export_message(message: ChatMessage) -> Result<Value, String> {
         "thinkingOrder": optional_json(message.thinking_order)?,
         "toolCalls": optional_json(message.tool_calls)?,
         "toolCallId": non_empty_value(message.tool_call_id.as_deref()),
-        "images": optional_json(message.images)?,
+        "images": export_images(message.images)?,
         "assetRefs": optional_json(message.asset_refs)?,
         "thinkingContent": non_empty_value(message.thinking_content.as_deref()),
         "thinkingDuration": optional_json(message.thinking_duration)?,
@@ -995,6 +1048,14 @@ fn non_empty_value(value: Option<&str>) -> Value {
         .unwrap_or_else(empty_value)
 }
 
+fn export_claude_connection(metadata: Option<&Value>) -> Value {
+    match metadata.and_then(|value| value.get("claude_connection")) {
+        Some(Value::Null) => json!({"version":1,"transport":"local"}),
+        Some(config) => json!({"version":1,"transport":"ssh","config":config}),
+        None => empty_value(),
+    }
+}
+
 fn empty_value() -> Value {
     Value::String(EMPTY.to_string())
 }
@@ -1135,6 +1196,17 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn claude_connection_export_distinguishes_legacy_local_and_remote() {
+        assert_eq!(export_claude_connection(None), empty_value());
+        assert_eq!(export_claude_connection(Some(&json!({"model":"legacy"}))), empty_value());
+        assert_eq!(export_claude_connection(Some(&json!({"claude_connection":null})))["transport"], "local");
+        let remote = json!({"claude_connection":{"target":"test@host","port":22}});
+        let exported = export_claude_connection(Some(&remote));
+        assert_eq!(exported["version"], 1);
+        assert_eq!(exported["config"]["target"], "test@host");
+    }
+
+    #[test]
     fn exports_parseable_yaml_for_session_without_provider_attempts() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("create store");
@@ -1164,6 +1236,9 @@ mod tests {
             Some(EMPTY)
         );
         assert_eq!(yaml["sessions"][0]["compactions"].as_str(), Some(EMPTY));
+        for field in ["claudeCheckpoint", "claudePendingInput", "claudeQueuedInputMigration", "claudeTodos", "claudePlanActive", "claudeTiming", "claudeNative"] {
+            assert_eq!(yaml["sessions"][0]["messages"][0][field].as_str(), Some(EMPTY));
+        }
         assert_eq!(
             yaml["sessions"][0]["cache_invalidations"].as_str(),
             Some(EMPTY)

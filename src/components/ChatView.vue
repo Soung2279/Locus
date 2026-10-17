@@ -1,5 +1,7 @@
 
 <script setup lang="ts">
+import { useWindowSurface } from "../composables/useWindowSurface";
+const { ownerWindow, ownerDocument, unityEmbedded } = useWindowSurface();
 import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
 import { BookOpen, Copy, Crosshair, ExternalLink, FileDiff, FileSearch, FolderOpen, GitFork, PanelTopOpen, PencilLine, Undo2 } from "lucide";
 import {
@@ -22,6 +24,7 @@ import ChatTurnNavigationRail from "./chat/ChatTurnNavigationRail.vue";
 import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue";
 import QueuedFollowUpImages from "./chat/QueuedFollowUpImages.vue";
 import RichChatInput from "./chat/RichChatInput.vue";
+import BackgroundTasksIndicator from "./chat/BackgroundTasksIndicator.vue";
 import TokenUsageBar from "./chat/TokenUsageBar.vue";
 import SessionContextUsageWindow from "./SessionContextUsageWindow.vue";
 import AskUserCard from "./chat/AskUserCard.vue";
@@ -43,6 +46,7 @@ import {
   type LocusAssetInspectorTarget,
 } from "../services/locusAssetInspector";
 import { normalizeAppError } from "../services/errors";
+import { useClaudeSessionTransfer } from "../composables/useClaudeSessionTransfer";
 import { knowledgeRevealTarget } from "../services/knowledge";
 import { t } from "../i18n";
 import { useChatChangesStore } from "../stores/chatChanges";
@@ -296,6 +300,11 @@ const props = defineProps<{
   activeSessionId: string | null;
   /** Whether this session is the active tab in the focused pane. */
   active?: boolean;
+  /**
+   * Whether the host shows this surface. False while a workbench editor is
+   * prepared behind the previous one or sits in a hidden tab; omitted means shown.
+   */
+  presented?: boolean;
   pendingSessionId?: string | null;
   unityConnected?: boolean;
   unityPluginStatus?: "missing" | "outdated" | null;
@@ -546,7 +555,7 @@ const messageCtxMenu = ref<MessageContextMenuState | null>(null);
 
 function isUnityEmbeddedWindow() {
   if (typeof window === "undefined") return false;
-  return window.location.pathname === "/unity-embed";
+  return unityEmbedded || ownerWindow.location.pathname === "/unity-embed";
 }
 
 function isUnityAssetPath(filePath: string) {
@@ -584,7 +593,12 @@ const assetRefContextCanSelectInUnity = computed(() => {
   if (target.kind !== "asset") return false;
   return shouldSelectUnityAsset(target.assetPath);
 });
-const knowledgeAccessMode = computed(() => knowledgeAccessState.mode);
+const workspaceKnowledgeEnabled = computed(() => {
+  const checkoutId = props.workspaceRef?.checkoutId ?? workspaceContextStore.focusedCheckout?.checkoutId;
+  const checkout = checkoutId ? workspaceContextStore.checkoutsById[checkoutId] : null;
+  return (checkout?.knowledgeEnabled ?? checkout?.runtime?.knowledgeEnabled) !== false;
+});
+const knowledgeAccessMode = computed(() => workspaceKnowledgeEnabled.value ? knowledgeAccessState.mode : "disabled");
 
 const assetRefContextIsKnowledge = computed(() =>
   assetRefCtxMenu.value?.target.kind === "knowledge",
@@ -798,7 +812,7 @@ function handleContentContextMenu(e: MouseEvent) {
   if (e.target.closest(".unity-property-fence, [data-md-unity-property-fence='true']")) return;
   const selectionText = typeof window === "undefined"
     ? ""
-    : selectionTextAtPoint(window.getSelection(), { x: e.clientX, y: e.clientY });
+    : selectionTextAtPoint(ownerWindow.getSelection(), { x: e.clientX, y: e.clientY });
   if (!selectionText) {
     const target = assetContextTargetFromElement(e.target);
     if (target) {
@@ -1461,8 +1475,32 @@ const NEW_CHAT_DRAFT_KEY = "__new_chat__";
 const inputText = ref(props.composerValue ?? "");
 const composerDrafts = ref(new Map<string, string>());
 const composerPanelRef = ref<InstanceType<typeof RichChatInput> | null>(null);
+const claudeTransfer = useClaudeSessionTransfer(() => ({
+  sessionId: props.activeSessionId,
+  modelId: props.selectedModelId,
+  enabled: props.models.some(model => model.id === props.selectedModelId && model.provider === "claude_code"),
+}));
+const { pending: claudeTransferPending, busy: claudeTransferBusy, error: claudeTransferError } = claudeTransfer;
+async function restoreClaudeAndSend() {
+  const sessionId = props.activeSessionId;
+  const modelId = props.selectedModelId;
+  const draft = JSON.stringify(composerPanelRef.value?.exportDraft());
+  if (!await claudeTransfer.restore()) return;
+  if (sessionId !== props.activeSessionId || modelId !== props.selectedModelId) return;
+  claudeTransferBusy.value = true;
+  try {
+    await chatStore.refreshSessionAfterExternalChange(sessionId!);
+  } catch (error) {
+    claudeTransferError.value = normalizeAppError(error).message;
+    return;
+  } finally { claudeTransferBusy.value = false; }
+  await nextTick();
+  if (sessionId !== props.activeSessionId || modelId !== props.selectedModelId || draft !== JSON.stringify(composerPanelRef.value?.exportDraft())) return;
+  await composerPanelRef.value?.send();
+}
 const transcriptRef = ref<InstanceType<typeof ChatTranscript> | null>(null);
 const transcriptScrollElement = computed(() => transcriptRef.value?.getScrollElement() ?? null);
+const turnNavigationRailRef = ref<InstanceType<typeof ChatTurnNavigationRail> | null>(null);
 
 function draftSessionKey(sessionId: string | null) {
   return sessionId ?? NEW_CHAT_DRAFT_KEY;
@@ -1832,6 +1870,20 @@ defineExpose({
   exportComposerDraft,
   focusComposerInput,
   isComposerDraftEmpty,
+  exportWorkStateScroll: () => {
+    if (props.activeSessionId && (pendingRestoreSessionId.value || props.sessionHistoryLoading)) {
+      return getSessionScrollState(props.activeSessionId);
+    }
+    const element = getMessagesElement();
+    return element ? captureCurrentSessionScrollState(element) : null;
+  },
+  restoreWorkStateScroll: (state: SessionScrollState) => {
+    const sessionId = props.activeSessionId;
+    if (!sessionId) return;
+    rememberSessionScrollState(sessionId, state);
+    if (pendingRestoreSessionId.value) restorePendingSessionScroll({ defer: true });
+    else scheduleSessionRestoreFollowup(sessionId, state);
+  },
 });
 
 function canApplyPendingChatPrefill(prefill: NonNullable<typeof uiStore.pendingChatPrefill>) {
@@ -1936,6 +1988,7 @@ const showWelcomeState = computed(
 
 const pendingRestoreSessionId = ref<string | null>(null);
 const pendingRestoreMessagesRef = ref<ChatMessage[] | null>(null);
+const surfacePresented = computed(() => props.presented !== false);
 const toolHandoffViewportQuiet = ref(false);
 let sessionRestoreFrame = 0;
 let suppressScrollCapture = false;
@@ -2201,7 +2254,7 @@ function requestViewportFrame(callback: () => void): number {
   if (typeof requestAnimationFrame === "function") {
     return requestAnimationFrame(() => callback());
   }
-  return window.setTimeout(callback, 16);
+  return ownerWindow.setTimeout(callback, 16);
 }
 
 function cancelViewportFrame(handle: number) {
@@ -2209,7 +2262,7 @@ function cancelViewportFrame(handle: number) {
     cancelAnimationFrame(handle);
     return;
   }
-  window.clearTimeout(handle);
+  ownerWindow.clearTimeout(handle);
 }
 
 function cancelSessionRestoreFrame() {
@@ -2482,6 +2535,9 @@ watch(toolHandoffViewportQuiet, (quiet, previousQuiet) => {
 });
 
 function reconcileViewport(forceBottom = false) {
+  // A surface that is not shown is aligned when it is presented; measuring it
+  // now would force a layout that its presentation invalidates.
+  if (!surfacePresented.value) return;
   if (toolHandoffViewportQuiet.value) {
     return;
   }
@@ -2755,7 +2811,7 @@ let transcriptObservedViewportWidth = 0;
 
 function readTranscriptViewportWidth() {
   if (typeof window === "undefined") return 0;
-  return Math.max(1, Math.round(window.innerWidth || document.documentElement?.clientWidth || 0));
+  return Math.max(1, Math.round(ownerWindow.innerWidth || ownerDocument.documentElement?.clientWidth || 0));
 }
 
 function isLiveResizeInProgress() {
@@ -2913,6 +2969,51 @@ watch(
     if (!pendingRestoreSessionId.value || pendingRestoreSessionId.value !== props.activeSessionId) return;
     if (messages === pendingRestoreMessagesRef.value) return;
     restorePendingSessionScroll();
+  },
+  { flush: "post" },
+);
+
+function measurableTranscriptElement(): HTMLElement | null {
+  const el = getMessagesElement();
+  return el && el.clientHeight > 0 && !showWelcomeState.value ? el : null;
+}
+
+// A ChatView mounted with its transcript already loaded restores the viewport
+// while mounting, so the first painted frame is at the restored position
+// instead of the top. A surface that is not presented yet (a workbench editor
+// prepared behind the previous one) restores once when it is presented:
+// measuring it earlier would lay out the whole transcript twice before its
+// first frame.
+function restoreMountedSessionViewport() {
+  const sessionId = props.activeSessionId;
+  if (!sessionId || !surfacePresented.value || pendingRestoreSessionId.value) return;
+  if (!measurableTranscriptElement()) return;
+  beginSessionRestoreLayoutStabilization();
+  pendingRestoreSessionId.value = sessionId;
+  pendingRestoreMessagesRef.value = null;
+  restorePendingSessionScroll();
+  turnNavigationRailRef.value?.measureNow(getMessagesElement());
+}
+
+// The host presents a prepared surface in the task that flips `presented`.
+// The viewport is aligned here, before the first visible paint, rather than by
+// the frame-deferred resize reconcile.
+function alignViewportForPresentation() {
+  const sessionId = props.activeSessionId;
+  if (!sessionId || !measurableTranscriptElement()) return;
+  if (pendingRestoreSessionId.value) {
+    if (pendingRestoreSessionId.value === sessionId) restorePendingSessionScroll();
+  } else {
+    restoreMessagesScrollState(getSessionScrollState(sessionId), sessionId);
+  }
+  // The rail reads the aligned viewport; laying it out now keeps it in this frame.
+  turnNavigationRailRef.value?.measureNow(getMessagesElement());
+}
+
+watch(
+  surfacePresented,
+  (presented, wasPresented) => {
+    if (presented && !wasPresented) alignViewportForPresentation();
   },
   { flush: "post" },
 );
@@ -3178,8 +3279,8 @@ function onSessionSplitterMouseDown(e: MouseEvent) {
   isDraggingSession.value = true;
   releaseSessionSelectionLock?.();
   releaseSessionSelectionLock = acquireSelectionLock();
-  document.addEventListener("mousemove", onSessionSplitterMouseMove);
-  document.addEventListener("mouseup", onSessionSplitterMouseUp);
+  ownerDocument.addEventListener("mousemove", onSessionSplitterMouseMove);
+  ownerDocument.addEventListener("mouseup", onSessionSplitterMouseUp);
 }
 
 function onSessionSplitterMouseMove(e: MouseEvent) {
@@ -3191,8 +3292,8 @@ function onSessionSplitterMouseMove(e: MouseEvent) {
 function onSessionSplitterMouseUp() {
   flushSessionSplitterWidth();
   isDraggingSession.value = false;
-  document.removeEventListener("mousemove", onSessionSplitterMouseMove);
-  document.removeEventListener("mouseup", onSessionSplitterMouseUp);
+  ownerDocument.removeEventListener("mousemove", onSessionSplitterMouseMove);
+  ownerDocument.removeEventListener("mouseup", onSessionSplitterMouseUp);
   releaseSessionSelectionLock?.();
   releaseSessionSelectionLock = null;
   try { localStorage.setItem(sessionPanelWidthStorageKey.value, String(sessionPanelWidth.value)); } catch {}
@@ -3274,7 +3375,7 @@ watch(
 );
 
 onMounted(() => {
-  window.addEventListener("keydown", onGlobalChatKeydown);
+  ownerWindow.addEventListener("keydown", onGlobalChatKeydown);
   try {
     const saved = localStorage.getItem(sessionPanelWidthStorageKey.value);
     if (saved) sessionPanelWidth.value = Math.max(140, Math.min(480, Number(saved)));
@@ -3285,13 +3386,14 @@ onMounted(() => {
       ? !!props.defaultSessionPanelCollapsed
       : saved === "1";
   } catch {}
+  restoreMountedSessionViewport();
   nextTick(() => {
     connectTranscriptResizeObserver();
   });
 });
 
 onUnmounted(() => {
-  window.removeEventListener("keydown", onGlobalChatKeydown);
+  ownerWindow.removeEventListener("keydown", onGlobalChatKeydown);
   clearCancelShortcutConfirmation();
   rememberScrollForSession();
   clearInputControlsSwitchTimer();
@@ -3306,8 +3408,8 @@ onUnmounted(() => {
   clearStreamingTextFlushTimer();
   cancelSessionSplitterFrame();
   disconnectTranscriptResizeObserver();
-  document.removeEventListener("mousemove", onSessionSplitterMouseMove);
-  document.removeEventListener("mouseup", onSessionSplitterMouseUp);
+  ownerDocument.removeEventListener("mousemove", onSessionSplitterMouseMove);
+  ownerDocument.removeEventListener("mouseup", onSessionSplitterMouseUp);
   releaseSessionSelectionLock?.();
   releaseSessionSelectionLock = null;
 });
@@ -3457,6 +3559,7 @@ onUnmounted(() => {
           :is-streaming="isStreaming"
           :is-compacting="isCompacting"
           :is-thinking="isThinking"
+          :show-thinking-blocks="!selectedModelId.startsWith('claude_code/')"
           :has-thinking="hasThinking"
           :thinking-order="thinkingOrder"
           :thinking-duration="thinkingDuration"
@@ -3499,7 +3602,9 @@ onUnmounted(() => {
           :messages="messages"
           :session-id="activeSessionId"
           :user-message-ids="turnNavigationUserMessageIds"
+          ref="turnNavigationRailRef"
           :scroll-element="transcriptScrollElement"
+          :presented="surfacePresented"
           :load-preview="turnNavigationLoadPreview"
           :load-turn="turnNavigationLoadTurn"
           @navigate="markMessagesUserScrollIntent"
@@ -3646,10 +3751,15 @@ onUnmounted(() => {
             </svg>
           </button>
         </div>
-        <div v-if="!inputControlsCollapsed" class="input-backdrop-row">
-          <div v-if="!inputControlsCollapsed" class="input-backdrop-status">
+        <div v-if="!inputControlsCollapsed || $slots['session-picker']" class="input-backdrop-row">
+          <div class="input-backdrop-status">
             <ChatStatusIndicators
+              v-if="!inputControlsCollapsed"
               :key="statusWorkspaceKey"
+              :session-id="activeSessionId"
+              :selected-model-id="selectedModelId"
+              :active="active"
+              :is-streaming="isStreaming"
               :unity-connected="unityConnected"
               :unity-plugin-status="unityPluginStatus"
               :unity-plugin-installing="unityPluginInstalling"
@@ -3663,14 +3773,18 @@ onUnmounted(() => {
               :scan-phase="scanPhase"
               :last-scan-stats="lastScanStats"
               :knowledge-access-mode="knowledgeAccessMode"
+              :knowledge-enabled="workspaceKnowledgeEnabled"
               :selected-agent-id="selectedAgentId"
               @start-scan="emit('startScan')"
               @install-plugin="emit('installPlugin')"
               @launch-unity-project="emit('launchUnityProject')"
               @update-knowledge-access-mode="setKnowledgeAccessMode"
-            />
+            >
+              <BackgroundTasksIndicator :session-id="activeSessionId" />
+            </ChatStatusIndicators>
+            <slot name="session-picker" />
           </div>
-          <div class="input-backdrop-action">
+          <div v-if="!inputControlsCollapsed" class="input-backdrop-action">
             <button
               v-if="!isViewingSubagent && hasPanelToggleRow"
               class="changes-toggle-btn ui-select-none"
@@ -3689,7 +3803,8 @@ onUnmounted(() => {
         <RichChatInput
           ref="composerPanelRef"
           v-model="inputText"
-          :disabled="worktreeBusy || workspaceChanging"
+          :disabled="worktreeBusy || workspaceChanging || claudeTransferBusy"
+          :before-send="claudeTransfer.beforeSend"
           :selected-agent-id="selectedAgentId"
           :skills="skills"
           :managed-local-files="managedLocalFiles"
@@ -3724,6 +3839,22 @@ onUnmounted(() => {
           @cancel="emit('cancel')"
           @resume="emit('resume')"
         >
+          <template v-if="claudeTransferPending || claudeTransferError" #before-input>
+            <div class="claude-transfer-prompt" role="status" aria-live="polite">
+              <div class="claude-transfer-copy">
+                <template v-if="claudeTransferPending">
+                  <span>{{ t('chat.input.claudeTransfer', claudeTransferPending.target) }}</span>
+                  <span v-if="claudeTransferPending.updatedAt" class="claude-transfer-detail">{{ t('chat.input.claudeBackup', new Date(claudeTransferPending.updatedAt * 1000).toLocaleString()) }}</span>
+                  <span v-if="claudeTransferPending.blockedReason" class="claude-transfer-detail">{{ t(`chat.input.claudeTransfer.${claudeTransferPending.blockedReason}`) }}</span>
+                </template>
+                <span v-if="claudeTransferError" class="claude-transfer-error">{{ claudeTransferError }}</span>
+              </div>
+              <BaseButton :disabled="claudeTransferBusy" @click="claudeTransfer.dismiss">{{ t('common.cancel') }}</BaseButton>
+              <BaseButton v-if="claudeTransferPending && !claudeTransferPending.blockedReason" :disabled="claudeTransferBusy || isStreaming" @click="restoreClaudeAndSend">
+                {{ t(claudeTransferBusy ? 'chat.input.claudeRestoring' : 'chat.input.claudeRestoreAndSend') }}
+              </BaseButton>
+            </div>
+          </template>
           <template v-if="!inputControlsCollapsed" #footer-start>
             <ModelEffortSelector
               align="start"
@@ -3994,6 +4125,18 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.claude-transfer-prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+}
+.claude-transfer-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
+.claude-transfer-detail { color: var(--text-secondary); font-size: 11px; }
+.claude-transfer-error { color: var(--status-error-fg, var(--text-color)); }
 .chat-view-layout {
   flex: 1 1 0;
   display: flex;

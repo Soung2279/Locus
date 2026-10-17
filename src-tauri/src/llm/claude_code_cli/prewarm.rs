@@ -1,0 +1,370 @@
+//! Unused processes have reserved Locus IDs, but no database rows or messages.
+//! Allocation retains that ID, native UUID, remote directory and SSH transport.
+//! A used process never returns to the spare pool: it stays sticky until reaped.
+use super::*;
+use super::super::ssh::{ConnectionSettings, PermissionMode, SshConfig};
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Context {
+    pub cwd: String,
+    pub checkout: String,
+    pub epoch: u64,
+    pub model: String,
+    pub remote: SshConfig,
+    pub permission: PermissionMode,
+    pub runtime: super::super::runtime_settings::RuntimeSettings,
+    pub native_tool_search: bool,
+}
+impl Context {
+    pub fn options(&self, id: String, resume: Option<String>) -> ClaudeCodeCliOptions {
+        let native_tool_search = self.native_tool_search && super::super::tool_catalog::native_mode_for_session(&id, resume.is_some()).unwrap_or(self.native_tool_search);
+        ClaudeCodeCliOptions { locus_session_id: id, cwd: self.cwd.clone(), model: self.model.clone(), remote: Some(self.remote.clone()),
+            system_prompt: String::new(), effort: None, tools: vec![], resume_session_id: resume, native_tool_search }
+    }
+    fn configured(&self, settings: &ConnectionSettings) -> bool {
+        settings.remote.as_ref() == Some(&self.remote) && settings.permission_mode == self.permission
+            && settings.runtime == self.runtime
+    }
+}
+struct Spare { id: String, context: Context }
+struct Job { generation: String, abort: tokio::task::AbortHandle, done: tokio::sync::watch::Receiver<bool>, claimed: bool }
+#[derive(Default)]
+struct Pool {
+    desired: Option<(Context, Instant)>,
+    spares: Vec<Spare>,
+    jobs: HashMap<String, Job>,
+    retry_after: Option<Instant>,
+    maintenance: bool,
+    manual: bool,
+    last_error: Option<String>,
+}
+fn pool() -> &'static Mutex<Pool> {
+    static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
+    POOL.get_or_init(Default::default)
+}
+
+struct IdleHost;
+impl ClaudeCodeHost for IdleHost {
+    fn on_text_delta(&mut self, _: String) {}
+    fn on_thinking_delta(&mut self, _: String) {}
+    fn on_tool_call_start(&mut self, _: String, _: String) {}
+    fn on_assistant_message(&mut self, _: ClaudeCodeAssistantMessage) -> Result<(), String> { Err("Unexpected output during prewarm".into()) }
+    fn execute_tool<'a>(&'a mut self, _: &'a str, _: &'a str, _: serde_json::Value) -> ClaudeCodeHostFuture<'a> {
+        Box::pin(async { ClaudeCodeToolResult { output: "Tools cannot execute during prewarm".into(), is_error: true, images: None } })
+    }
+}
+
+fn launch(state: &mut Pool, options: ClaudeCodeCliOptions, permission: PermissionMode) {
+    let id = options.locus_session_id.clone();
+    if state.jobs.contains_key(&id) { return; }
+    let (done, receive) = tokio::sync::watch::channel(false);
+    let job_id = id.clone();
+    let generation = uuid::Uuid::new_v4().to_string();
+    let job_generation = generation.clone();
+    let task = tokio::spawn(async move {
+        let result = tokio::time::timeout(Duration::from_secs(90), async {
+            let _gate = history_gate(&job_id).write_owned().await;
+            let existing = sessions().lock().unwrap_or_else(|e| e.into_inner()).get(&job_id).cloned();
+            if let Some(existing) = existing {
+                if existing.alive() && existing.cwd == options.cwd && existing.connection == options.remote
+                    && normalize_claude_model(&existing.model) == normalize_claude_model(&options.model)
+                    && existing.permission_mode == permission
+                    && existing.runtime_settings == super::super::ssh::load_settings()?.runtime
+                    && existing.native_tool_search == options.native_tool_search
+                    && options.resume_session_id.as_ref().is_none_or(|id| existing.session_id.lock().unwrap_or_else(|e| e.into_inner()).as_ref() == Some(id)) {
+                    return Ok(());
+                }
+                close_session(&job_id);
+            }
+            let session = connection_status::start_cached(&options, permission).await?;
+            session.prewarmed.store(true, Ordering::SeqCst);
+            session.busy.store(true, Ordering::SeqCst);
+            let mut lease = TurnLease(session.clone(), false);
+            let mut bridge = session.bridge.lock().await;
+            await_ready(&session, &options, &mut IdleHost, &mut bridge).await?;
+            // No prompt, Enter, slash command, tool or inference is submitted.
+            if session.options.read().unwrap_or_else(|e| e.into_inner())["active"] != false { return Err("Prewarm unexpectedly activated input".to_string()); }
+            if !pool().lock().unwrap_or_else(|e| e.into_inner()).jobs.get(&job_id).is_some_and(|job| job.generation == job_generation) {
+                return Err("Prewarm cancelled".into());
+            }
+            lease.1 = true;
+            Ok::<_, String>(())
+        }).await;
+        let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
+        if state.jobs.get(&job_id).is_some_and(|job| job.generation == job_generation) {
+            if !matches!(result, Ok(Ok(()))) {
+                state.last_error = Some(match result {
+                    Ok(Err(error)) => error,
+                    _ => "Claude connection timed out".to_string(),
+                });
+                state.retry_after = Some(Instant::now() + Duration::from_secs(60));
+            }
+            state.jobs.remove(&job_id);
+        }
+        let _ = done.send(true);
+    });
+    state.jobs.insert(id, Job { generation, abort: task.abort_handle(), done: receive, claimed: false });
+}
+
+/// Called on selection, and by a lightweight foreground interest heartbeat.
+pub(crate) fn maintain(context: Context, existing: Option<(String, Option<String>)>, warm_existing: bool) {
+    let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
+    // Background windows may keep sending interest heartbeats. Only an explicit
+    // selection can replace another context; heartbeats must not churn the pool.
+    if !warm_existing && state.desired.as_ref().is_none_or(|(desired, _)| desired != &context) { return; }
+    if state.desired.as_ref().is_none_or(|(desired, _)| desired != &context) { state.retry_after = None; }
+    state.desired = Some((context.clone(), Instant::now()));
+    if warm_existing {
+        if let Some((id, resume)) = existing {
+            launch(&mut state, context.options(id, resume), context.permission);
+        }
+    }
+    if !state.maintenance {
+        state.maintenance = true;
+        tokio::spawn(async {
+            loop {
+                reconcile();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
+}
+
+/// Explicit connection uses the same idle TUI as prewarm, including when
+/// automatic prewarm is disabled. It never changes the saved preference.
+pub(crate) async fn connect(context: Context) -> Result<(), String> {
+    {
+        let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
+        state.manual = true;
+        state.retry_after = None;
+        state.last_error = None;
+    }
+    maintain(context.clone(), None, true);
+    reconcile_inner(true);
+    let (id, receive) = {
+        let state = pool().lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.spares.iter().find(|spare| spare.context == context)
+            .map(|spare| spare.id.clone()).ok_or("Claude connection is waiting for the current operation")?;
+        let receive = state.jobs.get(&id).map(|job| job.done.clone());
+        (id, receive)
+    };
+    if let Some(mut receive) = receive {
+        tokio::time::timeout(Duration::from_secs(95), async {
+            while !*receive.borrow_and_update() {
+                if receive.changed().await.is_err() { break; }
+            }
+        }).await.map_err(|_| "Claude connection timed out")?;
+    }
+    if sessions().lock().unwrap_or_else(|e| e.into_inner()).get(&id)
+        .is_some_and(|session| session.alive() && session.ready.load(Ordering::SeqCst)) {
+        Ok(())
+    } else {
+        Err(pool().lock().unwrap_or_else(|e| e.into_inner()).last_error.clone()
+            .unwrap_or_else(|| "Claude connection was cancelled".to_string()))
+    }
+}
+
+fn reconcile() {
+    reconcile_inner(false);
+}
+
+fn reconcile_inner(explicit: bool) {
+    let Ok(settings) = super::super::ssh::load_settings() else { return; };
+    let snapshot = sessions().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
+    let desired = state.desired.as_ref().filter(|(ctx, touched)| (settings.prewarm || state.manual) && ctx.configured(&settings)
+        && touched.elapsed() < Duration::from_secs(u64::from(settings.idle_minutes.clamp(1, 60)) * 60)).map(|(ctx, _)| ctx.clone());
+    let mut remove = Vec::new();
+    let jobs: std::collections::HashSet<_> = state.jobs.keys().cloned().collect();
+    state.spares.retain(|spare| {
+        let keep = desired.as_ref() == Some(&spare.context) && (jobs.contains(&spare.id) || snapshot.get(&spare.id).is_some_and(|s| s.alive()));
+        if !keep { remove.push(spare.id.clone()); }
+        keep
+    });
+    let capacity = if settings.prewarm { settings.pool_capacity.clamp(1, 4) as usize } else { 1 };
+    while state.spares.len() > capacity {
+        remove.push(state.spares.pop().unwrap().id);
+    }
+    for id in &remove {
+        if let Some(job) = state.jobs.remove(id) { job.abort.abort(); }
+    }
+    // Foreground demand keeps unused spares warm; bound conversations retain
+    // their independent idle deadline, measured from their last actual turn.
+    for spare in &state.spares {
+        if let Some(session) = snapshot.get(&spare.id) { *session.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now(); }
+    }
+    if let Some(context) = desired {
+        let busy = snapshot.values().any(|s| s.remote.is_some() && s.busy.load(Ordering::SeqCst));
+        if (explicit || !busy) && state.retry_after.is_none_or(|at| Instant::now() >= at) {
+            while state.spares.len() < capacity {
+                let id = uuid::Uuid::new_v4().to_string();
+                state.spares.push(Spare { id: id.clone(), context: context.clone() });
+                launch(&mut state, context.options(id, None), context.permission);
+            }
+        }
+    }
+    drop(state);
+    for id in remove { close_session(&id); }
+}
+
+/// Only a genuinely new conversation can consume a spare. The database is
+/// created with this reserved ID, so archive/resume paths never need rebinding.
+pub(crate) fn claim(cwd: &str, checkout: &str, epoch: u64, model: &str) -> Option<String> {
+    let settings = super::super::ssh::load_settings().ok()?;
+    let snapshot = sessions().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
+    if !settings.prewarm && !state.manual { return None; }
+    allocate(&mut state, &snapshot, &settings, cwd, checkout, epoch, model)
+}
+fn allocate(state: &mut Pool, snapshot: &HashMap<String, Arc<Session>>, settings: &ConnectionSettings, cwd: &str, checkout: &str, epoch: u64, model: &str) -> Option<String> {
+    let index = state.spares.iter().enumerate().filter(|(_, s)| s.context.configured(&settings) && s.context.cwd == cwd
+        && s.context.checkout == checkout && s.context.epoch == epoch && normalize_claude_model(&s.context.model) == normalize_claude_model(model))
+        .min_by_key(|(_, s)| !snapshot.get(&s.id).is_some_and(|process| process.ready.load(Ordering::SeqCst) && process.alive())).map(|(i, _)| i)?;
+    let spare = state.spares.remove(index);
+    if let Some(job) = state.jobs.get_mut(&spare.id) { job.claimed = true; }
+    Some(spare.id)
+}
+
+pub(crate) async fn wait_for(id: &str) -> Result<(), String> {
+    let receive = {
+        let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
+        state.jobs.get_mut(id).map(|job| { job.claimed = true; job.done.clone() })
+    };
+    if let Some(mut receive) = receive {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while !*receive.borrow_and_update() { if receive.changed().await.is_err() { break; } }
+        }).await.map_err(|_| "Claude prewarm is still waiting for SSH; retry when it is ready".to_string())?;
+    }
+    Ok(())
+}
+pub(super) async fn turn_gate(id: &str) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
+    wait_for(id).await?;
+    history_gate(id).try_write_owned().map_err(|_| "Claude conversation is already running or its history is being updated".into())
+}
+
+pub(crate) fn spare_id(cwd: &str, model: &str, settings: &ConnectionSettings) -> Option<String> {
+    let snapshot = sessions().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    pool().lock().unwrap_or_else(|e| e.into_inner()).spares.iter()
+        .filter(|s| s.context.configured(settings) && s.context.cwd == cwd && normalize_claude_model(&s.context.model) == normalize_claude_model(model))
+        .min_by_key(|s| !snapshot.get(&s.id).is_some_and(|s| s.ready.load(Ordering::SeqCst) && s.alive())).map(|s| s.id.clone())
+}
+
+pub(super) struct PoolSnapshot {
+    pub spares: std::collections::HashSet<String>,
+    pub pending: Vec<String>,
+    pub demanded: bool,
+    pub retrying: bool,
+}
+pub(super) fn status(config: &SshConfig, settings: &ConnectionSettings) -> PoolSnapshot {
+    let state = pool().lock().unwrap_or_else(|e| e.into_inner());
+    let spares: std::collections::HashSet<_> = state.spares.iter().filter(|s| &s.context.remote == config).map(|s| s.id.clone()).collect();
+    let demanded = state.desired.as_ref().is_some_and(|(context, touched)| &context.remote == config
+        && (settings.prewarm || state.manual) && context.configured(settings) && touched.elapsed() < Duration::from_secs(u64::from(settings.idle_minutes.clamp(1, 60)) * 60));
+    PoolSnapshot {
+        pending: spares.iter().filter(|id| state.jobs.contains_key(*id)).cloned().collect(),
+        spares, demanded,
+        retrying: demanded && state.retry_after.is_some_and(|at| Instant::now() < at),
+    }
+}
+pub(crate) fn cancel_all() {
+    let ids = {
+        let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
+        state.desired = None;
+        state.manual = false;
+        state.last_error = None;
+        let ids: Vec<_> = state.spares.drain(..).map(|s| s.id).collect();
+        state.jobs.retain(|_, job| { if !job.claimed { job.abort.abort(); } job.claimed });
+        ids
+    };
+    for id in ids { close_session(&id); }
+}
+pub(crate) fn discard_unassigned(id: &str) {
+    if let Some(job) = pool().lock().unwrap_or_else(|e| e.into_inner()).jobs.remove(id) { job.abort.abort(); }
+    close_session(id);
+}
+pub(crate) fn shutdown() {
+    cancel_all();
+    for (_, job) in pool().lock().unwrap_or_else(|e| e.into_inner()).jobs.drain() { job.abort.abort(); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn context() -> Context {
+        Context { cwd: "C:/workspace".into(), checkout: "checkout".into(), epoch: 3, model: "claude_code/claude-opus-5-5".into(),
+            remote: SshConfig { target: "unused.invalid".into(), port: None, identity_file: None, known_hosts_file: None, cli_path: None }, permission: PermissionMode::Auto, runtime: Default::default(), native_tool_search: true }
+    }
+    #[test]
+    fn allocation_is_exclusive_and_never_crosses_server_model_or_checkout() {
+        let context = context();
+        let settings = ConnectionSettings { prewarm: true, remote: Some(context.remote.clone()), ..Default::default() };
+        let mut state = Pool::default();
+        for id in ["one", "two"] { state.spares.push(Spare { id: id.into(), context: context.clone() }); }
+        let snapshot = HashMap::new();
+        assert!(allocate(&mut state, &snapshot, &settings, &context.cwd, "other", 3, &context.model).is_none());
+        assert!(allocate(&mut state, &snapshot, &settings, &context.cwd, "checkout", 4, &context.model).is_none());
+        assert!(allocate(&mut state, &snapshot, &settings, &context.cwd, "checkout", 3, "claude-sonnet-5-5").is_none());
+        let changed_runtime = ConnectionSettings {
+            runtime: super::super::super::runtime_settings::RuntimeSettings { telemetry: true, ..Default::default() },
+            ..settings.clone()
+        };
+        assert!(allocate(&mut state, &snapshot, &changed_runtime, &context.cwd, "checkout", 3, &context.model).is_none());
+        let changed = ConnectionSettings { remote: None, ..settings.clone() };
+        assert!(allocate(&mut state, &snapshot, &changed, &context.cwd, "checkout", 3, &context.model).is_none());
+        assert_eq!(allocate(&mut state, &snapshot, &settings, &context.cwd, "checkout", 3, "claude-opus-5-5"), Some("one".into()));
+        assert_eq!(allocate(&mut state, &snapshot, &settings, &context.cwd, "checkout", 3, &context.model), Some("two".into()));
+        assert!(allocate(&mut state, &snapshot, &settings, &context.cwd, "checkout", 3, &context.model).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires explicitly authorized isolated SSH config; starts idle remote Claude only, no model messages"]
+    async fn real_ssh_pool_allocates_sticky_processes_and_reaps_without_inference() {
+        use crate::llm::claude_code_cli::native_integration_tests::EnvGuard;
+        let config_dir = std::env::var("LOCUS_CLAUDE_SSH_TEST_CONFIG_DIR").expect("select an isolated test configuration");
+        let model = std::env::var("LOCUS_CLAUDE_SSH_TEST_MODEL").expect("select the permitted model");
+        let _env = EnvGuard::set(&[("LOCUS_RUNTIME_CONFIG_DIR", Some(config_dir.clone()))]);
+        let path = Path::new(&config_dir).join("claude_connection.json");
+        struct Restore(std::path::PathBuf, Vec<u8>);
+        impl Drop for Restore { fn drop(&mut self) { cancel_all(); close_all(); let _ = std::fs::write(&self.0, &self.1); } }
+        let _restore = Restore(path.clone(), std::fs::read(&path).unwrap());
+        let mut settings = super::super::super::ssh::load_settings().unwrap();
+        settings.prewarm = true; settings.pool_capacity = 2; settings.idle_minutes = 5;
+        super::super::super::ssh::save_settings(&settings).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let context = Context { cwd: root.path().display().to_string(), checkout: "pool-test".into(), epoch: 0,
+            model, remote: settings.remote.clone().unwrap(), permission: settings.permission_mode, runtime: settings.runtime, native_tool_search: true };
+        maintain(context.clone(), None, true);
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let ids = loop {
+            let ids: Vec<_> = pool().lock().unwrap().spares.iter().map(|s| s.id.clone()).collect();
+            if ids.len() == 2 && ids.iter().all(|id| sessions().lock().unwrap().get(id).is_some_and(|s| s.ready.load(Ordering::SeqCst) && s.alive())) { break ids; }
+            assert!(Instant::now() < deadline, "pool failed to initialize");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        std::fs::create_dir_all(root.path().join("db")).unwrap();
+        let store = crate::session::store::SessionStore::new(&root.path().join("db")).unwrap();
+        assert!(store.list_sessions(None).unwrap().is_empty());
+        let claimed = claim(&context.cwd, &context.checkout, context.epoch, &context.model).unwrap();
+        let session = sessions().lock().unwrap().get(&claimed).unwrap().clone();
+        session.busy.store(true, Ordering::SeqCst);
+        let native = session.session_id.lock().unwrap().clone();
+        super::super::super::clear_stale_session_id_for_turn(&claimed).await;
+        assert!(Arc::ptr_eq(&session, sessions().lock().unwrap().get(&claimed).unwrap()), "first-send preparation must retain the unused process");
+        assert_eq!(session.options.read().unwrap()["active"], false);
+        store.create_session_scoped_with_id(&claimed, "Pool allocation", None, None, None, "chat", None).unwrap();
+        assert!(store.get_messages(&claimed).unwrap().is_empty());
+        maintain(context.clone(), Some((claimed.clone(), native.clone())), true);
+        wait_for(&claimed).await.unwrap();
+        assert!(Arc::ptr_eq(&session, sessions().lock().unwrap().get(&claimed).unwrap()));
+        assert_eq!(*session.session_id.lock().unwrap(), native);
+        session.busy.store(true, Ordering::SeqCst);
+        reconcile();
+        assert_eq!(pool().lock().unwrap().spares.len(), 1, "do not replenish during an active turn");
+        session.busy.store(false, Ordering::SeqCst);
+        cancel_all();
+        assert!(session.alive(), "turning off spare prewarm must preserve a bound conversation");
+        *session.last_used.lock().unwrap() = Instant::now() - Duration::from_secs(6 * 60);
+        tokio::time::timeout(Duration::from_secs(15), async { while has_live_session(&claimed) { tokio::time::sleep(Duration::from_millis(100)).await; } }).await.unwrap();
+        std::println!("LOCUS_POOL_CHECK {}", json!({"spares":ids.len(),"nativeIdPreserved":true,"transportReused":true,"emptyDatabaseBeforeAllocation":true,"idleReaped":true,"modelPromptsSubmitted":0}));
+    }
+}

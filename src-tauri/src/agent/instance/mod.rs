@@ -3,6 +3,7 @@ mod async_resume;
 mod backend;
 mod claude_code_cli;
 mod codex_steering;
+mod custom_codex;
 mod codex_patch;
 mod compaction;
 mod dangerous_command;
@@ -341,6 +342,8 @@ pub(super) enum LazyToolRenderer {
     /// OpenAI Responses `tool_search` protocol; deferred definitions stay
     /// client-side.
     CodexNative,
+    /// Claude Code owns ToolSearch, tool_reference serialization and caching.
+    ClaudeCliNative,
 }
 
 impl LazyToolRenderer {
@@ -353,6 +356,7 @@ impl LazyToolRenderer {
             Self::ToolLoadFallback => "tool_load_fallback",
             Self::AnthropicNative => "anthropic_native",
             Self::CodexNative => "codex_native",
+            Self::ClaudeCliNative => "claude_cli_native",
         }
     }
 }
@@ -1528,6 +1532,7 @@ fn build_knowledge_document_create_preview(
             .unwrap_or_else(|_| normalized_path.clone()),
     };
     let mut document = crate::knowledge_store::KnowledgeDocument {
+        properties_yaml: String::new(),
         inject_agents: patch.inject_agents.clone().unwrap_or_else(crate::knowledge_store::default_inject_agents),
         id: patch.id.take().unwrap_or_else(|| "__preview__".to_string()),
         doc_type,
@@ -3547,29 +3552,18 @@ impl AgentInstance {
     }
 
     fn resolve_path_against_working_dir(&self, raw_path: &str) -> Option<String> {
-        let trimmed = raw_path.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let path = std::path::Path::new(trimmed);
-        if path.is_absolute() {
-            return Some(trimmed.to_string());
-        }
-
-        if !self.has_selected_working_dir() {
-            return None;
-        }
-        if !self.knowledge_access_mode.allows_context() {
-            return None;
-        }
-
-        Some(
-            std::path::Path::new(&self.working_dir)
-                .join(path)
-                .display()
-                .to_string(),
-        )
+        // Filesystem resolution is independent of knowledge access permissions.
+        let root = self
+            .execution_context
+            .as_ref()
+            .map(|execution| execution.root())
+            .or_else(|| {
+                self.has_selected_working_dir()
+                    .then(|| std::path::Path::new(&self.working_dir))
+            });
+        crate::tool::path::resolve_workspace_path(root, raw_path)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
     }
 
     fn normalize_path_lexically(path: &std::path::Path) -> std::path::PathBuf {
@@ -3998,6 +3992,9 @@ impl AgentInstance {
         cancel_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         let effective_effort = effort.or_else(|| def.default_effort.clone());
+        let knowledge_access_mode = if working_dir.trim().is_empty() || crate::workspace::knowledge_enabled(&working_dir) {
+            knowledge_access_mode
+        } else { KnowledgeAccessMode::Disabled };
         AgentInstance {
             id: uuid::Uuid::new_v4().to_string(),
             def,
@@ -4054,6 +4051,9 @@ impl AgentInstance {
         execution_context: Arc<crate::workspace_service::AgentExecutionContext>,
     ) {
         self.working_dir = execution_context.root().to_string_lossy().to_string();
+        if !crate::workspace::knowledge_enabled(&self.working_dir) {
+            self.knowledge_access_mode = KnowledgeAccessMode::Disabled;
+        }
         self.workspace_id = Some(execution_context.project_id.to_string());
         self.execution_context = Some(execution_context);
     }
@@ -4303,6 +4303,7 @@ impl AgentInstance {
             runtime_state: Some(self.tool_runtime_state.clone()),
             cancel_rx: Some(self.cancel_waiter()),
             progress: None,
+            tool_progress: None,
             output: None,
             output_path: None,
             background: false,
@@ -4867,6 +4868,7 @@ impl AgentInstance {
             return LazyToolRenderer::ToolLoadFallback;
         }
         match &self.backend {
+            LlmBackend::ClaudeCodeCli => LazyToolRenderer::ClaudeCliNative,
             LlmBackend::Anthropic { .. }
                 if anthropic_endpoint_lazy_enabled
                     && Self::anthropic_model_supports_native_lazy(&self.effective_model) =>
@@ -4878,6 +4880,10 @@ impl AgentInstance {
                 supports_tool_lazy_loading: true,
                 ..
             } => LazyToolRenderer::AnthropicNative,
+            LlmBackend::Custom {
+                api_format: crate::commands::ApiFormat::OpenaiResponses,
+                codex_transport: Some(_), supports_tool_lazy_loading: true, api_model, ..
+            } if Self::codex_model_supports_tool_search(api_model) => LazyToolRenderer::CodexNative,
             LlmBackend::OpenAiCodex { base_url, .. }
                 if Self::codex_backend_supports_tool_search(base_url.as_deref())
                     && Self::codex_model_supports_tool_search(&self.effective_model) =>
@@ -4939,6 +4945,9 @@ impl AgentInstance {
     }
 
     fn uses_codex_remote_compaction(&self) -> bool {
+        if self.uses_codex_protocol() {
+            return true;
+        }
         match &self.backend {
             LlmBackend::OpenAiCodex { .. } => true,
             LlmBackend::Custom {
@@ -4959,12 +4968,14 @@ impl AgentInstance {
                 context_length,
                 api_format,
                 remote_compaction_mode,
+                codex_transport,
                 ..
             } => RuntimeContextLimits {
                 effective_context_window: *context_length,
                 codex_auto_compact_token_limit: (api_format
                     == &crate::commands::ApiFormat::OpenaiResponses
-                    && *remote_compaction_mode == crate::commands::RemoteCompactionMode::CodexV2)
+                    && (codex_transport.is_some()
+                        || *remote_compaction_mode == crate::commands::RemoteCompactionMode::CodexV2))
                     .then(|| {
                         compact::codex_auto_compact_token_limit_from_raw_window(*context_length)
                     }),
@@ -5119,7 +5130,7 @@ impl AgentInstance {
             // tool_search expands only the requested schemas. Anthropic keeps
             // the legacy eager declaration for selected Skills.
             if configured_load_mode == ToolLoadMode::Direct
-                || (renderer != LazyToolRenderer::CodexNative
+                || (renderer == LazyToolRenderer::AnthropicNative
                     && selected_skill_tool_names.contains(&name))
             {
                 push_unique_tool_name(&mut direct, &name);
@@ -5252,6 +5263,9 @@ impl AgentInstance {
             LazyToolRenderer::AnthropicNative => {
                 "These tools have deferred definitions. Load them by name with `tool_load`; their schemas expand through native tool references, then call the tools directly."
             }
+            LazyToolRenderer::ClaudeCliNative => {
+                "Skill and specialized tool schemas load through Claude Code's native `ToolSearch`. Read or select the Skill first to activate its tools, then use `ToolSearch` with `query: \"select:mcp__locus__<tool_name>\"` and call the returned tool directly. Use the exact full names in the CLI's deferred-tool reminders. Do not use `tool_load` or `tool_call`."
+            }
             LazyToolRenderer::ToolLoadFallback => {
                 "These tool schemas are available by name through `tool_load`:"
             }
@@ -5281,6 +5295,11 @@ impl AgentInstance {
         &self,
         renderer: LazyToolRenderer,
     ) -> Option<String> {
+        if renderer == LazyToolRenderer::ClaudeCliNative {
+            // The CLI appends catalog deltas to messages, not to this cached
+            // system prefix. This guidance is independent of Skill inventory.
+            return Some(Self::format_lazy_tool_manifest(&[], renderer));
+        }
         let tool_names = self.lazy_tool_manifest_names().await;
         // Codex also needs the native loading route when only Skill documents
         // (rather than the default lazy catalog) supply deferred tool names.
@@ -5320,7 +5339,7 @@ impl AgentInstance {
         let enabled_overrides = self.tool_enabled_overrides();
         let lazy_tool_renderer = self.cached_lazy_tool_renderer();
         let native_renderer_active = lazy_tool_renderer.is_native();
-        let codex_native_tool_search = lazy_tool_renderer == LazyToolRenderer::CodexNative;
+        let codex_native_tool_search = matches!(lazy_tool_renderer, LazyToolRenderer::CodexNative | LazyToolRenderer::ClaudeCliNative);
         let request_tool_names = self.build_request_tool_names().await;
         let mut direct_tool_names = HashSet::new();
         let mut tool_names = Vec::new();
@@ -5676,7 +5695,13 @@ impl AgentInstance {
         // Keep the detail window aligned with the ring's provider-reported
         // occupancy. A locally estimated growth after the last completed
         // request may raise the current value further.
-        let context_tokens = raw_estimated_context_tokens.max(usage.context_tokens);
+        let context_tokens = if self.effective_model.starts_with("claude_code/") && usage.context_tokens > 0 {
+            // The CLI owns compaction and its prompt; the Locus transcript
+            // includes historical tool results outside that live window.
+            usage.context_tokens
+        } else {
+            raw_estimated_context_tokens.max(usage.context_tokens)
+        };
         let tools = estimate_session_tool_result_usage(session_messages);
 
         let runtime_context_limit = self.context_limit();
@@ -5783,8 +5808,7 @@ impl AgentInstance {
         let cache_key = serde_json::json!({
             "provider": provider_key.as_str(),
             "model": self.effective_model.as_str(),
-            "effort": if matches!(self.backend, LlmBackend::OpenAiCodex { .. })
-                && codex::supports_reasoning_updates(&self.effective_model) {
+            "effort": if self.codex_protocol_model().is_some_and(codex::supports_reasoning_updates) {
                 None
             } else {
                 self.effort.as_deref()
@@ -6226,7 +6250,8 @@ impl AgentInstance {
                     }
                 }
             }
-
+        }
+        if matches!(renderer, LazyToolRenderer::AnthropicNative | LazyToolRenderer::ClaudeCliNative) {
             for tool in self.build_api_tools(&plan.deferred).await {
                 let mut tool = tool;
                 tool["defer_loading"] = serde_json::json!(true);
@@ -6330,6 +6355,15 @@ impl AgentInstance {
                         continue;
                     };
                     names.extend(codex_tool_search_output_tool_names(&output.content));
+                }
+            }
+            LazyToolRenderer::ClaudeCliNative => {
+                // These definitions were published only after passing the
+                // Agent/Skill capability boundary. Rebuild activation, but
+                // continue applying current Knowledge/runtime permissions.
+                match crate::llm::claude_code_cli::tool_catalog::registered_names(&self.session_id) {
+                    Ok(registered) => names.extend(registered),
+                    Err(error) => eprintln!("[Claude tools] Cannot restore activations: {error}"),
                 }
             }
             LazyToolRenderer::ToolLoadFallback => return,
@@ -8438,6 +8472,7 @@ impl AgentInstance {
         store: &SessionStore,
         codex_turn_state: Option<&mut codex::TurnState>,
         steering: Option<&dyn codex::steering::SteeringSource>,
+        codex_request_context: Option<(&str, usize)>,
         request_options: LlmRequestOptions,
         system_parts: &[&str],
         messages: &[crate::session::models::ChatMessage],
@@ -8447,6 +8482,13 @@ impl AgentInstance {
         on_thinking_delta: impl Fn(String) + Send + Sync + 'static,
         on_tool_call_start: impl Fn(String, String) + Send + Sync + 'static,
     ) -> Result<LlmCallResult, String> {
+        if let Some(route) = self.custom_codex_route() {
+            return self.call_custom_codex(
+                route, store, codex_turn_state, steering, codex_request_context,
+                request_options, system_parts, messages, api_tools, tool_search_description,
+                on_text_delta, on_thinking_delta, on_tool_call_start,
+            ).await;
+        }
         match &self.backend {
             LlmBackend::Mock { profile } => {
                 stream_mock_response(
@@ -8559,6 +8601,11 @@ impl AgentInstance {
                 let (access_token, account_id) = resolve_codex_request_auth(auth, false)
                     .await
                     .map_err(|e| format!("OpenAI Codex token failed (please re-login): {}", e))?;
+                let mut stream_options =
+                    codex::CodexStreamOptions::default().with_fast_mode(self.codex_fast_mode);
+                if let Some((run_id, iteration)) = codex_request_context {
+                    stream_options = stream_options.with_request_context(run_id, iteration);
+                }
                 let resp = match codex::stream_chat_steerable(
                     &access_token,
                     account_id.as_deref(),
@@ -8574,7 +8621,7 @@ impl AgentInstance {
                     Some(&self.session_id),
                     Some(&response_request_metadata),
                     codex_turn_state,
-                    codex::CodexStreamOptions::default().with_fast_mode(self.codex_fast_mode),
+                    stream_options.clone(),
                     steering,
                     &on_text_delta,
                     &on_thinking_delta,
@@ -8605,7 +8652,7 @@ impl AgentInstance {
                             Some(&self.session_id),
                             Some(&response_request_metadata),
                             codex_turn_state,
-                            codex::CodexStreamOptions::default().with_fast_mode(self.codex_fast_mode),
+                            stream_options,
                             steering,
                             &on_text_delta,
                             &on_thinking_delta,
@@ -9047,6 +9094,7 @@ impl AgentInstance {
 
         self.call_llm(
             store,
+            None,
             None,
             None,
             LlmRequestOptions::checkpoint_compaction(max_output_tokens),
@@ -9641,7 +9689,7 @@ impl AgentInstance {
             &compact_plan.keep_from_message_id,
             0,
         )?;
-        if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
+        if self.uses_codex_protocol() {
             crate::llm::codex::reset_cached_session_window(&self.session_id).await;
         }
         let compacted_context_tokens = self
@@ -10180,6 +10228,7 @@ impl AgentInstance {
         env_prompt_prefix: Option<&str>,
         input: PendingSessionInput,
         prepared_suffix: Option<Option<String>>,
+        claude_receipt: Option<&serde_json::Value>,
     ) -> Result<(), String> {
         let user_intent_signature = input
             .user_intent
@@ -10200,7 +10249,17 @@ impl AgentInstance {
         } else {
             None
         };
-        let message_id = store.add_message_with_images_asset_refs_and_signature(
+        let response_metadata = claude_receipt.map(|checkpoint| -> Result<serde_json::Value, String> {
+            crate::llm::claude_code_cli::recovery::validate_input_checkpoint(checkpoint)?;
+            let native = crate::llm::claude_code_cli::recovery::native_session_id(store, &self.session_id)?;
+            if native.as_deref() != checkpoint["sessionId"].as_str() {
+                return Err("Inserted input belongs to another Claude conversation".into());
+            }
+            Ok(serde_json::json!({"backend":"claude_code_cli", "claude_checkpoint":checkpoint,
+                "claude_run_id":run_id,"claude_plan_active":self.plan_mode_main_active(),
+                "claude_pending_input":{"version":1,"token":input.id,"carrier":null}}))
+        }).transpose()?;
+        let message_id = store.add_message_with_images_asset_refs_signature_and_response(
             &self.session_id,
             MessageRole::User,
             &input.text,
@@ -10209,6 +10268,7 @@ impl AgentInstance {
             user_intent_signature.as_deref(),
             current_prompt_prefix,
             user_prompt_suffix.as_deref(),
+            response_metadata.as_ref(),
         )?;
         if let Some(first_user_message_id) = first_user_message_id.as_deref() {
             store.update_message_prompt_prefix(
@@ -10218,6 +10278,9 @@ impl AgentInstance {
             )?;
         }
         let current_user_message = self.persisted_message_by_id(store, &message_id)?;
+        if matches!(self.backend,LlmBackend::ClaudeCodeCli) && response_metadata.is_none() {
+            store.set_message_response_request_metadata(&self.session_id,&message_id,&serde_json::json!({"claude_plan_active":self.plan_mode_main_active()}))?;
+        }
         emit_stream(
             app_handle,
             run_id,
@@ -10253,7 +10316,7 @@ impl AgentInstance {
         let claimed_inputs = pending_inputs.clone();
         let result = (|| -> Result<(), String> {
             for input in pending_inputs {
-                self.persist_pending_input(app_handle, store, run_id, env_prompt_prefix, input, None)?;
+                self.persist_pending_input(app_handle, store, run_id, env_prompt_prefix, input, None, None)?;
             }
             Ok(())
         })();
@@ -10577,8 +10640,22 @@ impl AgentInstance {
             Ordering::Relaxed,
         );
         let dynamic_tool_loading_mode = self.dynamic_tool_loading_mode(app_handle);
+        let renderer_mode = if matches!(self.backend, LlmBackend::ClaudeCodeCli)
+            && dynamic_tool_loading_mode == crate::config::DynamicToolLoadingMode::Native
+        {
+            let resuming = crate::llm::claude_code_cli::recovery::native_session_id(store, &self.session_id)?.is_some();
+            let native = crate::llm::claude_code_cli::tool_catalog::native_mode_for_session(&self.session_id, resuming)?;
+            if resuming && !native && store.get_response_request_metadata(&self.session_id)?.values().any(|value| value["claude_native_tool_search"] == true) {
+                return Err("The saved Claude native tool catalog is missing. Restore it or start a new conversation; the cached tool prefix was not replaced.".into());
+            }
+            if native {
+                dynamic_tool_loading_mode
+            } else {
+                crate::config::DynamicToolLoadingMode::MetaTool
+            }
+        } else { dynamic_tool_loading_mode };
         let lazy_tool_renderer = self.refresh_lazy_tool_renderer(
-            dynamic_tool_loading_mode,
+            renderer_mode,
             Self::anthropic_native_lazy_enabled_from_app_handle(app_handle),
         );
         if dynamic_tool_loading_mode == crate::config::DynamicToolLoadingMode::Direct {
@@ -10621,6 +10698,11 @@ impl AgentInstance {
 
         if initial_mode == "compact" {
             let prompt_parts = self.resolve_system_prompt_parts(store).await?.parts;
+            if matches!(&self.backend, LlmBackend::ClaudeCodeCli) {
+                let system = [prompt_parts.base_prompt.as_str(),prompt_parts.rules_prompt.as_str(),prompt_parts.knowledge_prompt.as_str(),prompt_parts.env_prompt.as_str()].join("\n\n");
+                let active_skills = self.active_skill_tool_names(&selected_skill_tool_names);
+                return self.run_claude_code_cli(app_handle,store,"/compact",&system,None,initial_mode,&run_id,&active_skills,None).await;
+            }
             if let Some(first_user_message_id) =
                 store.first_user_message_id(&self.session_id)?
             {
@@ -10735,7 +10817,9 @@ impl AgentInstance {
         let actual_user_text: String;
         if internal_system_reminder.is_some() {
             actual_user_text = String::new();
-        } else if crate::unity_bridge::is_unity_project(&self.working_dir) {
+        } else if self.agent_uses_unity_service_tools()
+            && crate::unity_bridge::is_unity_project(&self.working_dir)
+        {
             // The status probe can stall on a busy editor; race it against the
             // cancel signal so a cancel during prep reacts immediately.
             let mut cancel_rx = self.cancel_waiter();
@@ -10848,7 +10932,13 @@ impl AgentInstance {
         } else {
             None
         };
-        let current_message_id = store.add_message_with_images_asset_refs_and_signature(
+        // Claude's native history does not yet contain an interrupted input
+        // that failed before submission. Resume that durable user row instead
+        // of hiding it behind another empty continuation row.
+        let (current_message_id, resumed_claude_message) = claude_code_cli::persist_turn_user_message(
+            store, &self.session_id,
+            matches!(&self.backend, LlmBackend::ClaudeCodeCli) && internal_system_reminder.is_some(),
+            || store.add_message_with_images_asset_refs_and_signature(
             &self.session_id,
             MessageRole::User,
             &actual_user_text,
@@ -10857,7 +10947,7 @@ impl AgentInstance {
             user_intent_signature.as_deref(),
             current_prompt_prefix,
             user_prompt_suffix.as_deref(),
-        )?;
+        ))?;
         if let Some(first_user_message_id) = first_user_message_id.as_deref() {
             store.update_message_prompt_prefix(
                 &self.session_id,
@@ -10875,6 +10965,9 @@ impl AgentInstance {
                     self.session_id, current_message_id
                 )
             })?;
+        // Attachment context is validated and appended by the store. Use that
+        // persisted suffix for direct CLI backends as well as history adapters.
+        let user_prompt_suffix = current_user_message.prompt_suffix.clone();
         if internal_system_reminder.is_none() {
             emit_stream(app_handle, &run_id, StreamEvent::UserMessage {
                 session_id: self.session_id.clone(),
@@ -10901,16 +10994,11 @@ impl AgentInstance {
 
         self.register_async_resumer(app_handle, store, &run_id);
         if matches!(&self.backend, LlmBackend::ClaudeCodeCli) {
-            let mut prompt_text = crate::session::history::render_prompt_content(
-                &actual_user_text,
-                current_prompt_prefix,
-                user_prompt_suffix.as_deref(),
+            let prompt_text = claude_code_cli::claude_user_prompt(
+                &current_user_message,
+                if resumed_claude_message { internal_system_reminder.as_deref() } else { None },
+                &prompt_parts.env_prompt,
             );
-            let async_tasks = app_handle.state::<Arc<crate::async_tasks::AsyncTaskManager>>();
-            for reminder in async_tasks.deliver_notifications(&self.session_id, store)? {
-                prompt_text.push_str("\n\n");
-                prompt_text.push_str(&reminder);
-            }
             let system_prompt = {
                 let mut parts = vec![prompt_parts.base_prompt.as_str()];
                 if !prompt_parts.rules_prompt.is_empty() {
@@ -10918,6 +11006,13 @@ impl AgentInstance {
                 }
                 if !prompt_parts.knowledge_prompt.is_empty() {
                     parts.push(prompt_parts.knowledge_prompt.as_str());
+                }
+                // Claude's PTY cwd is an isolated runtime directory. Promote
+                // the actual tool host environment into its system prompt;
+                // the Mod separately removes CLI's own environment attachment.
+                parts.push("All filesystem and process tools execute in the Locus client environment below. Use its OS, shell and workspace paths. The Claude CLI runtime directory is not the project directory. Do not translate Windows drive paths to Linux paths.");
+                if !prompt_parts.env_prompt.is_empty() {
+                    parts.push(prompt_parts.env_prompt.as_str());
                 }
                 parts.join("\n\n")
             };
@@ -10928,10 +11023,11 @@ impl AgentInstance {
                     store,
                     &prompt_text,
                     &system_prompt,
-                    images,
+                    current_user_message.images.as_deref(),
                     initial_mode,
                     &run_id,
                     &active_skill_tool_names,
+                    Some(&current_user_message.id),
                 )
                 .await;
             if result.is_ok() {
@@ -11016,7 +11112,7 @@ impl AgentInstance {
         // Tracks whether this run has persisted any assistant message yet; a
         // cancel before that revokes the user message back to the composer.
         let mut assistant_round_persisted = false;
-        let mut codex_turn_state = matches!(self.backend, LlmBackend::OpenAiCodex { .. })
+        let mut codex_turn_state = self.uses_codex_protocol()
             .then(codex::TurnState::default);
         let run_steering = codex_steering::RunSteering::new(
             self, app_handle, store, &run_id, env_prompt_prefix.as_deref());
@@ -11282,6 +11378,7 @@ impl AgentInstance {
                         store,
                         codex_turn_state.as_mut(),
                         Some(&run_steering),
+                        Some((&run_id, iteration)),
                         LlmRequestOptions::default(),
                         &system_parts,
                         &prepared_messages,
@@ -15003,7 +15100,7 @@ impl AgentInstance {
     }
 
     fn tool_call_runs_in_background(&self, tool_name: &str, args: &serde_json::Value) -> bool {
-        self.async_tasks_enabled
+        (self.async_tasks_enabled || crate::llm::claude_code_cli::native_scope::current().is_some_and(|scope|scope.call.tool=="Bash"))
             && crate::async_tasks::supports_async_mode(tool_name)
             && crate::async_tasks::AsyncMode::parse(args, true)
                 .map(crate::async_tasks::AsyncMode::is_background)
@@ -15593,6 +15690,10 @@ impl AgentInstance {
                     )
                     .await
                 }
+                LazyToolRenderer::ClaudeCliNative => ToolResult {
+                    output: "Use Claude Code's native ToolSearch with query select:mcp__locus__<tool_name>, then call that tool directly. Read or select its Skill first if it is not yet available.".into(),
+                    is_error: true,
+                },
                 LazyToolRenderer::ToolLoadFallback => {
                     self.execute_tool_load_with_mode_and_skills(
                         args,
@@ -15794,7 +15895,7 @@ impl AgentInstance {
 
         if crate::async_tasks::supports_async_mode(&tc.name) {
             let async_mode =
-                match crate::async_tasks::AsyncMode::parse(args, self.async_tasks_enabled) {
+                match crate::async_tasks::AsyncMode::parse(args, self.async_tasks_enabled || crate::llm::claude_code_cli::native_scope::current().is_some_and(|scope|scope.call.tool=="Bash")) {
                     Ok(mode) => mode,
                     Err(output) => {
                         return ExecutedToolResult::from_tool_result(ToolResult {
@@ -15873,6 +15974,20 @@ impl AgentInstance {
         args: &serde_json::Value,
         run_id: &str,
     ) -> ExecutedToolResult {
+        if tc.name == "unity_test_run" {
+            // Queueing behind another Unity tool happens in the scope below,
+            // before the bridge can report its own stages.
+            emit_tool_progress(
+                app_handle,
+                run_id,
+                &self.session_id,
+                &tc.id,
+                "Waiting for Unity Editor",
+                "",
+                None,
+                "running",
+            );
+        }
         crate::agent::unity_execution_scope::run(
             &self.working_dir, &tc.name, args, Some(self.cancel_waiter()),
             self.background_task_id.is_some(),
@@ -15938,6 +16053,23 @@ impl AgentInstance {
             ))
             .await
         } else if tc.name == "ask_user_question" {
+            if let Some(scope)=crate::llm::claude_code_cli::native_scope::current().filter(|scope|scope.call.tool=="AskUserQuestion") {
+                let mut answers=serde_json::Map::new();
+                for question in scope.call.input["questions"].as_array().into_iter().flatten() {
+                    let mut question=question.clone();
+                    // AskUserCard treats the last entry as the free-text field.
+                    // Preserve every native choice and append that field explicitly.
+                    let mut options=question["options"].as_array().cloned().unwrap_or_default();
+                    options.push(serde_json::json!({"label":"其他","description":"输入回答"}));
+                    question["options"]=serde_json::json!(options);
+                    let answer=self.await_tool_result(Box::pin(self.execute_ask(app_handle,&tc.id,&question,run_id))).await;
+                    if answer.is_error{return answer;}
+                    answers.insert(question["question"].as_str().unwrap_or_default().into(),serde_json::json!(answer.output.strip_prefix("User answered: ").unwrap_or(&answer.output)));
+                }
+                let result=serde_json::json!({"questions":scope.call.input["questions"],"answers":answers});
+                scope.set_result(result.clone());
+                return ExecutedToolResult::from_tool_result(ToolResult{output:result.to_string(),is_error:false});
+            }
             self.await_tool_result(Box::pin(self.execute_ask(app_handle, &tc.id, args, run_id)))
                 .await
         } else if tc.name == "todowrite" {
@@ -16084,6 +16216,23 @@ impl AgentInstance {
             let mut tool_context = self
                 .build_tool_execution_context(app_handle, &tc.name, args)
                 .await;
+            let progress_handle = app_handle.clone();
+            let progress_run_id = run_id.to_string();
+            let progress_session_id = self.session_id.clone();
+            let progress_tool_call_id = tc.id.clone();
+            let tool_progress: crate::tool::ToolProgressReporter = Arc::new(move |update| {
+                emit_tool_progress(
+                    &progress_handle,
+                    &progress_run_id,
+                    &progress_session_id,
+                    &progress_tool_call_id,
+                    update.title,
+                    update.info,
+                    update.progress,
+                    "running",
+                );
+            });
+            tool_context.tool_progress = Some(tool_progress);
             if tc.name == "bash" {
                 let output_handle = app_handle.clone();
                 let output_run_id = run_id.to_string();
@@ -17798,10 +17947,38 @@ impl AgentInstance {
             .unwrap_or(model)
     }
 
+    /// Project type of the session's workspace, or `None` without a selected
+    /// working directory.
+    fn workspace_project_type(&self) -> Option<&'static str> {
+        if let Some(execution) = self.execution_context.as_ref() {
+            return Some(crate::agent::definition::project_type_for_workspace(
+                execution
+                    .workspace
+                    .services()
+                    .detected_kinds()
+                    .contains(&crate::workspace_service::ServiceKind::Unity),
+            ));
+        }
+        self.has_selected_working_dir().then(|| {
+            crate::agent::definition::project_type_for_workspace(
+                crate::unity_bridge::is_unity_project(&self.working_dir),
+            )
+        })
+    }
+
+    /// Unity Editor status announcements are only useful to Agents that can
+    /// act on the Editor or its project data.
+    fn agent_uses_unity_service_tools(&self) -> bool {
+        self.def.tools.iter().any(|name| {
+            crate::workspace_service::owner_service_for_tool(name)
+                == Some(crate::workspace_service::ServiceKind::Unity)
+        })
+    }
+
     fn render_subagent_tool_description(&self) -> String {
         let agent_list = self
             .registry
-            .list_subagent_descriptions()
+            .list_subagent_descriptions_for_project_type(self.workspace_project_type())
             .into_iter()
             .map(|(id, description)| {
                 let model = self
@@ -19082,11 +19259,11 @@ impl AgentInstance {
         working_dir: &str,
         file_path_arg: &str,
         asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
-    ) -> (
+    ) -> Result<(
         Option<Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>>,
         Option<std::path::PathBuf>,
         std::path::PathBuf,
-    ) {
+    ), ToolResult> {
         let ref_graph_state = Some(Arc::clone(asset_db));
 
         let project_root: Option<std::path::PathBuf> = ref_graph_state
@@ -19105,15 +19282,10 @@ impl AgentInstance {
                 }
             });
 
-        let abs_path = if std::path::Path::new(file_path_arg).is_absolute() {
-            std::path::PathBuf::from(file_path_arg)
-        } else if let Some(ref root) = project_root {
-            root.join(file_path_arg)
-        } else {
-            std::path::PathBuf::from(file_path_arg)
-        };
+        let abs_path = crate::tool::path::resolve_workspace_path(project_root.as_deref(), file_path_arg)
+            .map_err(|output| ToolResult { output, is_error: true })?;
 
-        (ref_graph_state, project_root, abs_path)
+        Ok((ref_graph_state, project_root, abs_path))
     }
 
     /// Cap on how much file the yaml tools will load. Force-Text scenes can
@@ -19221,6 +19393,10 @@ impl AgentInstance {
                 is_error: true,
             })?;
 
+        // Validate only the filesystem root here; child segments retain the
+        // Property Tree parser's escaping and addressing semantics.
+        crate::tool::path::resolve_workspace_path(Some(std::path::Path::new(working_dir)), input)
+            .map_err(|output| ToolResult { output, is_error: true })?;
         crate::unity_serialized_property::property_tree::PropertyTreePath::parse(working_dir, input)
             .map_err(|error| ToolResult {
                 output: error,
@@ -19347,7 +19523,7 @@ impl AgentInstance {
             }
         }
         let (ref_graph_state, project_root, _) =
-            Self::unity_yaml_project_context(working_dir, &path.asset_path, asset_db);
+            Self::unity_yaml_project_context(working_dir, &path.asset_path, asset_db)?;
         let content = Self::read_unity_yaml_content(&path.absolute_asset_path)?;
         if !Self::is_unity_yaml_content(&content) {
             if Self::looks_binary_content(&content) {
@@ -19591,7 +19767,8 @@ impl AgentInstance {
                     return Ok(None);
                 }
                 let (_, project_root, _) =
-                    Self::unity_yaml_project_context(working_dir, &path.asset_path, asset_db);
+                    Self::unity_yaml_project_context(working_dir, &path.asset_path, asset_db)
+                        .map_err(|result| result.output)?;
                 let abs_path = &path.absolute_asset_path;
                 // Saved YAML is used only for matcher identity. Failure to load
                 // it must not prevent a live read of an unsaved/new asset.
@@ -20251,7 +20428,10 @@ impl AgentInstance {
         }
 
         let (ref_graph_state, _project_root, abs_path) =
-            Self::unity_yaml_project_context(working_dir, &file_path_arg, &asset_db);
+            match Self::unity_yaml_project_context(working_dir, &file_path_arg, &asset_db) {
+                Ok(context) => context,
+                Err(result) => return result,
+            };
         let mut live_fallback_reason: Option<String> = None;
         if Self::unity_yaml_live_eligible(working_dir, &abs_path) {
             let payload = Self::unity_yaml_search_editor_payload(&file_path_arg, &search_options);
@@ -20386,7 +20566,10 @@ impl AgentInstance {
         let (window_limit, window_offset) = Self::parse_unity_yaml_read_window(args);
 
         let (ref_graph_state, project_root, abs_path) =
-            Self::unity_yaml_project_context(working_dir, &file_path_arg, &asset_db);
+            match Self::unity_yaml_project_context(working_dir, &file_path_arg, &asset_db) {
+                Ok(context) => context,
+                Err(result) => return result,
+            };
         let ext = Self::unity_yaml_file_extension(&abs_path);
         let is_hierarchical = yaml_parser::is_hierarchical_file(&ext);
 
@@ -21279,13 +21462,24 @@ impl AgentInstance {
         tool_call_id: &str,
         run_id: &str,
     ) -> Result<SubagentRunResult, String> {
+        let project_type = self.workspace_project_type();
         let agent_def = match self.registry.get(subagent_type) {
-            Some(def) => def.clone(),
-            None => {
+            Some(def) if def.is_delegation_target_for_project_type(project_type) => def.clone(),
+            found => {
+                let available = self
+                    .registry
+                    .list_subagent_descriptions_for_project_type(project_type)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>();
+                let reason = if found.is_some() {
+                    "is not available for delegation in this workspace"
+                } else {
+                    "is unknown"
+                };
                 return Err(format!(
-                    "Unknown agent type: '{}'. Available: {:?}",
-                    subagent_type,
-                    self.registry.list_ids()
+                    "Agent type '{}' {}. Available: {:?}",
+                    subagent_type, reason, available
                 ));
             }
         };
@@ -23429,6 +23623,8 @@ PrefabInstance:
                 env_template: env_template.to_string(),
                 tools: Vec::new(),
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -23815,6 +24011,68 @@ PrefabInstance:
         assert_eq!(loaded_description, direct_description);
     }
 
+    #[test]
+    fn subagent_tool_description_follows_workspace_project_type_and_delegation() {
+        let agent_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../agent");
+        let registry = Arc::new(AgentDefRegistry::load(Some(agent_dir.as_path()), None));
+        let listed = |instance: &AgentInstance| -> Vec<String> {
+            instance
+                .render_subagent_tool_description()
+                .lines()
+                .filter_map(|line| line.strip_prefix("- "))
+                .filter_map(|line| line.split(':').next())
+                .map(str::to_string)
+                .collect()
+        };
+
+        let mut instance = test_agent_instance(String::new());
+        instance.registry = registry.clone();
+        let unscoped = listed(&instance);
+        for id in ["unity", "explorer", "simple", "researcher"] {
+            assert!(unscoped.iter().any(|listed| listed == id), "{id} missing from {unscoped:?}");
+        }
+        assert!(!unscoped.iter().any(|id| id == "general"), "{unscoped:?}");
+
+        let generic = tempdir().unwrap();
+        let mut instance = test_agent_instance(generic.path().to_string_lossy().to_string());
+        instance.registry = registry.clone();
+        assert_eq!(instance.workspace_project_type(), Some("generic"));
+        let generic_agents = listed(&instance);
+        for id in ["simple", "researcher"] {
+            assert!(generic_agents.iter().any(|listed| listed == id), "{id} missing from {generic_agents:?}");
+        }
+        for hidden in ["general", "unity", "explorer"] {
+            assert!(!generic_agents.iter().any(|id| id == hidden), "{hidden} in {generic_agents:?}");
+        }
+
+        let unity = tempdir().unwrap();
+        std::fs::create_dir_all(unity.path().join("Assets")).unwrap();
+        std::fs::create_dir_all(unity.path().join("ProjectSettings")).unwrap();
+        let mut instance = test_agent_instance(unity.path().to_string_lossy().to_string());
+        instance.registry = registry;
+        assert_eq!(instance.workspace_project_type(), Some("unity"));
+        let unity_agents = listed(&instance);
+        for id in ["unity", "explorer"] {
+            assert!(unity_agents.iter().any(|listed| listed == id), "{id} missing from {unity_agents:?}");
+        }
+        for hidden in ["general", "researcher", "simple"] {
+            assert!(!unity_agents.iter().any(|id| id == hidden), "{hidden} in {unity_agents:?}");
+        }
+    }
+
+    #[test]
+    fn unity_status_announcements_follow_unity_service_tools() {
+        let mut instance = test_agent_instance(String::new());
+        assert!(!instance.agent_uses_unity_service_tools());
+
+        let agent_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../agent");
+        let registry = AgentDefRegistry::load(Some(agent_dir.as_path()), None);
+        for (id, expected) in [("unity", true), ("explorer", true), ("general", false), ("simple", false), ("researcher", false)] {
+            instance.def = Arc::new(registry.get(id).expect("built-in Agent").clone());
+            assert_eq!(instance.agent_uses_unity_service_tools(), expected, "{id}");
+        }
+    }
+
     fn test_agent_instance_with_tools_and_mode(
         working_dir: String,
         tools: Vec<String>,
@@ -23831,6 +24089,8 @@ PrefabInstance:
                 env_template: "{{#knowledge}}\n<knowledge_context>\n{{/knowledge}}".to_string(),
                 tools,
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -23894,6 +24154,7 @@ PrefabInstance:
             api_format: crate::commands::ApiFormat::OpenaiChat,
             context_length: 256_000,
             remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
+            codex_transport: None,
             supports_tool_lazy_loading: false,
             supported_reasoning_efforts: Vec::new(),
             reasoning_param_format:
@@ -23917,6 +24178,7 @@ PrefabInstance:
                 api_format,
                 context_length: 272_000,
                 remote_compaction_mode,
+                codex_transport: None,
                 supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: vec!["high".to_string()],
                 reasoning_param_format:
@@ -24209,6 +24471,8 @@ PrefabInstance:
                     "knowledge_query".to_string(),
                 ],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -24279,6 +24543,8 @@ PrefabInstance:
                     "skill_list".to_string(),
                 ],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -24302,6 +24568,31 @@ PrefabInstance:
             HashMap::new(),
             cancel_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn claude_cli_native_skill_activation_keeps_eager_plan_and_guidance_stable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut instance = native_plan_test_instance(&temp);
+        let renderer = instance.refresh_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::Native, true);
+        assert_eq!(renderer, LazyToolRenderer::ClaudeCliNative);
+        let before = instance.build_native_request_tool_plan(renderer, &HashSet::new()).await;
+        let guidance = instance.lazy_tool_manifest_prompt().await.unwrap();
+        let active = HashSet::from(["skill_list".to_string(), "create_skill_package".to_string()]);
+        let after = instance.build_native_request_tool_plan(renderer, &active).await;
+        assert_eq!(before.direct, after.direct);
+        assert!(after.deferred.contains(&"skill_list".to_string()));
+        assert!(after.deferred.contains(&"create_skill_package".to_string()));
+        assert!(!after.all_names().iter().any(|name| AgentInstance::is_meta_tool(name)));
+        let api = instance.build_api_tools_for_plan(renderer, &after).await;
+        for name in ["skill_list", "create_skill_package"] {
+            assert!(api.iter().any(|tool| tool["function"]["name"] == name && tool["defer_loading"] == true));
+        }
+        assert!(guidance.contains("ToolSearch"));
+        assert_eq!(instance.lazy_tool_manifest_prompt().await.unwrap(), guidance);
+        instance.knowledge_access_mode = KnowledgeAccessMode::Disabled;
+        let denied = instance.build_native_request_tool_plan(renderer, &active).await;
+        assert!(!denied.all_names().iter().any(|name| active.contains(name)), "native discovery must not bypass Knowledge permissions");
     }
 
     #[test]
@@ -24351,6 +24642,7 @@ PrefabInstance:
                 api_format,
                 context_length: 256_000,
                 remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
+                codex_transport: None,
                 supports_tool_lazy_loading: lazy,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
@@ -24908,6 +25200,8 @@ PrefabInstance:
                     "web_fetch".to_string(),
                 ],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -24922,6 +25216,7 @@ PrefabInstance:
                 api_format: crate::commands::ApiFormat::OpenaiChat,
                 context_length: 256_000,
                 remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
+                codex_transport: None,
                 supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
@@ -25011,6 +25306,8 @@ PrefabInstance:
                     "web_fetch".to_string(),
                 ],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -25025,6 +25322,7 @@ PrefabInstance:
                 api_format: crate::commands::ApiFormat::OpenaiResponses,
                 context_length: 256_000,
                 remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
+                codex_transport: None,
                 supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
@@ -25096,6 +25394,8 @@ PrefabInstance:
                 env_template: String::new(),
                 tools: vec!["edit".to_string(), "web_fetch".to_string()],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -25110,6 +25410,7 @@ PrefabInstance:
                 api_format: crate::commands::ApiFormat::OpenaiResponses,
                 context_length: 256_000,
                 remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
+                codex_transport: None,
                 supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
@@ -25188,6 +25489,8 @@ PrefabInstance:
                     "unity_capture_viewport".to_string(),
                 ],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -25259,6 +25562,8 @@ PrefabInstance:
                     "skill_special".to_string(),
                 ],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -25326,6 +25631,8 @@ PrefabInstance:
                 env_template: String::new(),
                 tools: vec!["read".to_string(), "skill_special".to_string()],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -25410,6 +25717,41 @@ PrefabInstance:
             .await;
         assert!(!read_only_with_skill.contains("create_skill_package"));
         assert!(read_only_with_skill.contains("skill_list"));
+    }
+
+    #[test]
+    fn workspace_path_regression_injection_is_independent_of_knowledge_mode() {
+        let root = tempdir().expect("workspace");
+        for mode in [KnowledgeAccessMode::Disabled, KnowledgeAccessMode::ReadOnly, KnowledgeAccessMode::Full] {
+            let instance = test_agent_instance_with_tools_and_mode(
+                root.path().to_string_lossy().into_owned(), Vec::new(), mode,
+            );
+            for (tool, field) in [
+                ("grep", "path"), ("list", "path"), ("bash", "workdir"),
+                ("read", "filePath"), ("write", "filePath"), ("edit", "filePath"),
+                ("unity_recompile", "project_path"),
+            ] {
+                let mut args = json!({(field): "."});
+                instance.inject_working_dir(tool, &mut args);
+                assert_eq!(std::path::Path::new(args[field].as_str().unwrap()), root.path().join("."), "{tool}");
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_path_regression_legacy_yaml_has_no_process_cwd_fallback() {
+        let db = Arc::new(std::sync::Mutex::new(None));
+        assert!(AgentInstance::unity_yaml_project_context("", "Assets/test.prefab", &db).is_err());
+        let workspace = tempdir().unwrap();
+        let (_, _, resolved) = AgentInstance::unity_yaml_project_context(
+            &workspace.path().to_string_lossy(), "Assets/test.prefab", &db,
+        ).unwrap();
+        assert_eq!(resolved, workspace.path().join("Assets/test.prefab"));
+        assert!(AgentInstance::unity_property_tree_path_arg("", &json!({"path":"Assets/test.prefab/child"})).is_err());
+        #[cfg(windows)]
+        assert!(AgentInstance::unity_property_tree_path_arg(
+            &workspace.path().to_string_lossy(), &json!({"path":"C:test.prefab/child"}),
+        ).is_err());
     }
 
     #[tokio::test]
@@ -25525,6 +25867,8 @@ PrefabInstance:
                     "knowledge_query".to_string(),
                 ],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -25790,6 +26134,8 @@ Create a reusable Skill.
                 env_template: String::new(),
                 tools: vec!["skill_list".to_string()],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -25903,6 +26249,8 @@ Search, install, audit, and export a plugin.
                 env_template: String::new(),
                 tools: vec!["read".to_string()],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,
@@ -26007,7 +26355,8 @@ Search, install, audit, and export a plugin.
 
     fn sample_agent_knowledge_document(path: &str, title: &str) -> KnowledgeDocument {
         KnowledgeDocument {
-            inject_agents: crate::knowledge_store::default_inject_agents(),
+            properties_yaml: String::new(),
+            inject_agents: crate::knowledge_store::legacy_inject_agents(),
             id: format!("kd_{}", title.replace(' ', "_").to_lowercase()),
             doc_type: KnowledgeType::Design,
             path: path.to_string(),
@@ -26517,7 +26866,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_design_combat_move".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
@@ -26801,7 +27151,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_design_combat_rules".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
@@ -26856,7 +27207,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_design_combat".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
@@ -26928,7 +27280,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_skill_builtin_create_skill".to_string(),
                 doc_type: KnowledgeType::Skill,
                 path: "builtin/create-skill.md".to_string(),
@@ -26991,7 +27344,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_design_hidden".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/hidden.md".to_string(),
@@ -27091,7 +27445,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_design_hidden_dir_doc".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
@@ -27125,7 +27480,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_design_hidden_dir_nested_doc".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/sub/chain.md".to_string(),
@@ -27185,7 +27541,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_design_summary".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/summary.md".to_string(),
@@ -27219,7 +27576,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_design_body".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/body.md".to_string(),
@@ -27529,7 +27887,8 @@ Search, install, audit, and export a plugin.
         let working_dir = temp.path().to_string_lossy().to_string();
 
         let documents = vec![KnowledgeDocument {
-            inject_agents: crate::knowledge_store::default_inject_agents(),
+            properties_yaml: String::new(),
+            inject_agents: crate::knowledge_store::legacy_inject_agents(),
             id: "kd_unity_execution_order".to_string(),
             doc_type: KnowledgeType::Reference,
             path: "unity-official-docs/manual/ExecutionOrder.md".to_string(),
@@ -27644,8 +28003,13 @@ Search, install, audit, and export a plugin.
         let temp = tempdir().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
         let config = crate::commands::AgentInjectionConfigLayers::default();
-        assert!(build_l2_full_document_section(&working_dir, None, "reviewer").unwrap().is_empty());
-        assert!(build_l3_rule_section(&working_dir, None, "reviewer", &config).unwrap().is_empty());
+        // Built-in Memory seeds created for a new workspace target every Agent.
+        let seeded_l2 = build_l2_full_document_section(&working_dir, None, "reviewer").unwrap();
+        let seeded_l3 = build_l3_rule_section(&working_dir, None, "reviewer", &config).unwrap();
+        assert!(seeded_l2.contains("project-mistake-note.md"), "{seeded_l2}");
+        assert!(seeded_l3.contains("user-preference.md") || seeded_l3.contains("User Preference"), "{seeded_l3}");
+        assert!(!seeded_l2.contains("REVIEWER_L2_BODY"));
+        assert!(!seeded_l3.contains("REVIEWER_L3_BODY"));
         for (path, mode, marker) in [
             ("agents/full.md", KnowledgeInjectMode::Full, "REVIEWER_L2_BODY"),
             ("agents/rule.md", KnowledgeInjectMode::Rule, "REVIEWER_L3_BODY"),
@@ -27675,7 +28039,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_design_full".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/full-design.md".to_string(),
@@ -27777,7 +28142,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_memory_empty".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: "empty-memory.md".to_string(),
@@ -27829,7 +28195,8 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             crate::knowledge_store::KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_memory_heading_map".to_string(),
                 doc_type: crate::knowledge_store::KnowledgeType::Memory,
                 path: "heading-map.md".to_string(),
@@ -28376,7 +28743,8 @@ Search, install, audit, and export a plugin.
             kind: KnowledgeTargetKind::Document,
             document: Some(KnowledgeReadResult {
                 document: KnowledgeDocument {
-                    inject_agents: crate::knowledge_store::default_inject_agents(),
+                    properties_yaml: String::new(),
+                    inject_agents: crate::knowledge_store::legacy_inject_agents(),
                     id: "kd_design_test".to_string(),
                     doc_type: KnowledgeType::Design,
                     path: "design/project-overview.md".to_string(),
@@ -28679,6 +29047,8 @@ Search, install, audit, and export a plugin.
                 env_template: String::new(),
                 tools: vec!["read".to_string(), "subagent".to_string()],
                 sub_agents: Vec::new(),
+                delegatable: true,
+                default_project_types: Vec::new(),
                 default: false,
                 default_effort: None,
                 model_recommendation: None,

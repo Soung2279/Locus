@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::auth::CodexAuthStateHandle;
 use super::{StreamEvent, TokenUsage};
 use crate::agent::definition::{
-    canonical_agent_id, is_hidden_legacy_agent_id, AgentDef, AgentDefRegistry,
-    GENERIC_PROJECT_TYPE, UNITY_PROJECT_TYPE,
+    canonical_agent_id, is_hidden_legacy_agent_id, project_type_for_workspace, AgentDef,
+    AgentDefRegistry,
 };
 use crate::agent::instance::{
     AgentInstance, AgentSystemPromptStats, AssistantStreamSnapshot, KnowledgeAccessMode,
@@ -430,6 +430,7 @@ fn apply_knowledge_target(
         Err(err) if err.contains("not found") => {
             let now = current_unix_millis();
             let doc = KnowledgeDocument {
+                properties_yaml: String::new(),
                 inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: format!("kd_{}", uuid::Uuid::new_v4()),
                 doc_type,
@@ -510,6 +511,9 @@ fn preferred_agent_id_for_project_type<'a>(
     agents: &[&'a AgentDef],
     project_type: Option<&str>,
 ) -> &'a str {
+    if let Some(default_id) = registry.workspace_default_id() {
+        return default_id;
+    }
     let Some(project_type) = project_type else {
         return registry.default_id();
     };
@@ -526,6 +530,13 @@ fn preferred_agent_id_for_project_type<'a>(
     }) {
         return default.id.as_str();
     }
+    if let Some(declared) = agents
+        .iter()
+        .filter(|agent| agent.is_default_for_project_type(project_type))
+        .min_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)))
+    {
+        return declared.id.as_str();
+    }
     agents
         .iter()
         .filter(|agent| agent.project_type_match_score(project_type) == best_score)
@@ -535,15 +546,12 @@ fn preferred_agent_id_for_project_type<'a>(
 }
 
 fn workspace_project_type(runtime: &WorkspaceRuntime) -> &'static str {
-    if runtime
-        .services()
-        .detected_kinds()
-        .contains(&ServiceKind::Unity)
-    {
-        UNITY_PROJECT_TYPE
-    } else {
-        GENERIC_PROJECT_TYPE
-    }
+    project_type_for_workspace(
+        runtime
+            .services()
+            .detected_kinds()
+            .contains(&ServiceKind::Unity),
+    )
 }
 
 fn list_agent_infos(registry: &AgentDefRegistry, project_type: Option<&str>) -> Vec<AgentInfo> {
@@ -805,6 +813,39 @@ pub async fn list_workspace_agents(
     )
     .await?;
     Ok(list_agent_infos(&registry, Some(project_type)))
+}
+
+#[tauri::command]
+pub async fn set_workspace_default_agent(
+    workspace_ref: WorkspaceRef,
+    agent_id: String,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    app: AppHandle,
+) -> Result<(), AppError> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner().as_ref(),
+        &workspace_ref,
+        "setWorkspaceDefaultAgent",
+    )?;
+    let mut agents = definitions.snapshot(scope.runtime()).await?.as_ref().clone();
+    agents.set_workspace_default(&agent_id)?;
+    let working_dir = scope.runtime().root().to_string_lossy();
+    super::knowledge::ensure_workspace_rule_path(
+        &working_dir,
+        &crate::workspace::workspace_config_path(&working_dir),
+    )?;
+    crate::workspace::set_default_agent_id(&working_dir, &agent_id)?;
+    if let Err(error) = super::selection_memory::remember_workspace_agent(
+        scope.runtime().project_id().as_str(),
+        &working_dir,
+        &agent_id,
+    ) {
+        tracing::warn!("[agent] failed to remember workspace default Agent: {error}");
+    }
+    definitions.invalidate_checkout(scope.runtime().checkout_id())?;
+    let _ = app.emit("agents-changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -1156,6 +1197,7 @@ pub(crate) fn custom_backend_from_config(
         api_format: provider.api_format,
         context_length: model.context_length,
         remote_compaction_mode: model.remote_compaction_mode,
+        codex_transport: model.codex_transport,
         supports_tool_lazy_loading: model.supports_tool_lazy_loading,
         supported_reasoning_efforts: model.supported_reasoning_efforts,
         reasoning_param_format: model
@@ -1415,6 +1457,12 @@ pub async fn fork_session(
     pending_input_queue: State<'_, PendingInputQueueHandle>,
     active_tasks: State<'_, ActiveTasks>,
 ) -> Result<String, AppError> {
+    let is_claude=store.latest_cli_session_id(&session_id,"claude_code")?.is_some();
+    if is_claude {
+        // Like a queued native /fork, copy after the current turn is settled.
+        let done=active_tasks.lock().await.get(&session_id).map(|task|task.done_rx.clone());
+        if let Some(mut done)=done {while !*done.borrow() {if done.changed().await.is_err(){break;}}}
+    }
     let live_store = store.inner().clone();
     let snapshot_source = live_store.clone();
     let snapshot = tokio::task::spawn_blocking(move || snapshot_source.create_export_snapshot())
@@ -1448,7 +1496,7 @@ pub async fn fork_session(
         .list_session(&session_id);
     let title = title.clone();
     let source_id = session_id.clone();
-    tokio::task::spawn_blocking(move || {
+    let forked_id = tokio::task::spawn_blocking(move || {
         let snapshot_message_ids = snapshot
             .get_messages(&source_id)?
             .into_iter()
@@ -1489,6 +1537,7 @@ pub async fn fork_session(
             }
 
             for pending in pending_inputs {
+                if is_claude {break;} // Unsubmitted drafts are not part of the native transcript.
                 let user_intent_signature = pending
                     .user_intent
                     .as_ref()
@@ -1541,7 +1590,12 @@ pub async fn fork_session(
                 .detail(error)
                 .operation("forkSession")
         }
-    })
+    })?;
+    if let Err(error)=crate::llm::claude_code_cli::fork::prepare(store.inner().as_ref(),&session_id,&forked_id).await {
+        store.delete_session(&forked_id)?;
+        return Err(AppError::new("session.fork_failed","Failed to fork Claude conversation").detail(error).operation("forkSession"));
+    }
+    Ok(forked_id)
 }
 
 #[tauri::command]
@@ -1551,7 +1605,7 @@ pub async fn fork_session_from_message(
     title: Option<String>,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<String, AppError> {
-    store
+    let forked_id = store
         .fork_session_from_message(&session_id, &message_id, title.as_deref())
         .map_err(|error| {
             if error == CHILD_SESSION_FORK_ERROR {
@@ -1563,7 +1617,12 @@ pub async fn fork_session_from_message(
                     .detail(error)
                     .operation("forkSession")
             }
-        })
+        })?;
+    if let Err(error)=crate::llm::claude_code_cli::fork::prepare(store.inner().as_ref(),&session_id,&forked_id).await {
+        store.delete_session(&forked_id)?;
+        return Err(AppError::new("session.fork_failed","Failed to fork Claude conversation").detail(error).operation("forkSession"));
+    }
+    Ok(forked_id)
 }
 
 #[tauri::command]
@@ -1695,14 +1754,23 @@ pub async fn chat(
         None => {
             let title = explicit_session_title.unwrap_or_else(|| text.chars().take(20).collect());
             let title = generated_title_fallback.unwrap_or(title);
-            store.create_session_scoped(
+            let pooled = model.as_deref().filter(|m| m.starts_with("claude_code/")).and_then(|model| {
+                let runtime = scoped_runtime.as_ref()?;
+                crate::llm::claude_code_cli::tui::prewarm::claim(&cwd, runtime.checkout_id().as_str(), runtime.materialization_epoch(), model)
+            });
+            if let Some(id) = pooled {
+                match store.create_session_scoped_with_id(&id, &title, None, ws_id.as_deref(), checkout_id.as_deref(), session_kind, requested_agent_id.as_deref()) {
+                    Ok(id) => id,
+                    Err(error) => { crate::llm::claude_code_cli::tui::prewarm::discard_unassigned(&id); return Err(error.into()); }
+                }
+            } else { store.create_session_scoped(
                 &title,
                 None,
                 ws_id.as_deref(),
                 checkout_id.as_deref(),
                 session_kind,
                 requested_agent_id.as_deref(),
-            )?
+            )? }
         }
     };
 
@@ -2685,13 +2753,75 @@ pub async fn load_session(
 }
 
 #[tauri::command]
+pub async fn sync_claude_remote_session(
+    session_id: String,
+    app_handle: AppHandle,
+    store: State<'_, Arc<SessionStore>>,
+    active_tasks: State<'_, ActiveTasks>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<crate::llm::claude_code_cli::recovery::SyncReport, String> {
+    if active_task_run_id(active_tasks.inner(), &session_id).await.is_some() {
+        return Err("Stop the active conversation before synchronizing remote history".into());
+    }
+    let report=crate::llm::claude_code_cli::recovery::synchronize(store.inner(), &session_id, None).await?;
+    if report.changed {
+        let scope=resolve_optional_session_workspace_scope(store.inner(),workspace_registry.inner(),&session_id,"sync_claude_remote_session")
+            .map_err(|e|e.to_string())?;
+        if let Some(scope)=scope {
+            super::emit_session_content_changed(&app_handle,
+                Some(&crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime())),
+                &scope.runtime().root().to_string_lossy(),&session_id,"claude_native_sync");
+        }
+    }
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRemoteHistorySync {
+    pub changed: bool,
+    pub warning: Option<String>,
+}
+
+fn remote_history_sync_warning(error: impl std::fmt::Display) -> String {
+    format!("Remote history was not synchronized; showing saved local data. {error}")
+}
+
+/// Background counterpart of `load_session_view(synchronize_remote = true)`.
+/// The view is first loaded from local storage; this reconciles the native
+/// remote history afterwards and reports whether the saved transcript changed,
+/// so an unchanged result never forces the frontend to re-render.
+#[tauri::command]
+pub async fn synchronize_session_remote_history(
+    session_id: String,
+    store: State<'_, Arc<SessionStore>>,
+    active_tasks: State<'_, ActiveTasks>,
+) -> Result<SessionRemoteHistorySync, String> {
+    if active_task_run_id(active_tasks.inner(), &session_id).await.is_some() {
+        // The active run owns synchronization and reloads the view when it ends.
+        return Ok(SessionRemoteHistorySync::default());
+    }
+    Ok(match crate::llm::claude_code_cli::recovery::synchronize(store.inner(), &session_id, None).await {
+        Ok(report) => SessionRemoteHistorySync { changed: report.changed, warning: report.warning },
+        Err(error) => SessionRemoteHistorySync { changed: false, warning: Some(remote_history_sync_warning(error)) },
+    })
+}
+
+#[tauri::command]
 pub async fn load_session_view(
     session_id: String,
     message_limit: Option<u32>,
+    synchronize_remote: Option<bool>,
     store: State<'_, Arc<SessionStore>>,
     pending_input_queue: State<'_, PendingInputQueueHandle>,
     active_tasks: State<'_, ActiveTasks>,
 ) -> Result<SessionViewSnapshot, AppError> {
+    let remote_sync_warning = if synchronize_remote != Some(false) && active_task_run_id(active_tasks.inner(), &session_id).await.is_none() {
+        match crate::llm::claude_code_cli::recovery::synchronize(store.inner(), &session_id, None).await {
+            Ok(report) => report.warning,
+            Err(error) => Some(remote_history_sync_warning(error)),
+        }
+    } else { None };
     let store_handle = store.inner().clone();
     let load_session_id = session_id.clone();
     let limit = message_limit.unwrap_or(DEFAULT_SESSION_VIEW_MESSAGE_LIMIT);
@@ -2709,6 +2839,7 @@ pub async fn load_session_view(
     })?
     .map_err(AppError::from)?;
 
+    snapshot.remote_sync_warning = remote_sync_warning;
     snapshot.session.pending_inputs = pending_input_queue
         .lock()
         .map_err(|error| {
@@ -2869,9 +3000,10 @@ pub async fn undo_latest_conversation_turn(
     let event_scope = scope.as_ref().map(|scope| {
         crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime())
     });
-    let deleted = store
-        .truncate_latest_conversation_turn(&session_id)
-        .map_err(AppError::from)?;
+    let deleted = match crate::llm::claude_code_cli::rewind::rewind(store.inner(), &session_id, None).await? {
+        Some(deleted) => deleted,
+        None => store.truncate_latest_conversation_turn(&session_id).map_err(AppError::from)?,
+    };
     if deleted == 0 {
         return Err(AppError::new(
             "session.undo.empty",
@@ -2912,9 +3044,9 @@ pub async fn rollback_session_to_message(
     let event_scope = scope.as_ref().map(|scope| {
         crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime())
     });
-    store
-        .truncate_after_message(&session_id, &message_id)
-        .map_err(AppError::from)?;
+    if crate::llm::claude_code_cli::rewind::rewind(store.inner(), &session_id, Some(&message_id)).await?.is_none() {
+        store.truncate_after_message(&session_id, &message_id).map_err(AppError::from)?;
+    }
     crate::llm::codex::reset_cached_session_window(&session_id).await;
     let detail = store.load_session(&session_id).map_err(AppError::from)?;
     super::emit_session_content_changed(
@@ -2987,6 +3119,23 @@ pub async fn list_checkout_sessions(
     populate_session_runtime_statuses(&mut sessions, store.inner().as_ref(), active_tasks.inner())
         .await;
     Ok(sessions)
+}
+
+#[tauri::command]
+pub async fn search_session_titles(
+    workspace_ref: WorkspaceRef,
+    query: String,
+    limit: u32,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<Vec<crate::session::store::SessionTitleMatch>, AppError> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner().as_ref(), &workspace_ref, "searchSessionTitles",
+    )?;
+    let store = store.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        store.search_session_titles(scope.runtime().checkout_id().as_str(), &query, limit)
+    }).await.map_err(|error| AppError::from(error.to_string()))?.map_err(Into::into)
 }
 
 #[tauri::command]
@@ -3083,7 +3232,9 @@ pub async fn archive_session(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<(), AppError> {
-    store.archive_session(&session_id).map_err(Into::into)
+    store.archive_session(&session_id).map_err(AppError::from)?;
+    crate::llm::claude_code_cli::tui::close_session(&session_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3101,6 +3252,7 @@ pub async fn delete_session(
     undo_manager: State<'_, crate::UndoManagerHandle>,
 ) -> Result<(), AppError> {
     store.delete_session(&session_id).map_err(AppError::from)?;
+    crate::llm::claude_code_cli::clear_session_id(&session_id).await;
     crate::llm::codex::invalidate_cached_session(&session_id);
     undo_manager.on_session_delete(&session_id).await;
     // The delete cascades to messages/events; reclaim file space in the
@@ -3165,10 +3317,12 @@ pub async fn get_session_context_usage_report(
         .and_then(|agent_id| registry_snapshot.get(agent_id).cloned())
         .or_else(|| registry_snapshot.default_def().cloned())
         .ok_or_else(|| "No agent definitions found".to_string())?;
-    let selected_model = model_id
+    let selected_model = detail.last_model_id.as_deref()
+        .filter(|value| value.starts_with("claude_code/"))
+        .or(model_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty()))
         .or(detail.last_model_id.as_deref())
         .ok_or_else(|| "This session has no model usage yet".to_string())?
         .to_string();
@@ -3958,6 +4112,27 @@ mod workspace_definition_scope_tests {
     }
 
     #[test]
+    fn workspace_default_overrides_project_type_and_rejects_subagents() {
+        let mut registry = repo_agent_registry();
+        registry.set_workspace_default("simple").unwrap();
+        assert_eq!(registry.default_def().unwrap().id, "simple");
+        for project_type in ["generic", "unity"] {
+            let agents = list_agent_infos(&registry, Some(project_type));
+            assert_eq!(agents.iter().filter(|agent| agent.is_default).count(), 1);
+            assert_eq!(agents[0].id, "simple");
+        }
+        for invalid in ["explorer", "researcher", "missing", "doc", "../simple"] {
+            assert!(registry.set_workspace_default(invalid).is_err());
+            assert_eq!(registry.workspace_default_id(), Some("simple"));
+        }
+        registry.set_workspace_default("general").unwrap();
+        for project_type in ["generic", "unity"] {
+            let agents = list_agent_infos(&registry, Some(project_type));
+            assert_eq!(agents[0].id, "general");
+        }
+    }
+
+    #[test]
     fn workspace_project_type_selects_the_compatible_builtin_default() {
         let registry = repo_agent_registry();
         let generic = list_agent_infos(&registry, Some("generic"));
@@ -3968,7 +4143,7 @@ mod workspace_definition_scope_tests {
                 .iter()
                 .find(|agent| agent.is_default)
                 .map(|agent| agent.id.as_str()),
-            Some("simple")
+            Some("general")
         );
         assert_eq!(
             unity
@@ -3977,5 +4152,37 @@ mod workspace_definition_scope_tests {
                 .map(|agent| agent.id.as_str()),
             Some("unity")
         );
+        for agents in [&generic, &unity] {
+            let ids = agents.iter().map(|agent| agent.id.as_str()).collect::<Vec<_>>();
+            for id in ["unity", "general", "simple"] {
+                assert!(ids.contains(&id), "{id} should be selectable: {ids:?}");
+            }
+            for sub_agent in ["explorer", "researcher"] {
+                assert!(!ids.contains(&sub_agent), "{sub_agent} should stay a subagent: {ids:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn declared_project_default_beats_name_order_for_generic_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let project_agents = root.path().join("Locus/agent");
+        let early = project_agents.join("aardvark");
+        std::fs::create_dir_all(&early).unwrap();
+        std::fs::write(
+            early.join("config.json"),
+            r#"{"name":"Aardvark","project_types":["generic"],"tools":["read"]}"#,
+        )
+        .unwrap();
+        std::fs::write(early.join("soul.md"), "Project Agent.").unwrap();
+        let agent_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../agent");
+        let registry = AgentDefRegistry::load(Some(&agent_dir), Some(&project_agents));
+        assert!(registry.get("aardvark").is_some());
+
+        let generic = list_agent_infos(&registry, Some("generic"));
+        assert_eq!(generic[0].id, "general");
+        assert!(generic[0].is_default);
+        let unity = list_agent_infos(&registry, Some("unity"));
+        assert_eq!(unity[0].id, "unity");
     }
 }

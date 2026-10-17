@@ -2,7 +2,10 @@
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
-import { computed } from "vue";
+import ClaudeConnection from './ClaudeConnection.vue';
+import { computed, ref } from "vue";
+import { isRemoteClaudeCode } from "../../services/claudeConnection";
+import { claudeCodeCliEnabled } from "../../services/claudeCodeCli";
 import { locale, t } from "../../i18n";
 import type {
   ModelOption,
@@ -34,7 +37,7 @@ interface ModelGroup {
   models: ModelOption[];
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   providers: ProviderStatus[];
   editingProvider: string | null;
   editKey: string;
@@ -51,6 +54,8 @@ const props = defineProps<{
   codexResetCreditBusyId: string | null;
   codexRetrying: boolean;
   codexTransport: CodexTransportMode;
+  codexAutoUpdateClientVersion?: boolean;
+  codexClientVersionBusy?: boolean;
   codexContextWindow: number;
   codexSessionTitleGeneration: boolean;
   codexAutoReview: boolean;
@@ -70,9 +75,12 @@ const props = defineProps<{
   claudeCodeTestResult?: string;
   mode?: "full" | "onboarding";
   onboardingFocus?: "custom" | "codex" | null;
-}>();
+}>(), {
+  codexAutoUpdateClientVersion: true,
+});
 
 const emit = defineEmits<{
+  claudeConnectionChanged: [];
   startEdit: [providerId: string];
   cancelEdit: [];
   saveKey: [providerId: string];
@@ -94,6 +102,7 @@ const emit = defineEmits<{
   consumeCodexResetCredit: [creditId: string | null];
   copyCode: [];
   "update:codexTransport": [value: CodexTransportMode];
+  "update:codexAutoUpdateClientVersion": [value: boolean];
   "update:codexContextWindow": [value: number];
   "update:codexSessionTitleGeneration": [value: boolean];
   "update:codexAutoReview": [value: boolean];
@@ -111,6 +120,7 @@ const emit = defineEmits<{
 
 const anthropicProvider = computed(() => props.providers.find((p) => p.id === "anthropic"));
 const claudeCodeProvider = computed(() => props.providers.find((p) => p.id === "claude_code"));
+const claudeConnectionMode = ref<'local' | 'ssh'>(isRemoteClaudeCode.value ? 'ssh' : 'local');
 const claudeCodeLoggedOut = computed(
   () => claudeCodeProvider.value?.hasKey === true && claudeCodeProvider.value?.loggedIn === false,
 );
@@ -559,23 +569,11 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
     </div>
   </div>
 
-  <div class="settings-section" v-if="!isOnboardingMode && claudeCodeProvider">
+  <div class="settings-section" v-if="!isOnboardingMode && claudeCodeCliEnabled && claudeCodeProvider">
     <div class="section-label">{{ t("settings.claudeCode.title") }}</div>
     <div class="provider-card">
-      <div class="provider-header">
-        <div class="provider-info">
-          <span class="provider-name">{{ claudeCodeProvider?.name || 'Claude Code CLI' }}</span>
-          <span class="provider-desc">{{ t("settings.provider.claude_code.desc") }}</span>
-        </div>
-        <span
-          class="provider-status"
-          :class="{ active: claudeCodeProvider?.hasKey && !claudeCodeLoggedOut }"
-        >
-          {{ claudeCodeStatusLabel }}
-        </span>
-      </div>
-
-      <div class="provider-detail">
+      <ClaudeConnection @changed="emit('claudeConnectionChanged')" @mode-change="claudeConnectionMode = $event" />
+      <div v-if="claudeConnectionMode === 'local'" class="provider-detail">
         <span
           class="key-hint"
           :class="{ mono: claudeCodeProvider?.hasKey }"
@@ -584,17 +582,14 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
             ? (claudeCodeProvider?.keyHint || t("settings.claudeCode.installed"))
             : t("settings.claudeCode.installHint") }}
         </span>
+        <span class="provider-status" :class="{ active: claudeCodeProvider?.hasKey && !claudeCodeLoggedOut }">{{ claudeCodeStatusLabel }}</span>
       </div>
 
-      <div class="provider-detail" v-if="claudeCodeLoggedOut" style="padding-top: 0;">
+      <div class="provider-detail" v-if="claudeConnectionMode === 'local' && claudeCodeLoggedOut" style="padding-top: 0;">
         <span class="oauth-hint">{{ t("settings.claudeCode.loginHint") }}</span>
       </div>
 
-      <div class="provider-detail" style="padding-top: 0;">
-        <span class="oauth-hint">{{ t("settings.claudeCode.hint") }}</span>
-      </div>
-
-      <div class="provider-detail">
+      <div v-if="claudeConnectionMode === 'local'" class="provider-detail">
         <div class="codex-status-copy">
           <span
             v-if="claudeCodeTestResult"
@@ -808,6 +803,19 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
           :model-value="codexTransport"
           :options="codexTransportOptions"
           @update:model-value="updateCodexTransport"
+        />
+      </div>
+
+      <div v-if="codexStep !== 'waiting' && !isOnboardingMode" class="provider-detail">
+        <div class="provider-info">
+          <span class="provider-name">{{ t("settings.codex.clientVersionTitle") }}</span>
+          <span class="provider-desc">{{ t("settings.codex.clientVersionDesc") }}</span>
+        </div>
+        <BaseSwitch
+          :model-value="codexAutoUpdateClientVersion !== false"
+          :disabled="codexClientVersionBusy || codexRefreshing"
+          :aria-label="t('settings.codex.clientVersionTitle')"
+          @update:model-value="emit('update:codexAutoUpdateClientVersion', $event)"
         />
       </div>
 

@@ -1,14 +1,16 @@
 import type { DevelopmentResourceRef } from "../../types/workbench";
 
-export type WorkspaceSecondarySection = "knowledge" | "assets" | "views" | "archived" | "collab" | "agents";
+export type WorkspaceSecondarySection = "knowledge" | "assets" | "views" | "archived" | "collab" | "agents" | "sessions" | "archivedFiles" | "fileHistory";
 
 export function workspaceSecondarySection(kind: string): WorkspaceSecondarySection | null {
   switch (kind) {
+    case "sessionsRoot": return "sessions";
     case "agentsRoot": return "agents";
     case "knowledgeRoot": return "knowledge";
     case "assetsRoot": return "assets";
     case "viewsRoot": return "views";
     case "archivedRoot": return "archived";
+    case "archivedFilesRoot": return "archivedFiles";
     default: return null;
   }
 }

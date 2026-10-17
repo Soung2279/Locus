@@ -65,6 +65,7 @@ const localStorageMock = vi.hoisted(() => {
 
 const tauriRuntimeMocks = vi.hoisted(() => ({
   hasTauriWindowRuntime: vi.fn(() => true),
+  getCurrentTauriWindowLabel: vi.fn(() => "main"),
 }));
 
 vi.mock("@tauri-apps/api/window", () => ({
@@ -77,6 +78,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 vi.mock("../services/tauriRuntime", () => ({
   hasTauriWindowRuntime: tauriRuntimeMocks.hasTauriWindowRuntime,
+  getCurrentTauriWindowLabel: tauriRuntimeMocks.getCurrentTauriWindowLabel,
 }));
 
 describe("ui store window resize sync", () => {
@@ -88,12 +90,36 @@ describe("ui store window resize sync", () => {
     localStorageMock.clear();
     tauriEventMocks.reset();
     tauriRuntimeMocks.hasTauriWindowRuntime.mockReturnValue(true);
+    tauriRuntimeMocks.getCurrentTauriWindowLabel.mockReturnValue("main");
     tauriWindowMocks.isMaximized.mockResolvedValue(false);
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it("persists each workspace window's page separately and ignores main-window resize broadcasts", async () => {
+    const main = useUiStore();
+    await main.init();
+    main.setPage("settings");
+    tauriRuntimeMocks.getCurrentTauriWindowLabel.mockReturnValue("workspace-app-new");
+    setActivePinia(createPinia());
+    const secondary = useUiStore();
+    await secondary.init();
+    expect(secondary.activePage).toBe("development");
+    secondary.setPage("plugins");
+    expect(localStorageMock.getItem("locus:activePage:v1")).toBe("settings");
+    tauriEventMocks.emitNativeClientSize(1000, 700);
+    expect(secondary.nativeWindowWidth).toBeNull();
+    expect(main.nativeWindowWidth).toBe(1000);
+    setActivePinia(createPinia());
+    const reloaded = useUiStore();
+    await reloaded.init();
+    expect(reloaded.activePage).toBe("plugins");
+    main.cleanup();
+    secondary.cleanup();
+    reloaded.cleanup();
   });
 
   it("debounces maximized-state sync while the window is being resized", async () => {

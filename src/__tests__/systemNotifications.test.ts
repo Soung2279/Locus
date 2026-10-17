@@ -63,6 +63,8 @@ function createDisplayState(): DisplaySettings {
     compactToolCalls: true,
     hideThinkingBlocks: true,
     showViewsInSessionPanel: false,
+    viewOpenTarget: "tab",
+    viewOpenOverrides: {},
     mergeGitTreeStatusIcon: true,
     hideGitCommandSuggestions: false,
     systemNotificationsEnabled: true,

@@ -9,6 +9,7 @@ import { useChatStore } from "../stores/chat";
 import { useNotificationStore } from "../stores/notification";
 import { useDisplaySettings } from "./useDisplaySettings";
 import { invalidateSkills, useSkills } from "./useSkills";
+import { applyNewSessionSelection } from "./newSessionSelection";
 import { normalizeAppError } from "../services/errors";
 import {
   maybeNotifyStreamEvent,
@@ -74,6 +75,7 @@ import {
 import {
   publishSessionAsyncTaskUpdate,
   publishSessionExecutionState,
+  publishSessionContentChange,
   publishSessionStreamEvent,
   workspaceStreamEventSource,
 } from "../services/sessionStreamEventHub";
@@ -243,7 +245,9 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       ? modelStore.defaultEffort
       : (agent?.defaultEffort ?? "none");
     if (!chatStore.activeSessionId) {
-      modelStore.activateAgentPreference(agentId, fallbackEffort, true);
+      // A new session follows the workspace's remembered choice for this Agent.
+      modelStore.activateAgentPreference(agentId, fallbackEffort, false);
+      applyNewSessionSelection({ agentId });
       return;
     }
     modelStore.activateAgentPreference(agentId, fallbackEffort, false);
@@ -332,7 +336,12 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
 
   // active session/agent selection -> current effort, preserving the user's saved default.
   watch(
-    () => [agentStore.selectedAgentId, chatStore.activeSessionId, agentStore.agents.length] as const,
+    () => [
+      agentStore.selectedAgentId,
+      chatStore.activeSessionId,
+      agentStore.agents.length,
+      agentStore.workspaceCheckoutId,
+    ] as const,
     syncEffortForChatContext,
     { immediate: true },
   );
@@ -581,7 +590,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   let _wpKnowledge: Promise<void> | null = null;
   function warmupKnowledge(generation: number): Promise<void> {
     const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
-    if (!workspaceRef) return Promise.resolve();
+    if (!workspaceRef || workspaceContextStore.focusedCheckout?.knowledgeEnabled === false) return Promise.resolve();
     if (_wpKnowledge) return _wpKnowledge;
     _wpKnowledge = (async () => {
       const page = await knowledgeListPage({ type: "design", limit: 64 }, workspaceRef);
@@ -747,6 +756,8 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
             event: streamEvent.payload,
             source: workspaceStreamEventSource(streamEvent),
           });
+        } else if (event.eventName === "session-content-changed") {
+          publishSessionContentChange({ sessionId: (event.payload as SessionContentChangedEvent).sessionId, source: workspaceStreamEventSource(event) });
         }
         const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
         const isFocusedWorkspace = workspaceRef

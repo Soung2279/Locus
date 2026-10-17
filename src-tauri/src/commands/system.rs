@@ -282,6 +282,8 @@ async fn exit_app_inner(app_handle: AppHandle) {
         return;
     }
 
+    crate::work_state::save_before_exit(&app_handle).await;
+
     if let Some(tasks) = app_handle.try_state::<crate::ActiveTasks>() {
         let tasks = tasks.lock().await;
         for task in tasks.values() {
@@ -397,10 +399,14 @@ pub fn get_async_tasks_enabled(
 pub fn set_async_tasks_enabled(
     value: bool,
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    app: AppHandle,
 ) -> Result<(), crate::error::AppError> {
+    use tauri::Emitter;
     config
         .set_async_tasks_enabled(value)
-        .map_err(crate::error::AppError::from)
+        .map_err(crate::error::AppError::from)?;
+    app.emit("async-tasks-enabled-changed", value)
+        .map_err(|error| crate::error::AppError::from(error.to_string()))
 }
 
 #[tauri::command]
@@ -418,6 +424,29 @@ pub fn set_unity_multi_agent_editor_enabled(
     config
         .set_unity_multi_agent_editor_enabled(value)
         .map_err(crate::error::AppError::from)
+}
+
+pub const CLAUDE_CODE_CLI_ENABLED_CHANGED_EVENT: &str = "claude-code-cli-enabled-changed";
+
+#[tauri::command]
+pub fn get_claude_code_cli_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.claude_code_cli_enabled())
+}
+
+#[tauri::command]
+pub fn set_claude_code_cli_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    app: AppHandle,
+) -> Result<(), crate::error::AppError> {
+    use tauri::Emitter;
+    config
+        .set_claude_code_cli_enabled(value)
+        .map_err(crate::error::AppError::from)?;
+    app.emit(CLAUDE_CODE_CLI_ENABLED_CHANGED_EVENT, value)
+        .map_err(|error| crate::error::AppError::from(error.to_string()))
 }
 
 #[tauri::command]

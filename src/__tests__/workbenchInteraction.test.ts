@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-const read = (path: string) => readFileSync(resolve(process.cwd(), path), "utf8");
+const read = (path: string) => readFileSync(resolve(process.cwd(), path), "utf8").replace(/\r\n/g, "\n");
 
 describe("development workbench editor groups", () => {
   it("restores pane focus through the persisted editor assignment", () => {
@@ -114,12 +114,11 @@ describe("development workbench editor groups", () => {
     const store = read("src/stores/workbench.ts");
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 
-    expect(store).toContain("group.tabs.length >= 2");
-    expect(store).toContain("showSingleTab && group.tabs.length === 1");
+    expect(tabs).toContain("shouldShowWorkbenchTabStrip(props.group, props.showSingleTab)");
     expect(workbench).toContain(":show-single-tab=\"props.auxiliary || workbenchWindow.layout.kind === 'split'\"");
     expect(workbench).toContain(":show-single-tabs=\"props.auxiliary || workbenchWindow.layout.kind === 'split'\"");
     expect(read("src/components/workbench/WorkbenchSplitLayout.vue")).toContain(
-      "props.showSingleTabs && count === 1",
+      "shouldShowWorkbenchTabStrip(group, props.showSingleTabs)",
     );
     expect(store).toContain("candidate.preview && !candidate.pinned && !candidate.dirty");
     expect(store).toContain("workbenchResourceKey(editor.resource) === resourceKey");
@@ -214,7 +213,7 @@ describe("development workbench editor groups", () => {
     const store = read("src/stores/workbench.ts");
 
     expect(workbench).toContain('displaySettings.workspaceDisplayMode === "single"');
-    expect(workbench).toContain("workspaceContextStore.focusedCheckout?.checkoutId ?? null");
+    expect(workbench).toContain("workspaceContextStore.focusedCheckout?.checkoutId ?? savedWindowState(WORKBENCH_WINDOW_ID)?.activeWorkspaceId ?? null");
     expect(workbench).toContain("?? workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID)");
     expect(workbench).toContain("workbenchStore.switchWorkspaceScope(");
     expect(workbench).toContain("syncWorkbenchWorkspaceScope(workspaceScopeId)");

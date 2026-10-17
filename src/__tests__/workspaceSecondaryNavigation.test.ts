@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WorkbenchSecondarySidebar from "../components/workbench/WorkbenchSecondarySidebar.vue";
 import { workspaceSecondaryResourceSection, workspaceSecondarySection } from "../components/workbench/workspaceSecondaryNavigation";
 import { createWorkbenchEditorInput, useWorkbenchStore, workbenchResourceKey } from "../stores/workbench";
+import { findFileHistorySidebarOwner } from "../components/workbench/fileHistorySidebarOwner";
 
 beforeEach(() => {
   localStorage.clear();
@@ -13,9 +14,41 @@ beforeEach(() => {
 afterEach(() => { document.body.innerHTML = ""; });
 
 describe("workspace secondary navigation", () => {
+  it("keeps history tabs separate from editable files and restores their scope", () => {
+    const store = useWorkbenchStore();
+    const history = { kind: "fileHistory", projectId: "p", path: "docs/note.md", workspaceScoped: true } as const;
+    const mounted = { ...history, workspaceScoped: false, path: "F:/Shared/note.md" };
+    expect(workbenchResourceKey(history)).not.toBe(workbenchResourceKey({ kind: "workspaceFile", projectId: "p", path: history.path }));
+    expect(workspaceSecondaryResourceSection(history)).toBeNull();
+    for (const resource of [history, mounted]) store.openEditor("main", createWorkbenchEditorInput(resource, "History", {
+      pinned: true, preview: false, checkoutBinding: { checkoutId: "c", expectedGeneration: 2 },
+      capabilities: { split: false, detach: false, duplicate: false },
+    }));
+    store.persist("main");
+    setActivePinia(createPinia());
+    const tabs = useWorkbenchStore().ensureWindow("main").groups.main!.tabs;
+    expect(tabs.map(editor => editor.resource)).toEqual([history, mounted]);
+    expect(tabs[0]?.capabilities.detach).toBe(false);
+  });
+
+  it("binds the history sidebar to its owning tab and clears it when that tab closes", () => {
+    const store = useWorkbenchStore();
+    const window = store.ensureWindow("main");
+    const owner = store.openEditor("main", createWorkbenchEditorInput({ kind: "fileHistory", projectId: "p", path: "one.md", workspaceScoped: true }, "History", {
+      pinned: true, preview: false, checkoutBinding: { checkoutId: "c", expectedGeneration: 2 },
+    }));
+    const other = store.openEditor("main", createWorkbenchEditorInput({ kind: "workspaceFile", projectId: "p", path: "two.md" }, "Other"));
+    const target = { editorId: owner.editorId, checkoutId: "c" };
+    expect(store.activeEditor("main")?.editorId).toBe(other.editorId);
+    expect(findFileHistorySidebarOwner(window.groups, target)?.editor.editorId).toBe(owner.editorId);
+    expect(findFileHistorySidebarOwner(window.groups, { ...target, checkoutId: "another" })).toBeNull();
+    store.closeEditor("main", "main", owner.editorId);
+    expect(findFileHistorySidebarOwner(window.groups, target)).toBeNull();
+  });
+
   it("routes workspace list nodes to secondary navigation", () => {
-    expect(["knowledgeRoot", "assetsRoot", "viewsRoot", "archivedRoot", "agentsRoot"].map(workspaceSecondarySection))
-      .toEqual(["knowledge", "assets", "views", "archived", "agents"]);
+    expect(["knowledgeRoot", "assetsRoot", "viewsRoot", "archivedRoot", "agentsRoot", "sessionsRoot"].map(workspaceSecondarySection))
+      .toEqual(["knowledge", "assets", "views", "archived", "agents", "sessions"]);
     for (const kind of ["collaboration", "checkout", "session", "knowledge", "localFile", "folder", "newSession"]) {
       expect(workspaceSecondarySection(kind)).toBeNull();
     }

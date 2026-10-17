@@ -170,6 +170,7 @@ export type WorkbenchResourceRef =
   | { kind: "session"; projectId: string; sessionId: string }
   | { kind: "knowledge"; projectId: string; documentId: string }
   | { kind: "workspaceFile"; projectId: string; path: string }
+  | { kind: "fileHistory"; projectId: string; path: string; workspaceScoped: boolean }
   | { kind: "asset"; projectId: string; path: string }
   | { kind: "sceneObject"; projectId: string; scenePath: string; objectPath: string }
   | { kind: "view"; projectId: string; viewId: string }
@@ -262,12 +263,20 @@ export interface WorkbenchWindowDropIntent {
 
 export type WorkbenchEditorTransferSnapshot =
   | { kind: "view"; state: Record<string, unknown> }
+  | { kind: "agent"; selection: unknown; drafts: import("../components/agent/AgentDocumentEditor.vue").SavedAgentDocumentDraft[] }
+  | { kind: "knowledge"; documentId: string;
+      session: import("../components/knowledge/knowledgeEditorWorkspaceSession").SavedKnowledgeDocumentSession;
+      selection?: { anchor: number; head: number } | null; scrollTop?: number }
   | {
       kind: "session";
       composerDraft?: unknown;
+      executionSelection?: { agentId: string; modelId: string; effort: import("../types").EffortLevel; fastMode: boolean; multiAgentEnabled: boolean };
+      scrollState?: import("../composables/chatScrollState").SessionScrollState | null;
     }
   | {
       kind: "workspaceFile";
+      dirty?: boolean;
+      conflicted?: boolean;
       text: string;
       contentHash: string;
       originalLineEnding: "\n" | "\r\n" | "\r";

@@ -51,4 +51,12 @@ describe("Workbench file routing", () => {
     mocks.available = false;
     await expect(openWorkbenchFileTab(request)).rejects.toThrow("Workbench window is unavailable");
   });
+
+  it("routes history from a workspace page to the main workbench with its checkout", async () => {
+    mocks.label = "workspace-page-assets";
+    await openWorkbenchFileTab({ ...request, mode: "history" });
+    expect(mocks.emitTo).toHaveBeenCalledWith("main", WORKBENCH_FILE_OPEN_EVENT, {
+      ...request, mode: "history", targetLabel: "main",
+    });
+  });
 });

@@ -1,7 +1,11 @@
 pub mod asset;
+mod async_tasks;
+pub(crate) use async_tasks::*;
 mod agent_documents;
 pub use agent_documents::*;
 mod auth;
+mod claude_connection;
+pub use claude_connection::*;
 mod csharp_lsp;
 mod diff;
 mod extra_workdirs;
@@ -17,20 +21,30 @@ mod merge_jobs;
 mod plan;
 mod plugin;
 mod ref_graph;
+mod selection_memory;
 mod session;
 mod skill;
 mod skill_external;
 mod storage;
 mod sub_window;
 mod system;
+mod text_preview;
 mod undo;
 mod unity_embed;
 mod unity_serialized_property;
 mod unity_assets;
 mod update;
 mod view;
+mod view_documents;
+pub use view_documents::*;
+mod markdown_documents;
+pub use markdown_documents::*;
 mod workspace;
 mod workspace_explorer;
+mod workspace_file_order;
+pub use workspace_file_order::*;
+mod workspace_file_watch;
+pub use workspace_file_watch::*;
 mod workspace_service;
 mod worktrees;
 
@@ -312,6 +326,11 @@ pub enum StreamEvent {
         trigger: Option<CompactTrigger>,
     },
     #[serde(rename_all = "camelCase")]
+    HistorySynchronized {
+        session_id: String,
+        messages: Vec<crate::session::models::ChatMessage>,
+    },
+    #[serde(rename_all = "camelCase")]
     CompactDone {
         session_id: String,
         messages_before: u32,
@@ -571,6 +590,8 @@ pub use mcp::*;
 pub use plan::*;
 pub use plugin::*;
 pub use ref_graph::*;
+pub use selection_memory::*;
+pub(crate) use selection_memory::remembered_model_for_project;
 pub use session::*;
 pub use garbage_collection::*;
 pub use skill::*;

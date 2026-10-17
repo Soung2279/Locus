@@ -154,7 +154,7 @@ describe("workbench store", () => {
     });
   });
 
-  it("replaces one unpinned preview and derives tab-strip visibility from tab count", () => {
+  it("replaces one unpinned preview and hides the tab strip only for a single session", () => {
     const store = useWorkbenchStore();
     const state = store.ensureWindow("main");
     const group = state.groups.main!;
@@ -163,6 +163,12 @@ describe("workbench store", () => {
     expect(group.tabs.map((tab) => tab.title)).toEqual(["session-a"]);
     expect(shouldShowWorkbenchTabStrip(group)).toBe(false);
     expect(shouldShowWorkbenchTabStrip(group, true)).toBe(true);
+
+    store.openEditor("main", createWorkbenchEditorInput({
+      kind: "workspaceFile", projectId: "project-a", path: "outline.md",
+    }, "outline.md"));
+    expect(group.tabs.map((tab) => tab.title)).toEqual(["outline.md"]);
+    expect(shouldShowWorkbenchTabStrip(group)).toBe(true);
 
     store.openEditor("main", sessionEditor("session-b"));
     expect(group.tabs.map((tab) => tab.title)).toEqual(["session-b"]);
@@ -525,6 +531,23 @@ describe("workbench store", () => {
     expect(store.windows.main!.groups.main!.tabs.map((editor) => (
       editor.checkoutBinding?.checkoutId
     ))).toEqual(["checkout-a"]);
+  });
+
+  it("isolates layouts between full workspace windows, including when both open the same checkout", () => {
+    const source = useWorkbenchStore();
+    source.switchWorkspaceScope("main", "checkout-a");
+    source.openEditor("main", sessionEditor("source-session", { preview: false }));
+    const target = useWorkbenchStore(createPinia());
+    const label = "workspace-app-new";
+    target.switchWorkspaceScope(label, "checkout-a");
+    target.openEditor(label, sessionEditor("target-session", { preview: false }));
+    target.switchWorkspaceScope(label, "checkout-b");
+    target.openEditor(label, sessionEditor("other-session", { preview: false, checkoutId: "checkout-b" }));
+    const restored = useWorkbenchStore(createPinia());
+    restored.switchWorkspaceScope(label, "checkout-a");
+    expect(restored.activeGroup(label).tabs.map((tab) => tab.title)).toEqual(["target-session"]);
+    expect(source.activeGroup("main").tabs.map((tab) => tab.title)).toEqual(["source-session"]);
+    expect(source.workspaceScope("main")).toBe("checkout-a");
   });
 
   it("repairs shifted workspace slots by each editor's checkout binding", () => {

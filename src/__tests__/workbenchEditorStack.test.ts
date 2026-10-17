@@ -61,6 +61,38 @@ function mountStack(initial: WorkbenchEditorInput[] = [editor("a")]) {
 }
 
 describe("workbench editor presentation", () => {
+  it("reports a surface as presented only once it replaces the visible one", async () => {
+    const group = reactive<WorkbenchEditorGroup>({ paneId: "pane", tabs: [editor("a")], activeEditorId: "a" });
+    const ready = new Map<string, () => void>();
+    const presented = reactive<Record<string, boolean>>({});
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      render: () => h(WorkbenchEditorStack, { group }, {
+        default: (slot: { editor: WorkbenchEditorInput; ready: () => void; presented: boolean }) => {
+          ready.set(slot.editor.editorId, slot.ready);
+          presented[slot.editor.editorId] = slot.presented;
+          return h("div", slot.editor.editorId);
+        },
+      }),
+    });
+    app.mount(host);
+    cleanups.push(() => { app.unmount(); host.remove(); });
+    await nextTick();
+    expect(presented.a).toBe(false);
+    ready.get("a")!();
+    await nextTick();
+    expect(presented.a).toBe(true);
+
+    group.tabs = [editor("b")];
+    group.activeEditorId = "b";
+    await nextTick();
+    expect(presented).toMatchObject({ a: true, b: false });
+    ready.get("b")!();
+    await nextTick();
+    expect(presented.b).toBe(true);
+  });
+
   it("does not expose an unloaded session as the new-session welcome screen", async () => {
     const stack = mountStack();
     expect(stack.visibleIds()).toEqual([]);

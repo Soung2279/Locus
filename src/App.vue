@@ -9,16 +9,22 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { open } from "@tauri-apps/plugin-dialog";
 import { t } from "./i18n";
 import { normalizeAppError } from "./services/errors";
+import { startUnityNativeEmbedHosts, unityNativeEmbedHosts } from "./services/unityNativeEmbed";
 import { useUiStore, type AppPage } from "./stores/ui";
 import { useAuthStore } from "./stores/auth";
 import { useAgentStore } from "./stores/agent";
 import { useModelStore } from "./stores/model";
+import { claudePrewarmSettings, prewarmClaudeSession } from "./services/claudeConnection";
+import { claudeCodeCliEnabled } from "./services/claudeCodeCli";
 import { useProjectStore } from "./stores/project";
 import { useWorkspaceContextStore } from "./stores/workspaceContext";
 import { useChatStore } from "./stores/chat";
 import { useNotificationStore } from "./stores/notification";
 import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
+import { bootstrapWorkspaceWindow } from "./composables/bootstrapWorkspaceWindow";
+import { isWorkspaceWindowLabel, workspaceWindowQuery } from "./services/workspaceWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAgentWorkspaceScope } from "./composables/useAgentWorkspaceScope";
 import { useUnityAssetDropTarget } from "./composables/useUnityAssetDropTarget";
 import { knowledgeGetEmbeddingStatus } from "./services/knowledge";
@@ -31,6 +37,8 @@ import LucideIcon from "./components/icons/LucideIcon.vue";
 import AppUpdateModal from "./components/AppUpdateModal.vue";
 import DevelopmentWorkbench from "./components/workbench/DevelopmentWorkbench.vue";
 import InternalDragOverlay from "./components/ui/InternalDragOverlay.vue";
+import WorkspaceSetupDialog from "./components/WorkspaceSetupDialog.vue";
+import { requestWorkspaceSetup } from "./composables/useWorkspaceSetup";
 
 import { provideDiffOverlay } from "./composables/useDiffOverlay";
 import { provideInternalDragController } from "./composables/useInternalDrag";
@@ -69,6 +77,7 @@ import {
   startCurrentWindowDragging,
 } from "./services/tauriRuntime";
 import { markStartupPhase } from "./services/startupPerf";
+import { initializeWorkState, revealWorkStateWindow, finishWorkStateRestore } from "./services/workState";
 import { currentUnityEmbedWorkspaceRef } from "./services/unity";
 const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
 const isUnityEmbedWindow = !isUnityEmbedTestWindow && window.location.pathname === "/unity-embed";
@@ -88,6 +97,8 @@ const isWorkspacePageWindow = isWorkspacePageWindowLocation();
 const isPlanViewWindow = isPlanViewWindowLocation();
 const isUnityValueEditorWindow = isUnityValueEditorWindowLocation();
 const isExtraWorkdirsWindow = isExtraWorkdirsWindowLocation();
+const applicationWindowId = getCurrentTauriWindowLabel() || "main";
+const isWorkspaceWindow = isWorkspaceWindowLabel(applicationWindowId);
 const isStandaloneWindow = isUnityEmbedWindow
   || isUnityEmbedTestWindow
   || isKnowledgeDownloadWindow
@@ -115,6 +126,7 @@ const UnityValueEditorWindow = defineAsyncComponent(() => import("./components/U
 const ExtraWorkdirsConfigWindow = defineAsyncComponent(() => import("./components/ExtraWorkdirsConfigWindow.vue"));
 const ViewHostWindow = defineAsyncComponent(() => import("./components/ViewHostWindow.vue"));
 const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components/UnityEmbeddedSessionView.vue"));
+const UnityNativeEmbedHost = defineAsyncComponent(() => import("./components/UnityNativeEmbedHost.vue"));
 const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
 const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
@@ -135,12 +147,32 @@ const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
 const appUpdateStore = useAppUpdateStore();
 const mainWorkspaceRestored = ref(false);
+let startupClaudeConnectionRequested = false;
+watch(() => [mainWorkspaceRestored.value, claudeCodeCliEnabled.value && claudePrewarmSettings.value.enabled,
+  workspaceContextStore.focusedWorkspaceRef, modelStore.selectedModelId, modelStore.allModels] as const,
+  ([restored, enabled, workspaceRef, selected, models]) => {
+    if (isStandaloneWindow || startupClaudeConnectionRequested || !restored || !enabled || !workspaceRef) return;
+    const model = selected.startsWith("claude_code/") ? selected
+      : (models.find(item => item.provider === "claude_code" && item.isDefault)
+        ?? models.find(item => item.provider === "claude_code"))?.id ?? "claude_code/";
+    startupClaudeConnectionRequested = true;
+    // Start the configured server pool as soon as startup restores a workspace,
+    // even when the current page is not Chat. An empty model suffix lets the
+    // native CLI choose its default until the catalog is available.
+    void prewarmClaudeSession(null, model, workspaceRef, true).catch(error => {
+      startupClaudeConnectionRequested = false;
+      console.warn("Claude startup connection failed", normalizeAppError(error).message);
+    });
+  }, { immediate: true });
 const mainBootstrapError = ref("");
+const workspaceWindowToolbarTarget = ref<HTMLElement | null>(null);
+let mainBootstrapCompleted = false;
 // Start recovery during setup, before the first mounted hook or auth request.
 // Utility/embedded windows bind their own explicit workspace in their owner.
 const mainWorkspaceReady = isStandaloneWindow ? undefined : (async () => {
   markStartupPhase("main_workspace_restore_start");
-  await workspaceContextStore.ensureInitialized(getCurrentTauriWindowLabel() || "main", "main");
+  await initializeWorkState(applicationWindowId);
+  await bootstrapWorkspaceWindow(workspaceContextStore, applicationWindowId, window.location.search);
   mainWorkspaceRestored.value = true;
   if (!workspaceContextStore.focusedCheckout
     && Object.values(workspaceContextStore.checkoutsById).some((checkout) => checkout.available === false)) {
@@ -154,6 +186,17 @@ const mainWorkspaceReady = isStandaloneWindow ? undefined : (async () => {
 void mainWorkspaceReady?.catch((error) => {
   mainBootstrapError.value = normalizeAppError(error).message;
 });
+watch(() => workspaceContextStore.focusedRuntime, (runtime) => {
+  if (!isWorkspaceWindow || !runtime || workspaceContextStore.windowId !== applicationWindowId) return;
+  const query = workspaceWindowQuery({
+    checkoutId: runtime.checkoutId,
+    expectedGeneration: runtime.workspaceGeneration,
+    expectedMaterializationEpoch: runtime.materializationEpoch,
+  });
+  window.history.replaceState(null, "", `${window.location.pathname}?${query}`);
+  const name = runtime.root.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || runtime.root;
+  void getCurrentWindow().setTitle(`Locus - ${name}`).catch(() => {});
+});
 function retryMainStartup() {
   window.location.reload();
 }
@@ -164,6 +207,7 @@ async function openRecoveryWorkspace() {
   try {
     const selected = await open({ directory: true, multiple: false });
     if (typeof selected !== "string" || !selected.trim()) return;
+    if (!await requestWorkspaceSetup(selected)) return;
     // Retry the catalog/CAS snapshot if its original startup request failed.
     await workspaceContextStore.ensureInitialized(getCurrentTauriWindowLabel() || "main", "main");
     const context = await workspaceContextStore.openAndFocusInPane(
@@ -190,6 +234,7 @@ let knowledgeRuntimeStatusTimer: ReturnType<typeof setTimeout> | null = null;
 let knowledgeRuntimeStatusRequestSeq = 0;
 let knowledgeRuntimeStartupPollsRemaining = 0;
 let appCloseRequestUnlisten: UnlistenFn | null = null;
+let unityNativeEmbedRelease: (() => void) | null = null;
 let extraWorkdirsUpdatedUnlisten: UnlistenFn | null = null;
 let workspacePageResetOnboardingUnlisten: UnlistenFn | null = null;
 
@@ -207,7 +252,7 @@ const {
   onOnboardingCompleted: handleOnboardingCompleted,
 } = useAppBootstrap({
   workspaceReady: mainWorkspaceReady,
-  handleExternalScriptOpen: !isUnityEmbedWindow && !isStandaloneWindow,
+  handleExternalScriptOpen: !isUnityEmbedWindow && !isStandaloneWindow && !isWorkspaceWindow,
 });
 
 async function bindUnityEmbedWorkspace() {
@@ -418,6 +463,14 @@ watch(() => uiStore.settingsMounted, (mounted) => {
 }, { immediate: true });
 
 watch([() => uiStore.activePage, visibleTopTabs], () => {
+  if (isWorkspaceWindow && uiStore.activePage !== "development") {
+    const requestedTab = topTabs.value.find((tab) => tab.id === uiStore.activePage);
+    uiStore.setPage("development");
+    // Keep this window on its workspace. Explicit settings/plugin actions can
+    // still use the existing detached page, without leaving a page with no tabs.
+    if (mainBootstrapCompleted && requestedTab) void openTopTabInWindow(requestedTab);
+    return;
+  }
   if (visibleTopTabs.value.some((tab) => tab.id === uiStore.activePage)) return;
   uiStore.setPage("development");
 }, { immediate: true });
@@ -530,6 +583,7 @@ function onResetOnboarding() {
 
 async function handleSettingsAuthChanged() {
   await authStore.loadProviderStatus();
+  await modelStore.loadModelDefaults();
   await modelStore.loadCodexAvailableModels();
   modelStore.resolveSelectedModel(!chatStore.activeSessionId);
 }
@@ -572,7 +626,7 @@ function scheduleKnowledgeRuntimeStatusPoll(delay = 700) {
 async function refreshKnowledgeRuntimeLoadingStatus() {
   const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
   const requestSeq = ++knowledgeRuntimeStatusRequestSeq;
-  if (isStandaloneWindow || !workspaceRef) {
+  if (isStandaloneWindow || !workspaceRef || workspaceContextStore.focusedCheckout?.knowledgeEnabled === false) {
     notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
     clearKnowledgeRuntimeStatusTimer();
     return;
@@ -620,7 +674,7 @@ function startKnowledgeRuntimeStartupPolling() {
 async function registerAppCloseRequestListener() {
   if (isStandaloneWindow || appCloseRequestUnlisten) return;
   try {
-    appCloseRequestUnlisten = await listen<void>(APP_CLOSE_REQUESTED_EVENT, () => {
+    appCloseRequestUnlisten = await getCurrentWindow().listen<void>(APP_CLOSE_REQUESTED_EVENT, () => {
       void handleAppCloseRequest();
     });
   } catch (error) {
@@ -642,15 +696,16 @@ async function registerExtraWorkdirsUpdatedListener() {
 function revealMainWindow() {
   if (isStandaloneWindow) return;
   const currentTauriWindowLabel = getCurrentTauriWindowLabel();
-  if (currentTauriWindowLabel && currentTauriWindowLabel !== "main") return;
+  if (currentTauriWindowLabel && currentTauriWindowLabel !== "main" && !isWorkspaceWindow) return;
   markStartupPhase("main_window_show_start");
-  void showCurrentTauriWindow()
+  void Promise.resolve(mainWorkspaceReady).then(() => revealWorkStateWindow(applicationWindowId))
     .then(() => {
       markStartupPhase("main_window_show_done");
     })
     .catch((error) => {
       markStartupPhase("main_window_show_error");
       console.warn("[startup] failed to show main window", error);
+      void showCurrentTauriWindow();
     });
 }
 
@@ -707,13 +762,14 @@ onMounted(async () => {
   try {
     await bootstrapCritical();
     markStartupPhase("main_bootstrap_critical_done");
+    mainBootstrapCompleted = true;
   } catch (error) {
     mainBootstrapError.value = normalizeAppError(error).message;
     reportWorkingDirSwitchError(error);
     return;
   }
   // Development is already interactive. Preload the remaining process-level pages.
-  preloadTabsInBackground([
+  if (!isWorkspaceWindow) preloadTabsInBackground([
     settingsView.ensureLoaded,
     pluginView.ensureLoaded,
     agentView.ensureLoaded,
@@ -721,12 +777,15 @@ onMounted(async () => {
   markStartupPhase("main_preload_tabs_scheduled");
   void bootstrapDeferred();
   markStartupPhase("main_bootstrap_deferred_scheduled");
+  if (!isWorkspaceWindow) unityNativeEmbedRelease = await startUnityNativeEmbedHosts();
+  // Each renderer recreates only the floating windows it originally owned.
   void restoreSharedWorkbenchWindows()
+    .then(() => finishWorkStateRestore())
     .then(() => prepareSharedWorkbenchWindowPool())
     .catch((error) => {
       console.warn("[workbench-window] restore or pool warmup failed", error);
     });
-  void appUpdateStore.checkForUpdates({ silent: true });
+  if (!isWorkspaceWindow) void appUpdateStore.checkForUpdates({ silent: true });
   markStartupPhase("main_update_check_scheduled");
   startKnowledgeRuntimeStartupPolling();
   // Pre-warm the shared sub-window pool once startup work settled so the
@@ -740,6 +799,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  unityNativeEmbedRelease?.();
   if (isUnityEmbedWindow) {
     cleanup();
     return;
@@ -809,8 +869,10 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
     @drop.capture="handleMainUnityAssetDrop"
   >
     <div class="main-area">
-      <div class="tab-bar" @pointerdown="onTabBarPointerDown">
+      <div class="tab-bar" :class="{ 'is-workspace-window': isWorkspaceWindow }" @pointerdown="onTabBarPointerDown">
         <div class="tab-drag-region" aria-hidden="true"></div>
+        <div v-if="isWorkspaceWindow" ref="workspaceWindowToolbarTarget" class="workspace-window-toolbar-host"></div>
+        <template v-else>
         <span class="tab-brand">Locus</span>
         <button
           v-for="tab in visibleTopTabs"
@@ -845,6 +907,7 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
           <span class="tab-plugin-action">{{ pluginToastAction }}</span>
         </button>
         <div class="tab-spacer"></div>
+        </template>
         <div class="window-controls">
           <button
             class="win-ctrl-btn"
@@ -870,7 +933,11 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
       </div>
       <TopBannerHost />
       <div class="tab-content">
-        <DevelopmentWorkbench v-show="uiStore.activePage === 'development'" />
+        <DevelopmentWorkbench
+          v-show="uiStore.activePage === 'development'"
+          :window-id="applicationWindowId"
+          :toolbar-target="workspaceWindowToolbarTarget"
+        />
 
         <component
           :is="pluginViewComponent"
@@ -1002,11 +1069,15 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
   </Transition>
   <FileDiffOverlay v-if="diffOverlay.visible.value" />
   <InternalDragOverlay />
+  <WorkspaceSetupDialog />
   <Teleport
     v-for="host in sharedWorkbenchWindowHosts"
     :key="host.label"
     :to="host.container"
   >
     <WorkbenchWindow :shared-host="host" />
+  </Teleport>
+  <Teleport v-for="host in unityNativeEmbedHosts.values()" :key="host.surface.generation" :to="host.container">
+    <UnityNativeEmbedHost :host="host" />
   </Teleport>
 </template>

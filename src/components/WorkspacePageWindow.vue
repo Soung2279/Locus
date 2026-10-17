@@ -7,6 +7,9 @@ import { t } from "../i18n";
 import { provideDiffOverlay } from "../composables/useDiffOverlay";
 import { useWorkspacePageBootstrap } from "../composables/useWorkspacePageBootstrap";
 import { normalizeAppError } from "../services/errors";
+import { openWorkbenchFileTab } from "../services/workbenchFile";
+import type { FileHistoryTarget } from "../services/fileHistory";
+import { useNotificationStore } from "../stores/notification";
 import {
   getWorkspacePageWindowPayload,
   WORKSPACE_PAGE_RESET_ONBOARDING_EVENT,
@@ -34,6 +37,7 @@ const PAGE_COMPONENTS = {
 const FileDiffOverlay = defineAsyncComponent(() => import("./diff/FileDiffOverlay.vue"));
 
 const payload = getWorkspacePageWindowPayload();
+const notificationStore = useNotificationStore();
 const page = ref<WorkspacePageId | null>(payload?.page ?? null);
 const pageTitle = ref(payload?.title ?? "Locus");
 const bootstrapped = ref(false);
@@ -111,6 +115,10 @@ const pageProps = computed<Record<string, unknown>>(() => {
       return {
         workingDir: checkoutWorkingDir.value,
         workspaceRef: checkoutWorkspaceRef.value,
+        onFileHistory: (target: FileHistoryTarget) => {
+          if (target.workspaceRef) void openWorkbenchFileTab({ filePath: target.path, workspaceRef: target.workspaceRef, mode: "history" })
+            .catch(error => notificationStore.addNotice("error", normalizeAppError(error).message));
+        },
       };
     case "views":
       return {

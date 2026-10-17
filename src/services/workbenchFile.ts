@@ -9,6 +9,7 @@ import { isWorkbenchWindowLabel } from "./workbenchWindow";
 export const WORKBENCH_FILE_OPEN_EVENT = "workbench-file-open";
 
 export interface WorkbenchFileOpenRequest extends ToolFilePreviewWindowPayload {
+  mode?: "file" | "history";
   workspaceRef: WorkspaceRef;
   targetLabel?: string;
 }

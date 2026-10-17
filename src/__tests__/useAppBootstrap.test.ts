@@ -45,6 +45,12 @@ vi.mock("../stores/model", () => ({
   useModelStore: () => modelStoreMock,
 }));
 
+const newSessionSelectionMock = vi.hoisted(() => ({
+  applyNewSessionSelection: vi.fn(),
+  rememberChatSelection: vi.fn(),
+}));
+vi.mock("../composables/newSessionSelection", () => newSessionSelectionMock);
+
 vi.mock("../stores/project", () => ({
   useProjectStore: () => projectStoreMock,
 }));
@@ -287,10 +293,11 @@ describe("useAppBootstrap onboarding completion", () => {
     agentStoreMock.selectedAgentId = "unity";
     await nextTick();
 
-    expect(modelStoreMock.activateAgentPreference).toHaveBeenLastCalledWith("unity", "medium", true);
+    // A new session tracks the Agent and takes the workspace's remembered selection.
+    expect(modelStoreMock.activateAgentPreference).toHaveBeenLastCalledWith("unity", "medium", false);
+    expect(newSessionSelectionMock.applyNewSessionSelection).toHaveBeenLastCalledWith({ agentId: "unity" });
     expect(modelStoreMock.restoreDefaultEffort).not.toHaveBeenCalled();
     expect(modelStoreMock.applyContextEffort).not.toHaveBeenCalled();
-    expect(modelStoreMock.effort).toBe("medium");
   });
 
   it("keeps the saved user default effort while a session is active", async () => {

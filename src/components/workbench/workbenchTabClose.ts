@@ -1,4 +1,4 @@
-export type WorkbenchTabCloseScope = "current" | "left" | "right" | "all";
+export type WorkbenchTabCloseScope = "current" | "others" | "left" | "right" | "all";
 
 export function workbenchTabCloseIds(
   tabIds: readonly string[],
@@ -10,6 +10,8 @@ export function workbenchTabCloseIds(
   switch (scope) {
     case "current":
       return [targetId];
+    case "others":
+      return tabIds.filter((tabId) => tabId !== targetId);
     case "left":
       return tabIds.slice(0, targetIndex);
     case "right":

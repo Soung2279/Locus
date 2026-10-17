@@ -1,9 +1,14 @@
 <script setup lang="ts">
-import { computed, reactive, shallowRef, watch } from "vue";
+import { computed, provide, reactive, shallowRef, watch } from "vue";
 import { t } from "../../i18n";
 import type { WorkbenchEditorGroup, WorkbenchEditorInput } from "../../types/workbench";
+import { isDocumentPreview } from "./workbenchDocumentPreview";
+import { isWorkbenchDocumentPath } from "../../stores/workbench";
+import { WORKSPACE_FILE_PREVIEW_CACHE, WorkspaceFilePreviewCache } from "./workspaceFilePreviewCache";
 
 const props = defineProps<{ group: WorkbenchEditorGroup }>();
+const emit = defineEmits<{ (event: "pin", editorId: string): void }>();
+provide(WORKSPACE_FILE_PREVIEW_CACHE, new WorkspaceFilePreviewCache());
 const readyEditors = reactive(new Set<string>());
 const presentedEditor = shallowRef<WorkbenchEditorInput | null>(null);
 const requestedEditor = computed(() => props.group.tabs.find(
@@ -11,8 +16,12 @@ const requestedEditor = computed(() => props.group.tabs.find(
 ) ?? null);
 
 function waitsForContent(editor: WorkbenchEditorInput): boolean {
+  const resource = editor.resource;
   return editor.availability !== "unavailable"
-    && (editor.resource.kind === "session" || editor.resource.kind === "knowledge");
+    && (resource.kind === "session" || resource.kind === "knowledge"
+      || resource.kind === "workspaceFile"
+      || (resource.kind === "localFile" && !!editor.sourcePath)
+      || (resource.kind === "asset" && isWorkbenchDocumentPath(resource.path)));
 }
 
 watch(
@@ -48,6 +57,19 @@ function markReady(editorId: string): void {
   // A superseded load may finish after its editor has already been removed.
   if (props.group.tabs.some((editor) => editor.editorId === editorId)) readyEditors.add(editorId);
 }
+
+function pinDocumentPreview(editor: WorkbenchEditorInput): void {
+  if (!pending.value && props.group.activeEditorId === editor.editorId && isDocumentPreview(editor)) {
+    emit("pin", editor.editorId);
+  }
+}
+
+function handleDocumentSelection(editor: WorkbenchEditorInput, event: KeyboardEvent): void {
+  const selectAll = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a";
+  const extendSelection = event.shiftKey
+    && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key);
+  if (selectAll || extendSelection) pinDocumentPreview(editor);
+}
 </script>
 
 <template>
@@ -61,10 +83,13 @@ function markReady(editorId: string): void {
       :data-editor-id="editor.editorId"
       :inert="pending || group.activeEditorId !== editor.editorId ? true : undefined"
       :aria-hidden="presentedEditor?.editorId !== editor.editorId"
+      @pointerdown.capture="$event.button === 0 && pinDocumentPreview(editor)"
+      @keydown.capture="handleDocumentSelection(editor, $event)"
     >
       <slot
         :editor="editor"
         :content-active="presentedEditor?.editorId === editor.editorId || group.activeEditorId === editor.editorId"
+        :presented="presentedEditor?.editorId === editor.editorId"
         :interactive="!pending && group.activeEditorId === editor.editorId"
         :ready="() => markReady(editor.editorId)"
       />

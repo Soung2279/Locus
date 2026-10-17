@@ -15,5 +15,13 @@ describe("workbench tab close targets", () => {
 
   it("returns no targets when the context tab is stale", () => {
     expect(workbenchTabCloseIds(tabs, "missing", "all")).toEqual([]);
+    expect(workbenchTabCloseIds(tabs, "missing", "others")).toEqual([]);
+  });
+
+  it("closes other tabs while preserving the context tab and original order", () => {
+    expect(workbenchTabCloseIds(tabs, "a", "others")).toEqual(["b", "c", "d"]);
+    expect(workbenchTabCloseIds(tabs, "c", "others")).toEqual(["a", "b", "d"]);
+    expect(workbenchTabCloseIds(tabs, "d", "others")).toEqual(["a", "b", "c"]);
+    expect(workbenchTabCloseIds(["a"], "a", "others")).toEqual([]);
   });
 });

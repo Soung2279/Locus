@@ -307,6 +307,18 @@ body.is-internal-dragging * {
   -webkit-app-region: drag;
 }
 
+.tab-bar.is-workspace-window {
+  padding-left: 0;
+}
+
+.workspace-window-toolbar-host {
+  -webkit-app-region: drag;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-self: stretch;
+}
+
 .tab-bar > :not(.tab-drag-region) {
   position: relative;
   z-index: 1;

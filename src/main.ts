@@ -16,6 +16,7 @@ import { getDebugMode } from "./services/permissions";
 import { bootstrapPluginInspectorDrawers } from "./services/inspectorDrawerExtensions";
 import { markStartupPhase, scheduleStartupPaintReport } from "./services/startupPerf";
 import { initWebviewBridgeDiagnostics } from "./services/webviewBridgeDiagnostics";
+import { installInputPunctuationPairing } from "./services/inputPunctuationPairing";
 
 const debugConsoleReady = initDebugConsole();
 markStartupPhase("frontend_main_enter", { href: window.location.href });
@@ -35,6 +36,7 @@ try {
 }
 
 const app = createApp(App);
+installInputPunctuationPairing();
 markStartupPhase("frontend_vue_app_created");
 app.use(createPinia());
 markStartupPhase("frontend_pinia_ready");

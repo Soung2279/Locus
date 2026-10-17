@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { useWindowSurface } from "../../composables/useWindowSurface";
+const { ownerWindow, ownerDocument } = useWindowSurface();
 import { computed, nextTick, onMounted, onUnmounted, ref, useAttrs, watch } from "vue";
 import type { StyleValue } from "vue";
 import { clampFloatingPosition } from "./floatingPosition";
@@ -62,8 +64,8 @@ function toCssSize(value: number | string): string {
 
 function viewportSize() {
   return {
-    width: window.innerWidth || document.documentElement.clientWidth,
-    height: window.innerHeight || document.documentElement.clientHeight,
+    width: ownerWindow.innerWidth || ownerDocument.documentElement.clientWidth,
+    height: ownerWindow.innerHeight || ownerDocument.documentElement.clientHeight,
   };
 }
 
@@ -72,10 +74,10 @@ async function updatePosition() {
   await nextTick();
   const menu = menuRef.value;
   if (!menu) return;
-  const rect = menu.getBoundingClientRect();
+  // Measure layout dimensions so the enter transition's scale cannot shrink the viewport bounds.
   position.value = clampFloatingPosition(
     { x: props.x, y: props.y },
-    { width: rect.width, height: rect.height },
+    { width: menu.offsetWidth, height: menu.offsetHeight },
     viewportSize(),
     props.viewportMargin,
   );
@@ -100,17 +102,17 @@ watch(
 );
 
 onMounted(() => {
-  document.addEventListener("keydown", onKeydown, true);
+  ownerDocument.addEventListener("keydown", onKeydown, true);
   void updatePosition();
 });
 
 onUnmounted(() => {
-  document.removeEventListener("keydown", onKeydown, true);
+  ownerDocument.removeEventListener("keydown", onKeydown, true);
 });
 </script>
 
 <template>
-  <Teleport to="body">
+  <Teleport :to="ownerDocument.body">
     <Transition name="base-context-menu-fade" appear>
       <div
         v-if="showBackdrop"
@@ -250,6 +252,15 @@ onUnmounted(() => {
   color: var(--status-warn-fg);
   font-size: 12px;
   line-height: 1.4;
+  cursor: default;
+}
+
+.base-context-menu :deep(.base-context-menu-label) {
+  padding: 4px 10px 2px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
   cursor: default;
 }
 

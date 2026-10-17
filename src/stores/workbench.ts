@@ -1,5 +1,6 @@
 import { computed, ref } from "vue";
 import { defineStore } from "pinia";
+import { recordWorkbenchLayout, forgetWorkWindow, savedWindowState } from "../services/workState";
 import type {
   WorkbenchDropDirection,
   WorkbenchEditorGroup,
@@ -69,6 +70,7 @@ export function workbenchResourceKey(resource: WorkbenchResourceRef): string {
     case "session": return `session:${resource.projectId}:${resource.sessionId}`;
     case "knowledge": return `knowledge:${resource.projectId}:${resource.documentId}`;
     case "workspaceFile": return `workspace-file:${resource.projectId}:${resource.path}`;
+    case "fileHistory": return `file-history:${resource.projectId}:${resource.workspaceScoped}:${resource.path}`;
     case "asset": return `asset:${resource.projectId}:${resource.path}`;
     case "sceneObject": return [
       "scene-object",
@@ -121,7 +123,12 @@ export function shouldShowWorkbenchTabStrip(
   group: WorkbenchEditorGroup,
   showSingleTab = false,
 ): boolean {
-  return group.tabs.length >= 2 || (showSingleTab && group.tabs.length === 1);
+  const resource = group.tabs[0]?.resource;
+  if (!resource) return false;
+  const isSession = resource.kind === "session"
+    || resource.kind === "newSession"
+    || (resource.kind === "section" && resource.section === "archived" && !!resource.sessionId);
+  return group.tabs.length >= 2 || showSingleTab || !isSession;
 }
 
 export function clampWorkbenchSplitRatio(ratio: number): number {
@@ -241,6 +248,7 @@ function isRestorableResource(value: unknown): value is WorkbenchResourceRef {
     case "folder": return typeof resource.nodeId === "string";
     case "session": return typeof resource.sessionId === "string";
     case "knowledge": return typeof resource.documentId === "string";
+    case "fileHistory": return typeof resource.path === "string" && !!resource.path.trim() && typeof resource.workspaceScoped === "boolean";
     case "workspaceFile":
     case "asset":
       return typeof resource.path === "string" && !!resource.path.trim();
@@ -288,6 +296,9 @@ function normalizeRestoredResource(resource: WorkbenchResourceRef): WorkbenchRes
       kind: "knowledge",
       projectId: legacy.projectId,
       documentId: legacy.documentId,
+    };
+    case "fileHistory": return {
+      kind: "fileHistory", projectId: legacy.projectId, path: legacy.path, workspaceScoped: legacy.workspaceScoped,
     };
     case "workspaceFile": return {
       kind: "workspaceFile",
@@ -735,6 +746,7 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     } catch (error) {
       console.warn("[workbench] layout persistence failed", error);
     }
+    recordWorkbenchLayout(windowId, scopeId, serializableWindow(state));
   }
 
   function ensureWindow(windowId = "main"): WorkbenchWindowState {
@@ -742,6 +754,8 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     if (existing) return existing;
     const restored = restoreStoredWindow(windowId, workspaceScope(windowId));
     const state = restored ?? createWindowState(windowId);
+    const sidebar = savedWindowState(windowId)?.sidebar;
+    if (sidebar) state.sidebar = { ...sidebar };
     windows.value[windowId] = state;
     return state;
   }
@@ -936,6 +950,11 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     if (!editor) return null;
     requireEditorWorkspaceScope(windowId, { ...editor, ...patch, editorId }, "updateEditor");
     Object.assign(editor, patch, { editorId });
+    // Editing commits a preview to the tab strip, including after autosave clears dirty.
+    if (patch.dirty === true) {
+      editor.preview = false;
+      editor.pinned = true;
+    }
     persist(windowId);
     return editor;
   }
@@ -1137,6 +1156,7 @@ export const useWorkbenchStore = defineStore("workbench", () => {
   }
 
   function deleteWindow(windowId: string, options: { removeStorage?: boolean } = {}): void {
+    forgetWorkWindow(windowId);
     delete windows.value[windowId];
     const scope = workspaceScope(windowId);
     delete workspaceScopes.value[windowId];

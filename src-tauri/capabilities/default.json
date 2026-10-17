@@ -4,6 +4,7 @@
   "description": "Capability for the main window and auxiliary progress windows",
   "windows": [
     "main",
+    "workspace-app-*",
     "knowledge-download-progress",
     "knowledge-lexical-progress",
     "unity-reference-import-progress",

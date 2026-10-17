@@ -11,6 +11,7 @@ const props = defineProps<{
   focusedPaneId: string;
   activeDropKey?: string | null;
   showSingleTabs?: boolean;
+  tabsInTitlebar?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -102,6 +103,7 @@ function forwardResize(splitId: string, ratio: number, commit: boolean): void {
     :focused-pane-id="focusedPaneId"
     :active-drop-key="activeDropKey"
     :show-single-tabs="showSingleTabs"
+    :tabs-in-titlebar="tabsInTitlebar"
     :register-pane-target="registerPaneTarget"
     :record-pane-scroll="recordPaneScroll"
     @focus-pane="emit('focus-pane', $event)"

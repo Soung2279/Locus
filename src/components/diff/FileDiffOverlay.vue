@@ -9,6 +9,8 @@ import { canOpenInEditor } from "../../composables/useHideMeta";
 import { t } from "../../i18n";
 
 const projectStore = useProjectStore();
+const props = defineProps<{ ownerWindow?: Window }>();
+const ownerWindow = props.ownerWindow ?? window;
 
 const overlay = useDiffOverlay();
 
@@ -30,8 +32,8 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => window.addEventListener("keydown", onKeydown, true));
-onUnmounted(() => window.removeEventListener("keydown", onKeydown, true));
+onMounted(() => ownerWindow.addEventListener("keydown", onKeydown, true));
+onUnmounted(() => ownerWindow.removeEventListener("keydown", onKeydown, true));
 
 function handleHeaderAction(action: DiffOverlayHeaderAction) {
   if (action.confirmMessage) {
@@ -62,7 +64,7 @@ async function onLfsPulled() {
 </script>
 
 <template>
-  <Teleport to="body">
+  <Teleport :to="ownerWindow.document.body">
     <Transition name="overlay-fade">
       <div v-if="overlay.visible.value" class="diff-overlay-backdrop" @click.self="overlay.close()">
         <div class="diff-overlay-panel">

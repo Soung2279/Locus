@@ -11,11 +11,14 @@ import {
 } from "./workbenchWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import { waitForSharedWorkbenchTransferTarget } from "./sharedWorkbenchTransfer";
+import { invoke } from "@tauri-apps/api/core";
+import { ensureWorkWindow, restoredAuxWindows, shouldImportLegacyAuxWindows, scheduleWorkStateCapture } from "./workState";
 
 const SHARED_WINDOW_FRAGMENT_PREFIX = "locus-shared-workbench-";
 const SHARED_POOL_LABEL_PREFIX = "workbench-shared-pool-";
 const SHARED_WINDOW_LABEL_PREFIX = "workbench-shared-";
 const STYLE_MARKER = "data-locus-shared-style";
+const synchronizedStyleSignatures = new WeakMap<Document, string>();
 const DEFAULT_WIDTH = 1120;
 const DEFAULT_HEIGHT = 760;
 const HANDLE_WAIT_MS = 2_000;
@@ -46,7 +49,6 @@ export const sharedWorkbenchWindowHosts = shallowReactive<SharedWorkbenchWindowH
 
 let preparedWindow: PreparedSharedWorkbenchWindow | null = null;
 let preparingWindow: Promise<PreparedSharedWorkbenchWindow | null> | null = null;
-let poolSequence = 0;
 let poolReplenishTimer: number | null = null;
 
 function scheduleSharedWorkbenchWindowPoolReplenishment(): void {
@@ -103,7 +105,7 @@ function copyAttributes(source: Element, target: Element, retained: string[] = [
   }
 }
 
-function synchronizeDocument(targetWindow: Window, label: string): {
+export function synchronizeDocument(targetWindow: Window, label: string, afterAttributeSync?: () => void): {
   container: HTMLElement;
   dispose: () => void;
 } {
@@ -118,12 +120,20 @@ function synchronizeDocument(targetWindow: Window, label: string): {
   targetDocument.body.style.margin = "0";
 
   let styleSyncQueued = false;
+  let disposed = false;
   const syncStyles = () => {
     styleSyncQueued = false;
-    targetDocument.head.querySelectorAll(`[${STYLE_MARKER}]`).forEach((node) => node.remove());
-    for (const source of sourceDocument.head.querySelectorAll<HTMLLinkElement | HTMLStyleElement>(
+    if (disposed || targetWindow.closed) return;
+    const sources = [...sourceDocument.head.querySelectorAll<HTMLLinkElement | HTMLStyleElement>(
       'link[rel="stylesheet"], style',
-    )) {
+    )];
+    const signature = JSON.stringify(sources.map(source => [source.outerHTML, source.disabled]));
+    // A parked WebView is rebound with a fresh Vue scope, but its styles have
+    // not changed. Keep those nodes and their loaded sheets/fonts intact.
+    if (synchronizedStyleSignatures.get(targetDocument) === signature
+      && targetDocument.head.querySelectorAll(`[${STYLE_MARKER}]`).length === sources.length) return;
+    targetDocument.head.querySelectorAll(`[${STYLE_MARKER}]`).forEach((node) => node.remove());
+    for (const source of sources) {
       const clone = source.cloneNode(true) as HTMLLinkElement | HTMLStyleElement;
       clone.setAttribute(STYLE_MARKER, "");
       if (clone instanceof HTMLLinkElement && source instanceof HTMLLinkElement) {
@@ -131,6 +141,7 @@ function synchronizeDocument(targetWindow: Window, label: string): {
       }
       targetDocument.head.appendChild(clone);
     }
+    synchronizedStyleSignatures.set(targetDocument, signature);
   };
   const scheduleStyleSync = () => {
     if (styleSyncQueued) return;
@@ -139,12 +150,14 @@ function synchronizeDocument(targetWindow: Window, label: string): {
   };
 
   const syncRootAttributes = () => {
+    if (disposed || targetWindow.closed) return;
     copyAttributes(sourceDocument.documentElement, targetDocument.documentElement, [
       "data-locus-shared-window",
     ]);
     copyAttributes(sourceDocument.body, targetDocument.body, ["data-locus-shared-window"]);
     targetDocument.documentElement.setAttribute("data-locus-shared-window", label);
     targetDocument.body.setAttribute("data-locus-shared-window", label);
+    afterAttributeSync?.();
   };
 
   syncStyles();
@@ -174,6 +187,7 @@ function synchronizeDocument(targetWindow: Window, label: string): {
   return {
     container,
     dispose: () => {
+      disposed = true;
       styleObserver.disconnect();
       attributeObserver.disconnect();
       targetDocument.body.removeEventListener("dragover", preventNavigationDrop);
@@ -186,7 +200,9 @@ async function waitForTauriWindow(label: string): Promise<WebviewWindow> {
   const deadline = performance.now() + HANDLE_WAIT_MS;
   do {
     const handle = await WebviewWindow.getByLabel(label).catch(() => null);
-    if (handle) return handle;
+    // Tauri's label registry is published before Wry inserts the native window
+    // into its event-loop map. NewWindowResponse::Create requires that map entry.
+    if (handle && await handle.isVisible().then(() => true, () => false)) return handle;
     await new Promise<void>((resolve) => window.setTimeout(resolve, 12));
   } while (performance.now() < deadline);
   throw new Error(`Shared Workbench native window did not appear: ${label}`);
@@ -197,10 +213,20 @@ async function openBlankSharedWindow(
   geometry: { x: number; y: number; width: number; height: number },
 ): Promise<PreparedSharedWorkbenchWindow> {
   const openedAt = Date.now();
+  await invoke("prepare_shared_workbench_window", { label });
+  const preparedHandle = await waitForTauriWindow(label).catch(async error => {
+    const abandoned = await WebviewWindow.getByLabel(label).catch(() => null);
+    await abandoned?.destroy().catch(() => undefined);
+    throw error;
+  });
   const browserWindow = window.open(sharedWindowUrl(label), "", featureString(geometry));
-  if (!browserWindow) throw new Error("Chromium rejected the shared Workbench window request.");
+  if (!browserWindow) {
+    const abandoned = await WebviewWindow.getByLabel(label).catch(() => null);
+    await abandoned?.destroy().catch(() => undefined);
+    throw new Error("Chromium rejected the shared Workbench window request.");
+  }
   try {
-    const appWindow = await waitForTauriWindow(label);
+    const appWindow = preparedHandle;
     const { container, dispose } = synchronizeDocument(browserWindow, label);
     recordWorkbenchWindowMetric("shared-window-proxy-ready", {
       startedAt: openedAt,
@@ -216,13 +242,14 @@ async function openBlankSharedWindow(
     };
   } catch (error) {
     browserWindow.close();
+    await preparedHandle.destroy().catch(() => undefined);
     throw error;
   }
 }
 
 export async function prepareSharedWorkbenchWindowPool(): Promise<void> {
   if (!hasTauriWindowRuntime() || preparedWindow || preparingWindow) return;
-  const label = `${SHARED_POOL_LABEL_PREFIX}${++poolSequence}`;
+  const label = randomLabel(SHARED_POOL_LABEL_PREFIX);
   preparingWindow = openBlankSharedWindow(label, {
     x: 80,
     y: 80,
@@ -299,6 +326,9 @@ function addSharedHost(options: {
     disposeDocumentSync: options.prepared.disposeDocumentSync,
   });
   sharedWorkbenchWindowHosts.push(host);
+  for (const type of ["input", "change", "pointerup", "scroll", "focusout"]) {
+    host.browserWindow.document.addEventListener(type, scheduleWorkStateCapture, { capture: true, passive: true });
+  }
   publishSharedWindowDebugState();
   const handleUnload = () => void removeSharedWorkbenchWindowHost(host.label, false);
   host.browserWindow.addEventListener("unload", handleUnload, { once: true });
@@ -315,6 +345,7 @@ export async function createSharedDetachedWorkbenchWindow(
   const claimedAt = Date.now();
   const { prepared, pooled } = await claimOrCreateSharedWindow(geometry);
   registerWorkbenchAuxWindow(prepared.label, geometry);
+  ensureWorkWindow(prepared.label);
   const existingHost = sharedWorkbenchWindowHosts.find((host) => host.label === prepared.label);
   if (existingHost) {
     existingHost.transferToken = token;
@@ -344,6 +375,11 @@ async function restoreSharedWorkbenchWindow(record: WorkbenchAuxWindowRecord): P
     height: record.height ?? DEFAULT_HEIGHT,
   };
   const prepared = await openBlankSharedWindow(record.label, geometry);
+  await Promise.all([
+    prepared.appWindow.setPosition(new LogicalPosition(geometry.x, geometry.y)),
+    prepared.appWindow.setSize(new LogicalSize(geometry.width, geometry.height)),
+  ]);
+  ensureWorkWindow(record.label);
   addSharedHost({
     prepared,
     transferToken: "",
@@ -356,7 +392,14 @@ async function restoreSharedWorkbenchWindow(record: WorkbenchAuxWindowRecord): P
 
 export async function restoreSharedWorkbenchWindows(): Promise<void> {
   if (!hasTauriWindowRuntime()) return;
-  for (const record of readWorkbenchAuxWindowRegistry()) {
+  const records = new Map<string, WorkbenchAuxWindowRecord>();
+  if (shouldImportLegacyAuxWindows()) {
+    for (const record of readWorkbenchAuxWindowRegistry()) records.set(record.label, record);
+  }
+  for (const record of restoredAuxWindows()) records.set(record.label, {
+    label: record.label, ...record.bounds, maximized: record.maximized, updatedAt: Date.now(),
+  });
+  for (const record of records.values()) {
     await restoreSharedWorkbenchWindow(record).catch((error) => {
       console.warn(`[workbench-window] failed to restore shared window ${record.label}`, error);
     });

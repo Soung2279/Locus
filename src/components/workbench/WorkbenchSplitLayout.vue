@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, type ComponentPublicInstance } from "vue";
+import { shouldShowWorkbenchTabStrip } from "../../stores/workbench";
 import type {
   WorkbenchEditorGroup,
   WorkbenchSplitNode,
@@ -14,6 +15,7 @@ const props = defineProps<{
   focusedPaneId: string;
   activeDropKey?: string | null;
   showSingleTabs?: boolean;
+  tabsInTitlebar?: boolean;
   registerPaneTarget: (paneId: string, element: HTMLElement) => void;
   recordPaneScroll: (paneId: string, event: Event) => void;
 }>();
@@ -36,8 +38,8 @@ const firstStyle = computed(() => {
 
 const leafShowsTabs = computed(() => {
   if (props.node.kind !== "group") return false;
-  const count = props.groups[props.node.paneId]?.tabs.length ?? 0;
-  return count >= 2 || (props.showSingleTabs && count === 1);
+  const group = props.groups[props.node.paneId];
+  return !props.tabsInTitlebar && !!group && shouldShowWorkbenchTabStrip(group, props.showSingleTabs);
 });
 
 const activeSplitDropDirection = computed<WorkbenchSplitDropDirection | null>(() => {
@@ -140,6 +142,7 @@ onUnmounted(() => resizeCleanup?.());
         :focused-pane-id="focusedPaneId"
         :active-drop-key="activeDropKey"
         :show-single-tabs="showSingleTabs"
+        :tabs-in-titlebar="tabsInTitlebar"
         @focus-pane="emit('focus-pane', $event)"
         @resize="forwardResize"
       />
@@ -164,6 +167,7 @@ onUnmounted(() => resizeCleanup?.());
         :focused-pane-id="focusedPaneId"
         :active-drop-key="activeDropKey"
         :show-single-tabs="showSingleTabs"
+        :tabs-in-titlebar="tabsInTitlebar"
         @focus-pane="emit('focus-pane', $event)"
         @resize="forwardResize"
       />
@@ -173,6 +177,7 @@ onUnmounted(() => resizeCleanup?.());
     v-else
     :ref="registerGroupElement"
     class="workbench-editor-group"
+    data-search-boundary
     :class="{ focused: focusedPaneId === node.paneId }"
     :data-workbench-pane-id="node.paneId"
     @pointerdown.capture="requestPaneFocus(node.paneId)"

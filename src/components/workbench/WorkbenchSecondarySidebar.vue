@@ -90,7 +90,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <aside ref="sidebarRef" class="workbench-secondary-sidebar" :style="{ width: `${width}px` }" :aria-label="title">
+  <aside ref="sidebarRef" class="workbench-secondary-sidebar" data-search-boundary :style="{ width: `${width}px` }" :aria-label="title">
     <div class="secondary-sidebar-surface">
     <div class="secondary-sidebar-header">
       <span class="secondary-sidebar-title">{{ title }}</span>

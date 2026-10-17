@@ -1,10 +1,11 @@
 import { computed, ref } from "vue";
+import { recordActivePage } from "../services/workState";
 import { defineStore } from "pinia";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Window as TauriWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { hasTauriWindowRuntime } from "../services/tauriRuntime";
+import { hasTauriWindowRuntime, getCurrentTauriWindowLabel } from "../services/tauriRuntime";
 import type { UserMessageDraft } from "../composables/chatMessageDraft";
 
 export type AppPage = "development" | "plugins" | "agent" | "settings";
@@ -51,6 +52,9 @@ interface PendingChatPrefill extends ChatPrefillOptions {
 }
 
 export const useUiStore = defineStore("ui", () => {
+  const windowLabel = getCurrentTauriWindowLabel() || "main";
+  const activePageStorageKey = windowLabel === "main"
+    ? ACTIVE_PAGE_STORAGE_KEY : `${ACTIVE_PAGE_STORAGE_KEY}:${windowLabel}`;
   const activePage = ref<AppPage>("development");
   /** Temporary read-compatible alias for components outside the app router. */
   const activeTab = computed<"chat" | "views" | "plugins" | "agent" | "settings">({
@@ -210,7 +214,9 @@ export const useUiStore = defineStore("ui", () => {
         console.error("Failed to listen for window resize:", error);
       }
     }
-    if (hasTauriWindowRuntime()) {
+    // The native live-resize hook currently publishes main-window dimensions.
+    // Other application windows use their own onResized events.
+    if (hasTauriWindowRuntime() && windowLabel === "main") {
       try {
         unlistenNativeClientSize = await listen<NativeWindowClientSizeEvent>(
           NATIVE_WINDOW_CLIENT_SIZE_EVENT,
@@ -223,8 +229,8 @@ export const useUiStore = defineStore("ui", () => {
       }
     }
     try {
-      const savedPage = localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY)
-        ?? localStorage.getItem("locus:activeTab");
+      const savedPage = localStorage.getItem(activePageStorageKey)
+        ?? (windowLabel === "main" ? localStorage.getItem("locus:activeTab") : null);
       setPage(migrateAppPage(savedPage));
       showOnboarding.value = !localStorage.getItem("locus-onboarding-completed");
     } catch (error) {
@@ -249,11 +255,12 @@ export const useUiStore = defineStore("ui", () => {
 
   function setPage(page: AppPage) {
     activePage.value = page;
+    recordActivePage(page);
     if (page === "plugins") pluginsMounted.value = true;
     if (page === "agent") agentMounted.value = true;
     if (page === "settings") settingsMounted.value = true;
     try {
-      localStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, page);
+      localStorage.setItem(activePageStorageKey, page);
     } catch {
       // A read-only WebView still keeps the in-memory route.
     }

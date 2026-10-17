@@ -15,6 +15,7 @@ import {
   installTauriWindowDragFallback,
 } from "./services/tauriRuntime";
 import { markStartupPhase, scheduleStartupPaintReport } from "./services/startupPerf";
+import { installInputPunctuationPairing } from "./services/inputPunctuationPairing";
 
 // Lightweight entry for every Locus sub-window (utility dialogs, View
 // hosts, graph tools). It skips the main-app store/service graph so the
@@ -29,6 +30,7 @@ installTauriDevtoolsHotkeys();
 installTauriWindowDragFallback();
 
 const app = createApp(WindowApp);
+installInputPunctuationPairing();
 app.use(createPinia());
 app.mount("#app");
 markStartupPhase("frontend_window_vue_mount_called");

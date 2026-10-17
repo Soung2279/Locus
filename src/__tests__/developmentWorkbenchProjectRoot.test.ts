@@ -27,12 +27,14 @@ describe("Development workbench project roots", () => {
     expect(projectBranch).not.toContain("selectedNodeKey");
   });
 
-  it("offers a persistent delete action from project root context menus", () => {
-    expect(workbench).toContain('@click="removeContextWorkspace"');
-    expect(workbench).toContain('t("development.deleteWorkspace")');
-    expect(workbench).toContain('t("development.deleteWorkspaceConfirm", projectLabel(project))');
-    expect(workbench).toContain("workspaceContextBaseStore.removeProject(project.projectId)");
-    expect(workbench).toContain("projectStore.loadRecentDirs()");
+  it("keeps workspace management outside tree context menus", () => {
+    const menu = workbench.match(/<BaseContextMenu\s+v-if="contextMenu"[\s\S]*?<\/BaseContextMenu>/)?.[0] ?? "";
+    expect(menu).toContain("beginCreateWorkspaceDocument('document')");
+    expect(menu).toContain("beginCreateWorkspaceDocument('csv')");
+    expect(menu).not.toContain("browseWorkspace");
+    expect(menu).not.toContain("removeContextWorkspace");
+    expect(menu).not.toContain('development.deleteWorkspace');
+    expect(workbench).toContain('@click="browseWorkspace"');
   });
 
   it("uses the Unity mark for projects with the Unity service detected", () => {

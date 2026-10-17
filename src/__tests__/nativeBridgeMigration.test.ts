@@ -39,7 +39,7 @@ describe("native bridge migration", () => {
     expect(native).toContain('"managedCapabilities": managed_capabilities');
     expect(native).toContain("guard.clear();");
     expect(native).toContain("const NATIVE_CAPABILITIES: &str =");
-    expect(native).toContain('"broker_v1,broker_state_mmf_v1,broker_queue_limits_v1,broker_request_accepted_v1"');
+    expect(native).toContain('broker_v1,broker_state_mmf_v1,broker_queue_limits_v1,broker_request_accepted_v1,broker_main_thread_liveness_v1');
     expect(managed).toContain("managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1");
     expect(managed).toContain("recompile_result_idempotent_v1");
     expect(managed).toContain("recompile_operation_id_v1");

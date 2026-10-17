@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { LogicalPosition, LogicalSize, getCurrentWindow } from "@tauri-apps/api/window";
 import { t } from "../i18n";
@@ -30,10 +30,15 @@ import {
   type SharedWorkbenchWindowHost,
 } from "../services/sharedWorkbenchWindow";
 import TopBannerHost from "./TopBannerHost.vue";
+import { provideWindowSurface } from "../composables/useWindowSurface";
+import { nativeViewHosts } from "./view/viewHostRegistry";
+import { installSharedWorkbenchWindowRefresh } from "../services/workbenchWindowRefresh";
+import { revealWorkStateWindow, isWorkStateExiting, forgetWorkWindow } from "../services/workState";
 
 const props = defineProps<{
   sharedHost?: SharedWorkbenchWindowHost;
 }>();
+provideWindowSurface(props.sharedHost?.browserWindow ?? window);
 
 const developmentWorkbenchModule = import("./workbench/DevelopmentWorkbench.vue");
 const DevelopmentWorkbench = defineAsyncComponent(
@@ -50,6 +55,10 @@ const claimed = ref(!initiallyPool);
 const bootstrapped = ref(!!props.sharedHost);
 const bootstrapError = ref("");
 const isMaximized = ref(false);
+const alwaysOnTop = ref(false);
+const pinPending = ref(false);
+const titlebarTarget = ref<HTMLElement | null>(null);
+const singleTabTitleTarget = ref<HTMLElement | null>(null);
 const workbenchMounted = computed(() => bootstrapped.value);
 let allowNativeClose = false;
 let closeRequest: Promise<void> | null = null;
@@ -58,11 +67,21 @@ let unlistenPoolClaim: (() => void) | null = null;
 let unlistenCloseRequested: (() => void) | null = null;
 let unlistenMoved: (() => void) | null = null;
 let unlistenResized: (() => void) | null = null;
+let unlistenRefresh: (() => void) | null = null;
 let poolReadyMarked = false;
 let windowRevealed = false;
 
 const workspaceContextStore = useWorkspaceContextStore();
 const workbenchStore = useWorkbenchStore();
+const singleEditor = computed(() => {
+  const state = workbenchStore.windows[windowId];
+  const editors = Object.values(state?.groups ?? {}).flatMap((group) => group.tabs);
+  return editors.length === 1 ? editors[0] : null;
+});
+const windowTitle = computed(() => singleEditor.value?.title || "Locus");
+watch(windowTitle, (title) => {
+  void appWindow.setTitle(title).catch(() => undefined);
+}, { immediate: true });
 const { bootstrapCritical, registerListeners, cleanup } = useAppBootstrap({
   syncActiveSessionSelection: false,
   handleExternalScriptOpen: false,
@@ -94,14 +113,15 @@ async function revealWorkbenchWindow(
     return;
   }
   registerWorkbenchAuxWindow(windowId);
-  await appWindow.show();
+  if (props.sharedHost) await revealWorkStateWindow(windowId);
+  else await appWindow.show();
   windowRevealed = true;
   recordWorkbenchWindowMetric(props.sharedHost ? "shared-window-shown" : "window-shown", {
     token,
     startedAt,
     detail: { windowId, pooled: props.sharedHost?.pooled ?? false },
   });
-  void appWindow.setFocus().catch(() => undefined);
+  if (!restoring) void appWindow.setFocus().catch(() => undefined);
   void persistWorkbenchWindowBounds(appWindow).catch(() => undefined);
 }
 
@@ -119,6 +139,7 @@ async function applyPoolClaim(payload: WorkbenchWindowPoolClaimPayload): Promise
 }
 
 async function closeWorkbenchWindow(options: { discardDirty?: boolean; empty?: boolean } = {}): Promise<void> {
+  if (isWorkStateExiting()) return;
   if (closeRequest) return closeRequest;
   closeRequest = (async () => {
     const state = workbenchStore.ensureWindow(windowId);
@@ -132,6 +153,7 @@ async function closeWorkbenchWindow(options: { discardDirty?: boolean; empty?: b
       if (!approved) return;
     }
     unregisterWorkbenchAuxWindow(windowId);
+    forgetWorkWindow(windowId);
     workbenchStore.deleteWindow(windowId, { removeStorage: true });
     await workspaceContextStore.disposeWindow(windowId).catch(() => 0);
     allowNativeClose = true;
@@ -147,6 +169,20 @@ async function toggleMaximize(): Promise<void> {
   await appWindow.toggleMaximize();
   isMaximized.value = await appWindow.isMaximized().catch(() => false);
   scheduleBoundsPersist();
+}
+
+async function toggleAlwaysOnTop(): Promise<void> {
+  if (pinPending.value) return;
+  pinPending.value = true;
+  try {
+    const pinned = !alwaysOnTop.value;
+    await appWindow.setAlwaysOnTop(pinned);
+    alwaysOnTop.value = pinned;
+  } catch (error) {
+    console.warn("[workbench-window] failed to set always on top", error);
+  } finally {
+    pinPending.value = false;
+  }
 }
 
 function handleWorkbenchReady(): void {
@@ -185,6 +221,16 @@ function handleTransferReady(token: string, startedAt: number): void {
 }
 
 onMounted(async () => {
+  if (props.sharedHost) {
+    unlistenRefresh = installSharedWorkbenchWindowRefresh(props.sharedHost.browserWindow, async () => {
+      const editor = workbenchStore.activeEditor(windowId);
+      if (editor?.resource.kind !== "view") return;
+      const host = nativeViewHosts().find((candidate) => (
+        candidate.windowLabel === windowId && candidate.instanceId === editor.editorId
+      ));
+      await host?.reload({ force: true });
+    });
+  }
   try {
     if (!props.sharedHost) {
       unlistenPoolClaim = await appWindow.listen<WorkbenchWindowPoolClaimPayload>(
@@ -193,6 +239,7 @@ onMounted(async () => {
       );
     }
     unlistenCloseRequested = await appWindow.onCloseRequested((event) => {
+      if (isWorkStateExiting()) { event.preventDefault(); return; }
       if (allowNativeClose) return;
       event.preventDefault();
       void closeWorkbenchWindow();
@@ -200,6 +247,7 @@ onMounted(async () => {
     unlistenMoved = await appWindow.onMoved(scheduleBoundsPersist);
     unlistenResized = await appWindow.onResized(scheduleBoundsPersist);
     isMaximized.value = await appWindow.isMaximized().catch(() => false);
+    alwaysOnTop.value = await appWindow.isAlwaysOnTop().catch(() => false);
     if (restoring && getWorkbenchAuxWindowRecord(windowId)?.maximized) {
       await appWindow.maximize().catch(() => undefined);
       isMaximized.value = await appWindow.isMaximized().catch(() => true);
@@ -218,6 +266,8 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  unlistenRefresh?.();
+  unlistenRefresh = null;
   if (boundsTimer) clearTimeout(boundsTimer);
   boundsTimer = null;
   unlistenPoolClaim?.();
@@ -235,14 +285,35 @@ onUnmounted(() => {
 <template>
   <main class="workbench-window-root">
     <header
+      ref="titlebarTarget"
       class="workbench-window-titlebar"
       data-tauri-drag-region
       @pointerdown="handleTitlebarPointerDown"
       @dblclick="toggleMaximize"
     >
-      <span class="workbench-window-title" data-tauri-drag-region>Locus</span>
+      <div
+        v-show="singleEditor"
+        ref="singleTabTitleTarget"
+        class="workbench-window-tab-title"
+        data-window-no-drag
+      />
+      <span v-if="!singleEditor" class="workbench-window-title" data-tauri-drag-region>Locus</span>
       <div class="workbench-window-drag-region" data-tauri-drag-region />
       <div class="workbench-window-controls" data-window-no-drag @dblclick.stop>
+        <button
+          type="button"
+          class="workbench-window-control"
+          :class="{ 'is-pinned': alwaysOnTop }"
+          :title="alwaysOnTop ? t('app.pin.unpin') : t('app.pin.pin')"
+          :aria-label="alwaysOnTop ? t('app.pin.unpin') : t('app.pin.pin')"
+          :aria-pressed="alwaysOnTop"
+          :disabled="pinPending"
+          @click="toggleAlwaysOnTop"
+        >
+          <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true" :style="{ transform: alwaysOnTop ? 'rotate(0deg)' : 'rotate(45deg)' }">
+            <path d="M9.828 1.282a.75.75 0 0 1 .955.073l3.862 3.862a.75.75 0 0 1-.564 1.272h-.862L11.2 8.507a2.25 2.25 0 0 1-.039 2.994l-.56.56a.75.75 0 0 1-1.06 0L7.05 9.57l-3.72 3.72a.75.75 0 1 1-1.06-1.06l3.72-3.72L3.5 6.02a.75.75 0 0 1 0-1.06l.56-.56a2.25 2.25 0 0 1 2.994-.04L9.07 2.342V1.48a.75.75 0 0 1 .758-.198z" />
+          </svg>
+        </button>
         <button
           type="button"
           class="workbench-window-control"
@@ -290,6 +361,8 @@ onUnmounted(() => {
       :initial-transfer-token="transferToken"
       :native-window="appWindow"
       :owner-window="sharedHost?.browserWindow"
+      :titlebar-target="titlebarTarget"
+      :single-tab-title-target="singleEditor ? singleTabTitleTarget : null"
       :prewarm="sharedHost?.pooled"
       auxiliary
       :show-explorer="false"
@@ -336,13 +409,23 @@ onUnmounted(() => {
   user-select: none;
 }
 
+.workbench-window-tab-title {
+  -webkit-app-region: no-drag;
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  height: 100%;
+}
+
 .workbench-window-drag-region {
   flex: 1;
+  min-width: 32px;
   align-self: stretch;
 }
 
 .workbench-window-controls {
   -webkit-app-region: no-drag;
+  flex-shrink: 0;
   display: flex;
   height: 100%;
 }
@@ -371,6 +454,10 @@ onUnmounted(() => {
 .workbench-window-control.is-close:focus-visible {
   background: var(--status-error-fg);
   color: var(--bg-color);
+}
+
+.workbench-window-control.is-pinned {
+  color: var(--accent-color);
 }
 
 .workbench-window-state,

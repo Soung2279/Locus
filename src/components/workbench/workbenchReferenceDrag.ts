@@ -63,6 +63,8 @@ export type WorkbenchReferenceDragEntry =
 
 export interface WorkbenchReferenceDragData {
   version: 1;
+  /** Physical filesystem entries can be moved within their source checkout. */
+  fileSystemMove?: boolean;
   origin: WorkbenchReferenceDragOrigin;
   entries: WorkbenchReferenceDragEntry[];
 }
@@ -375,7 +377,7 @@ export function workbenchReferenceInternalDragSource(
             ? Folder
           : File,
     },
-    allowedOperations: ["copy"],
+    allowedOperations: data.fileSystemMove ? ["copy", "move"] : ["copy"],
     externalize: () => externalizeWorkbenchReferenceDrag(data),
   };
 }

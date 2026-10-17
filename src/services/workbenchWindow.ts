@@ -12,6 +12,7 @@ import type {
 } from "../types/workbench";
 import { currentThemeBackgroundColor } from "../composables/useTheme";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import { isWorkspaceWindowLabel } from "./workspaceWindow";
 
 export const WORKBENCH_WINDOW_FLAG = "workbenchWindow";
 export const WORKBENCH_WINDOW_POOL_FLAG = "workbenchWindowPool";
@@ -153,7 +154,7 @@ function writeAuxWindowRegistry(records: WorkbenchAuxWindowRecord[]): void {
 }
 
 export function isWorkbenchWindowLabel(label: string): boolean {
-  return label === "main" || label.startsWith(WORKBENCH_WINDOW_LABEL_PREFIX);
+  return label === "main" || isWorkspaceWindowLabel(label) || label.startsWith(WORKBENCH_WINDOW_LABEL_PREFIX);
 }
 
 export function isWorkbenchAuxWindowLabel(label: string): boolean {
@@ -416,7 +417,8 @@ export async function detachedWindowGeometry(
   const workAreaSize = monitor?.workArea.size.toLogical(factor);
   const width = Math.min(DEFAULT_WIDTH, workAreaSize?.width ?? DEFAULT_WIDTH);
   const height = Math.min(DEFAULT_HEIGHT, workAreaSize?.height ?? DEFAULT_HEIGHT);
-  const tabOrigin = { x: 1, y: 33 };
+  // A newly detached window presents its first tab inside the titlebar.
+  const tabOrigin = { x: 1, y: 1 };
   const desiredX = tabAnchor
     ? logicalPoint.x - tabOrigin.x - tabAnchor.x
     : logicalPoint.x - 96;

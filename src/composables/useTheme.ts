@@ -131,6 +131,9 @@ export function setThemePreference(
 export function currentThemeBackgroundColor(scope: ThemeScope = activeScope): string {
   return THEME_BACKGROUND_COLOR[resolveTheme(preferenceRef(scope).value)];
 }
+export function resolvedTheme(scope: ThemeScope): "light" | "dark" {
+  return resolveTheme(preferenceRef(scope).value);
+}
 
 /** Call once from App.vue for each window surface that uses shared app tokens. */
 export function initTheme(scope: ThemeScope = "main") {

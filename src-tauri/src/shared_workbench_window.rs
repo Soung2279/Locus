@@ -54,7 +54,9 @@ fn track_native_drag_pointer(app_handle: AppHandle, stop: Arc<AtomicBool>) {
         .webview_windows()
         .into_iter()
         .filter(|(label, _)| {
-            label == MAIN_WINDOW_LABEL || label.starts_with(SHARED_WORKBENCH_WINDOW_LABEL_PREFIX)
+            label == MAIN_WINDOW_LABEL
+                || crate::workspace_window::is_workspace_window(label)
+                || label.starts_with(SHARED_WORKBENCH_WINDOW_LABEL_PREFIX)
         })
         .filter_map(|(label, window)| window.hwnd().ok().map(|hwnd| (label, hwnd)))
         .collect::<Vec<_>>();
@@ -167,6 +169,7 @@ pub fn label_from_url(url: &tauri::Url) -> Option<String> {
 fn base_window_builder<'a>(
     app_handle: &'a AppHandle,
     label: &str,
+    owner_label: &str,
 ) -> Result<WebviewWindowBuilder<'a, Wry, AppHandle<Wry>>, String> {
     let mut builder =
         WebviewWindowBuilder::new(app_handle, label, WebviewUrl::External(about_blank()?))
@@ -180,16 +183,54 @@ fn base_window_builder<'a>(
             .inner_size(1120.0, 760.0)
             .min_inner_size(620.0, 420.0)
             .visible(false);
-    if let Some(main_window) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
+    if let Some(owner_window) = app_handle.get_webview_window(owner_label) {
         builder = builder
-            .parent(&main_window)
+            .parent(&owner_window)
             .map_err(|error| format!("Failed to parent shared Workbench window: {error}"))?;
     }
     Ok(builder)
 }
 
+fn prepared_windows() -> &'static Mutex<std::collections::HashMap<String, String>> {
+    static WINDOWS: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    WINDOWS.get_or_init(Default::default)
+}
+
+#[tauri::command]
+pub async fn prepare_shared_workbench_window(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    label: String,
+) -> Result<(), String> {
+    let url: tauri::Url = format!("about:blank#{SHARED_WORKBENCH_WINDOW_FRAGMENT_PREFIX}{label}")
+        .parse()
+        .map_err(|e: url::ParseError| e.to_string())?;
+    if label_from_url(&url).as_deref() != Some(&label)
+        || (window.label() != MAIN_WINDOW_LABEL
+            && !crate::workspace_window::is_workspace_window(window.label()))
+    {
+        return Err("Invalid shared Workbench window request".into());
+    }
+    if app.get_webview_window(&label).is_some() {
+        return Err("Workbench window already exists".into());
+    }
+    // Building inside NewWindowRequested can reenter another WebView creation
+    // while Wry holds its WebContext mutex. Prepare from an async command and
+    // let the synchronous callback only hand over this already-created window.
+    let prepared = base_window_builder(&app, &label, window.label())?
+        .build()
+        .map_err(|e| e.to_string())?;
+    prepared_windows()
+        .lock()
+        .unwrap()
+        .insert(label, window.label().into());
+    let _ = prepared;
+    Ok(())
+}
+
 pub fn handle_new_window(
     app_handle: &AppHandle,
+    owner_label: &str,
     url: tauri::Url,
     _features: NewWindowFeatures,
 ) -> NewWindowResponse<Wry> {
@@ -197,26 +238,13 @@ pub fn handle_new_window(
         return NewWindowResponse::Deny;
     };
 
-    if app_handle.get_webview_window(&label).is_some() {
+    let reserved_owner = prepared_windows().lock().unwrap().remove(&label);
+    if reserved_owner.as_deref() != Some(owner_label) {
         return NewWindowResponse::Deny;
     }
-
-    let builder = match base_window_builder(app_handle, &label) {
-        Ok(builder) => builder,
-        Err(error) => {
-            eprintln!("[WorkbenchWindow] failed to prepare shared child {label}: {error}");
-            return NewWindowResponse::Deny;
-        }
-    };
-    match builder.build() {
-        Ok(window) => {
-            eprintln!("[WorkbenchWindow] shared child created directly: {label}");
-            NewWindowResponse::Create { window }
-        }
-        Err(error) => {
-            eprintln!("[WorkbenchWindow] failed to create shared child {label}: {error}");
-            NewWindowResponse::Deny
-        }
+    match app_handle.get_webview_window(&label) {
+        Some(window) => NewWindowResponse::Create { window },
+        None => NewWindowResponse::Deny,
     }
 }
 

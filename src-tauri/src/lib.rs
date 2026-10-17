@@ -47,6 +47,7 @@ pub mod knowledge_store;
 mod knowledge_watcher;
 mod llm;
 mod local_docs;
+mod markdown_attachments;
 pub mod mcp;
 pub(crate) mod merge;
 pub mod merge_jobs;
@@ -60,8 +61,11 @@ pub mod resource_policy;
 mod runtime_data_lock;
 mod runtime_paths;
 mod sdk;
+mod native_view;
+mod unity_renderer;
 mod session;
 mod shared_workbench_window;
+mod unity_embed_webview;
 mod skill_runtime_context;
 mod sqlite_maint;
 mod tool;
@@ -90,6 +94,11 @@ pub mod workspace_definition_registry;
 pub mod workspace_service;
 pub mod workspace_tool_registry;
 mod workspace_tree;
+mod workspace_file_order;
+mod workspace_file_watcher;
+mod workspace_window;
+mod work_state;
+mod captures;
 
 use agent::definition::AgentDefRegistry;
 use agent::instance::{AssistantStreamState, RawContextStore};
@@ -174,7 +183,10 @@ impl StartupTrace {
 }
 
 fn emit_main_window_close_request(window: &tauri::Window) {
-    if let Err(error) = window.emit(MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ()) {
+    if let Err(error) = window
+        .app_handle()
+        .emit_to(window.label(), MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ())
+    {
         eprintln!(
             "[Locus] failed to emit main window close request event: {}",
             error
@@ -469,6 +481,17 @@ pub fn run() {
             commands::handle_unity_embed_webview_event(webview, event);
         })
         .on_window_event(|window, event| {
+            if matches!(event, WindowEvent::Destroyed) {
+                unity_renderer::release_window(window.label());
+            }
+            work_state::handle_window_event(window, event);
+            if matches!(event, WindowEvent::Destroyed) {
+                if let Some(registry) = window.app_handle().try_state::<Arc<workspace_service::ProjectRegistry>>() {
+                    for runtime in registry.runtimes() {
+                        runtime.core().file_watch().release(window.label(), None);
+                    }
+                }
+            }
             commands::handle_locus_window_event(window, event);
             commands::handle_sub_window_event(window, event);
             // Process exit destroys every native window. Preserve the last
@@ -502,13 +525,44 @@ pub fn run() {
                     }
                 }
             }
-            if window.label() != MAIN_WINDOW_LABEL {
+            if window.label() != MAIN_WINDOW_LABEL
+                && !workspace_window::is_workspace_window(window.label())
+            {
                 return;
             }
 
             if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
                 let config = window.app_handle().state::<Arc<AppConfig>>();
+                let has_other_windows = workspace_window::has_other_application_windows(
+                    window.app_handle(),
+                    window.label(),
+                );
+                if workspace_window::is_workspace_window(window.label()) {
+                    // Closing one workspace only releases that window's panes.
+                    // The hidden main shell continues to own tray/global services.
+                    if has_other_windows {
+                        return;
+                    }
+                    if config.close_behavior() == AppCloseBehavior::MinimizeToTray
+                        && set_main_tray_visible(window.app_handle(), true)
+                    {
+                        return;
+                    }
+                    api.prevent_close();
+                    emit_main_window_close_request(window);
+                    return;
+                }
+                api.prevent_close();
+                if has_other_windows {
+                    // Keep the process shell alive for the other workspaces,
+                    // even on systems where no tray icon is available.
+                    let _ = set_main_tray_visible(window.app_handle(), true);
+                    if let Err(error) = window.hide() {
+                        eprintln!("[Locus] failed to hide main workspace window: {error}");
+                    }
+                    window.app_handle().state::<Arc<work_state::WorkStateStore>>().set_visible(window.label(), false);
+                    return;
+                }
                 if config.close_behavior() == AppCloseBehavior::MinimizeToTray {
                     hide_main_window_to_tray(window);
                     return;
@@ -536,6 +590,7 @@ pub fn run() {
                 runtime_data_lock.path().display()
             );
             app.manage(runtime_data_lock);
+            captures::init(app.handle());
             if let Ok(resource_dir) = app.path().resource_dir() {
                 process_util::set_managed_git_resource_dir(resource_dir.clone());
                 process_util::set_managed_github_cli_resource_dir(resource_dir);
@@ -683,7 +738,9 @@ pub fn run() {
             }
             startup_for_setup.mark("setup_workspace_runtime_data_plane_ready");
 
-            let recovered_window_contexts = commands::load_window_context_recovery(&data_dir);
+            let mut recovered_window_contexts = commands::load_window_context_recovery(&data_dir);
+            let desktop_work_state = work_state::WorkStateStore::load(&data_dir)?;
+            recovered_window_contexts.retain(|context| desktop_work_state.retain_context(context));
             let legacy_active_session_candidates = legacy_active_session_candidates(&data_dir);
             let recovered_main_context = recovered_window_contexts
                 .iter()
@@ -1001,6 +1058,7 @@ pub fn run() {
             app.manage(resource_policy);
             app.manage(window_contexts);
             app.manage(window_context_persistence);
+            app.manage(desktop_work_state);
             app.manage(pending_external_script_open);
             app.manage(auth_state);
             app.manage(codex_state);
@@ -1072,6 +1130,7 @@ pub fn run() {
             main_window_builder = main_window_builder.on_new_window(move |url, features| {
                 shared_workbench_window::handle_new_window(
                     &app_handle_for_shared_workbench,
+                    MAIN_WINDOW_LABEL,
                     url,
                     features,
                 )
@@ -1093,6 +1152,14 @@ pub fn run() {
             main_window_builder =
                 main_window_builder.initialization_script(debug_initialization_script);
             main_window_builder.build()?;
+            if let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                if let Some(record) = app.state::<Arc<work_state::WorkStateStore>>().snapshot().windows.get(MAIN_WINDOW_LABEL) {
+                    if let Err(error) = work_state::apply_geometry(&main, record) {
+                        eprintln!("[WorkState] main window geometry restore failed: {error}");
+                    }
+                }
+            }
+            unity_embed_webview::install(app.handle())?;
             startup_for_setup.mark("main_window_build_done");
             if let Some(cli_driver_config) = cli_driver_for_setup.clone() {
                 cli_driver::spawn(app.handle().clone(), cli_driver_config);
@@ -1100,6 +1167,7 @@ pub fn run() {
                 startup_for_setup.mark("setup_done");
                 return Ok(());
             }
+            workspace_window::restore_workspace_windows(app.handle());
             if app.state::<Arc<AppConfig>>().debug_enabled() {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -1187,6 +1255,10 @@ pub fn run() {
                     return;
                 };
                 let wd = runtime.root().to_string_lossy().to_string();
+                if !crate::workspace::knowledge_enabled(&wd) {
+                    startup_for_knowledge.mark("knowledge_startup_task_skipped");
+                    return;
+                }
                 let app_knowledge_dir: tauri::State<'_, AppKnowledgeDir> =
                     app_handle_for_knowledge.state();
                 let knowledge_startup_state =
@@ -1223,6 +1295,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            captures::capture_unity_attachment,
+            commands::inspect_workspace_setup,
+            commands::save_workspace_setup,
             commands::create_session,
             commands::fork_session,
             commands::fork_session_from_message,
@@ -1233,6 +1308,7 @@ pub fn run() {
             commands::delete_pending_chat_input,
             commands::list_agents,
             commands::list_workspace_agents,
+            commands::set_workspace_default_agent,
             commands::read_workspace_agent_document,
             commands::save_workspace_agent_document,
             commands::list_subagent_defs,
@@ -1252,6 +1328,8 @@ pub fn run() {
             commands::set_agent_tool_enabled,
             commands::load_session,
             commands::load_session_view,
+            commands::sync_claude_remote_session,
+            commands::synchronize_session_remote_history,
             commands::load_session_message_page,
             commands::load_session_message_images,
             commands::load_session_turn_preview,
@@ -1259,6 +1337,7 @@ pub fn run() {
             commands::get_compacted_context_output,
             commands::list_sessions,
             commands::list_checkout_sessions,
+            commands::search_session_titles,
             commands::list_project_sessions,
             commands::list_archived_sessions,
             commands::list_archived_checkout_sessions,
@@ -1284,6 +1363,7 @@ pub fn run() {
             commands::clear_api_key,
             commands::get_providers,
             commands::test_claude_code_cli,
+            commands::clear_claude_ssh_unlock_password,
             commands::save_provider_key,
             commands::delete_provider_key,
             commands::get_app_storage_info,
@@ -1367,6 +1447,7 @@ pub fn run() {
             commands::install_unity_plugin,
             commands::launch_unity_project,
             commands::close_headless_unity_project,
+            commands::restart_unresponsive_unity_project,
             commands::unity_recompile_run,
             commands::unity_recompile_probe_run,
             commands::unity_execute_snippet_run,
@@ -1391,8 +1472,17 @@ pub fn run() {
             commands::read_workspace_asset_preview_frame_cache,
             commands::cache_workspace_asset_preview_frame,
             commands::render_workspace_asset_preview_frame,
+            unity_renderer::unity_renderer_capabilities,
+            unity_renderer::unity_renderer_create,
+            unity_renderer::unity_renderer_mount,
+            unity_renderer::unity_renderer_layout,
+            unity_renderer::unity_renderer_status,
+            unity_renderer::unity_renderer_detach,
+            unity_renderer::unity_renderer_close,
             commands::preview_workspace_asset_target,
             commands::unity_serialized_property_read,
+            commands::unity_serialized_property_read_many,
+            commands::unity_property_objects,
             commands::unity_assets_execute,
             commands::unity_serialized_property_discover,
             commands::unity_serialized_property_write,
@@ -1493,7 +1583,16 @@ pub fn run() {
             commands::workspace_file_preview,
             commands::workspace_file_revision,
             commands::workspace_file_write,
+            commands::workspace_create_document,
             commands::explorer_file_action,
+            commands::file_history,
+            commands::file_history_preview,
+            commands::file_history_restore,
+            commands::workspace_move_entry,
+            commands::workspace_file_order,
+            commands::workspace_file_order_save,
+            commands::workspace_file_watch_start,
+            commands::workspace_file_watch_stop,
             commands::csv_view_read,
             commands::csv_view_write,
             commands::csv_file_relocate,
@@ -1564,6 +1663,11 @@ pub fn run() {
             commands::knowledge_reveal_target,
             commands::knowledge_document_source,
             commands::resolve_markdown_image,
+            commands::markdown_import_image,
+            commands::markdown_relative_path,
+            commands::markdown_rewrite_image_links,
+            commands::markdown_recovery_read,
+            commands::markdown_recovery_write,
             commands::preview_workspace_file,
             commands::list_app_rules,
             commands::read_app_rule,
@@ -1579,12 +1683,29 @@ pub fn run() {
             commands::save_last_effort,
             commands::get_agent_model_preferences,
             commands::save_agent_model_preference,
+            commands::get_workspace_selection,
+            commands::save_workspace_selection,
             commands::get_codex_fast_mode,
             commands::save_codex_fast_mode,
             commands::get_model_defaults,
             commands::save_model_defaults,
             commands::get_codex_model_config,
             commands::get_codex_available_models,
+            commands::get_claude_code_models,
+            commands::get_claude_connection,
+            commands::get_claude_session_connection,
+            commands::prewarm_claude_session,
+            commands::connect_claude_session,
+            commands::set_claude_prewarm,
+            commands::get_claude_native_archive,
+            commands::check_claude_session_transfer,
+            commands::backup_claude_native_session,
+            commands::restore_claude_native_session,
+            commands::set_claude_permission_mode,
+            commands::set_claude_runtime_settings,
+            commands::inspect_claude_ssh,
+            commands::authorize_claude_ssh,
+            commands::use_local_claude,
             commands::save_codex_model_config,
             commands::test_custom_endpoint,
             commands::get_custom_providers,
@@ -1647,8 +1768,12 @@ pub fn run() {
             commands::set_anthropic_native_lazy_enabled,
             commands::get_async_tasks_enabled,
             commands::set_async_tasks_enabled,
+            commands::list_background_tasks,
+            commands::cancel_background_task,
             commands::get_unity_multi_agent_editor_enabled,
             commands::set_unity_multi_agent_editor_enabled,
+            commands::get_claude_code_cli_enabled,
+            commands::set_claude_code_cli_enabled,
             commands::get_unity_background_hook_enabled,
             commands::set_unity_background_hook_enabled,
             commands::get_unity_background_hook_status,
@@ -1700,6 +1825,12 @@ pub fn run() {
             commands::append_frontend_logs,
             commands::reveal_log_file,
             commands::unity_embed_status,
+            unity_embed_webview::unity_native_embed_snapshot,
+            unity_embed_webview::unity_native_embed_focus,
+            unity_embed_webview::unity_native_embed_attach,
+            unity_embed_webview::unity_native_embed_release,
+            unity_embed_webview::unity_native_embed_ready,
+            unity_embed_webview::unity_native_embed_failed,
             commands::get_unity_embed_enabled,
             commands::set_unity_embed_enabled,
             commands::unity_embed_open_frontend_window,
@@ -1708,6 +1839,7 @@ pub fn run() {
             commands::unity_embed_set_drag_passthrough,
             commands::unity_embed_focus_debug_snapshot,
             shared_workbench_window::start_shared_workbench_drag_tracking,
+            shared_workbench_window::prepare_shared_workbench_window,
             shared_workbench_window::stop_shared_workbench_drag_tracking,
             commands::unity_embed_commit_asset_drop,
             commands::unity_embed_start_asset_drag,
@@ -1722,6 +1854,7 @@ pub fn run() {
             commands::view_create_folder,
             commands::view_delete_entry,
             commands::view_rename_entry,
+            commands::view_update_metadata,
             commands::view_move_entry,
             commands::view_export_package,
             commands::view_import_package,
@@ -1735,6 +1868,12 @@ pub fn run() {
             commands::view_run_in_unity,
             commands::view_set_tab_host,
             commands::sub_window_open,
+            workspace_window::open_workspace_window,
+            work_state::load_desktop_work_state,
+            work_state::save_window_work_state,
+            work_state::show_work_state_window,
+            work_state::finish_work_state_migration,
+            work_state::acknowledge_work_state_save,
             commands::sub_window_pool_prepare,
             commands::sub_window_pool_ready,
             commands::sub_window_claimed_query,
@@ -1747,6 +1886,8 @@ pub fn run() {
             commands::view_storage_set,
             commands::view_storage_remove,
             commands::view_fs_read_file,
+            commands::view_document_read,
+            commands::view_document_write,
             commands::view_fs_write_file,
             commands::view_fs_append_file,
             commands::view_fs_mkdir,
@@ -1761,6 +1902,11 @@ pub fn run() {
             commands::view_automation_respond,
             commands::fetch_app_update_manifest,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                crate::llm::claude_code_cli::tui::close_all();
+            }
+        });
 }

@@ -2580,12 +2580,12 @@ fn configure_skill_process_env(
     package_id: &str,
     ctx: &ToolExecutionContext,
     python: Option<&crate::python_runtime::ResolvedPythonRuntime>,
-) {
+) -> Result<(), String> {
+    let working_dir = ctx.resolve_path(".")?;
+    cmd.current_dir(&working_dir);
     cmd.env("LOCUS_SKILL_PACKAGE_ROOT", package_root);
     cmd.env("LOCUS_SKILL_PACKAGE_ID", package_id);
-    if let Some(working_dir) = ctx.working_dir.as_ref() {
-        cmd.env("LOCUS_WORKING_DIR", working_dir);
-    }
+    cmd.env("LOCUS_WORKING_DIR", &working_dir);
     cmd.env("PYTHONIOENCODING", "utf-8");
     cmd.env("PYTHONUTF8", "1");
     for (key, value) in crate::python_runtime::locus_sdk_invocation_env() {
@@ -2623,6 +2623,7 @@ fn configure_skill_process_env(
     if let Some(path) = path {
         cmd.env("PATH", path);
     }
+    Ok(())
 }
 
 fn apply_skill_tool_input_args(
@@ -2799,10 +2800,8 @@ async fn run_skill_package_python_tool(
 
     let program = python.path.to_string_lossy().to_string();
     let mut cmd = async_command(&program);
-    cmd.arg(&script_path)
-        .args(&tool.args)
-        .current_dir(package_root);
-    configure_skill_process_env(&mut cmd, package_root, package_id, ctx, Some(&python));
+    cmd.arg(&script_path).args(&tool.args);
+    configure_skill_process_env(&mut cmd, package_root, package_id, ctx, Some(&python))?;
     let stdin_payload = apply_skill_tool_input_args(&mut cmd, tool, args)?;
     run_skill_process(
         cmd,
@@ -2839,8 +2838,8 @@ async fn run_skill_package_cli_tool(
     }
 
     let mut cmd = async_command(&program);
-    cmd.args(&tool.args).current_dir(package_root);
-    configure_skill_process_env(&mut cmd, package_root, package_id, ctx, python.as_ref());
+    cmd.args(&tool.args);
+    configure_skill_process_env(&mut cmd, package_root, package_id, ctx, python.as_ref())?;
     let stdin_payload = apply_skill_tool_input_args(&mut cmd, tool, args)?;
     run_skill_process(
         cmd,
@@ -2912,13 +2911,13 @@ async fn run_skill_package_bash_tool(
     }
 
     let mut cmd = async_command("sh");
-    cmd.arg("-c").arg(command).current_dir(package_root);
+    cmd.arg("-c").arg(command);
     if stdin_payload.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
         cmd.stdin(Stdio::null());
     }
-    configure_skill_process_env(&mut cmd, package_root, package_id, ctx, python.as_ref());
+    configure_skill_process_env(&mut cmd, package_root, package_id, ctx, python.as_ref())?;
     run_skill_process(
         cmd,
         stdin_payload,
@@ -3384,7 +3383,8 @@ fn package_to_document(
         .map(|path| package_file_modified_at(path, record.updated_at))
         .unwrap_or(record.updated_at);
     Ok(KnowledgeDocument {
-        inject_agents: crate::knowledge_store::default_inject_agents(),
+        properties_yaml: String::new(),
+        inject_agents: crate::knowledge_store::legacy_inject_agents(),
         id: package_document_id(&manifest.id, doc_rel_path),
         doc_type: KnowledgeType::Skill,
         path: package_document_virtual_path(manifest, doc_rel_path),
@@ -4348,7 +4348,7 @@ fn package_to_list_item(
         .map(|path| package_file_modified_at(path, record.updated_at))
         .unwrap_or(record.updated_at);
     knowledge_store::KnowledgeListItem {
-        inject_agents: crate::knowledge_store::default_inject_agents(),
+        inject_agents: crate::knowledge_store::legacy_inject_agents(),
         id: package_document_id(&manifest.id, doc_rel_path),
         doc_type: KnowledgeType::Skill,
         path: package_document_virtual_path(manifest, doc_rel_path),
@@ -5049,6 +5049,7 @@ pub fn create_skill_document_sync(
     };
 
     let document = knowledge_store::KnowledgeDocument {
+        properties_yaml: String::new(),
         inject_agents: crate::knowledge_store::default_inject_agents(),
         id: format!("kd_{}", uuid::Uuid::new_v4()),
         doc_type: KnowledgeType::Skill,
@@ -8056,6 +8057,32 @@ Use Feishu safely.
             )),
             Some(&"ui_audit_extract_psd_layer_tree".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_path_regression_skill_process_uses_workspace_not_package_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("marker.txt"), "workspace_marker").unwrap();
+        std::fs::write(package.path().join("marker.txt"), "package_marker").unwrap();
+        let ctx = crate::tool::ToolExecutionContext {
+            working_dir: Some(workspace.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = crate::process_util::async_command("cmd");
+            cmd.args(["/C", "type marker.txt"]);
+            cmd
+        } else {
+            let mut cmd = crate::process_util::async_command("sh");
+            cmd.args(["-c", "cat marker.txt"]);
+            cmd
+        };
+        super::configure_skill_process_env(&mut cmd, package.path(), "path-test", &ctx, None).unwrap();
+        let output = cmd.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "workspace_marker");
+        assert!(super::configure_skill_process_env(&mut cmd, package.path(), "path-test", &Default::default(), None).is_err());
     }
 
     #[test]

@@ -4,18 +4,14 @@ use crate::eol::{apply_line_ending, normalize_lf, resolve_preferred_line_ending}
 use tauri::Manager;
 use tokio::io::AsyncWriteExt;
 
-pub(super) fn resolve_context_path(ctx: &crate::tool::ToolExecutionContext, requested: &str) -> String {
-    let requested_path = std::path::Path::new(requested);
-    if requested_path.is_absolute() {
-        return requested.to_string();
-    }
-    let root = ctx
-        .execution
-        .as_ref()
-        .map(|execution| execution.root())
-        .or_else(|| ctx.working_dir.as_deref().map(std::path::Path::new));
-    root.map(|root| root.join(requested_path).to_string_lossy().to_string())
-        .unwrap_or_else(|| requested.to_string())
+pub(super) fn resolve_context_path(
+    ctx: &crate::tool::ToolExecutionContext,
+    requested: &str,
+) -> Result<String, ToolResult> {
+    ctx.resolve_path(requested).map_err(|output| ToolResult {
+        output,
+        is_error: true,
+    })
 }
 
 pub(super) fn knowledge_registry_for_context(
@@ -291,7 +287,10 @@ pub(super) fn read() -> ToolDef {
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-                    Some(p) => resolve_context_path(&ctx, p),
+                    Some(p) => match resolve_context_path(&ctx, p) {
+                        Ok(path) => path,
+                        Err(result) => return result,
+                    },
                     None => {
                         return ToolResult {
                             output: "Missing required parameter: filePath".to_string(),
@@ -672,7 +671,10 @@ pub(super) fn write() -> ToolDef {
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-                    Some(p) => resolve_context_path(&ctx, p),
+                    Some(p) => match resolve_context_path(&ctx, p) {
+                        Ok(path) => path,
+                        Err(result) => return result,
+                    },
                     None => {
                         return ToolResult {
                             output: "Missing required parameter: filePath".to_string(),
@@ -909,7 +911,10 @@ pub(super) fn edit() -> ToolDef {
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-                    Some(p) => resolve_context_path(&ctx, p),
+                    Some(p) => match resolve_context_path(&ctx, p) {
+                        Ok(path) => path,
+                        Err(result) => return result,
+                    },
                     None => {
                         return ToolResult {
                             output: "Missing required parameter: filePath".to_string(),
@@ -1427,7 +1432,10 @@ pub(super) fn list() -> ToolDef {
                     .filter(|v| !v.is_empty())
                     .map(|v| v.to_string());
                 let root_path = match root_path {
-                    Some(path) => resolve_context_path(&ctx, &path),
+                    Some(path) => match resolve_context_path(&ctx, &path) {
+                        Ok(path) => path,
+                        Err(result) => return result,
+                    },
                     None => {
                         return ToolResult {
                             output: "Missing required parameter: path".to_string(),

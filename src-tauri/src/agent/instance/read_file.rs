@@ -22,6 +22,17 @@ impl AgentInstance {
                 });
             }
         };
+        let tool_context = self
+            .build_tool_execution_context(app_handle, "read", args)
+            .await;
+        let resolved_path = match tool_context.resolve_path(file_path) {
+            Ok(path) => path,
+            Err(output) => return ExecutedToolResult::from_tool_result(ToolResult {
+                output,
+                is_error: true,
+            }),
+        };
+        let file_path = resolved_path.as_str();
 
         let outline = match args.get("outline") {
             None => false,
@@ -54,9 +65,6 @@ impl AgentInstance {
         }
 
         if !is_image {
-            let tool_context = self
-                .build_tool_execution_context(app_handle, "read", args)
-                .await;
             let mut result = self
                 .await_tool_result(Box::pin(self.tool_registry.execute_with_context(
                     "read",
@@ -78,9 +86,6 @@ impl AgentInstance {
         let metadata = match tokio::fs::metadata(file_path).await {
             Ok(metadata) => metadata,
             Err(_) => {
-                let tool_context = self
-                    .build_tool_execution_context(app_handle, "read", args)
-                    .await;
                 return self
                     .await_tool_result(Box::pin(self.tool_registry.execute_with_context(
                         "read",
@@ -92,9 +97,6 @@ impl AgentInstance {
         };
 
         if metadata.is_dir() {
-            let tool_context = self
-                .build_tool_execution_context(app_handle, "read", args)
-                .await;
             return self
                 .await_tool_result(Box::pin(self.tool_registry.execute_with_context(
                     "read",
@@ -140,7 +142,7 @@ impl AgentInstance {
         };
 
         use base64::Engine as _;
-        let image = ImageData {
+        let image = ImageData { capture: None,
             data: base64::engine::general_purpose::STANDARD.encode(&image_bytes),
             mime_type: mime_type.to_string(),
         };

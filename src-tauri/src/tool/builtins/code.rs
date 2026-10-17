@@ -6,13 +6,15 @@
 use super::{make_exec, ToolDef, ToolResult};
 
 pub(super) fn require_workspace(ctx: &super::ToolExecutionContext) -> Result<String, ToolResult> {
-    match ctx.working_dir.as_deref().map(str::trim) {
-        Some(dir) if !dir.is_empty() => Ok(dir.to_string()),
-        _ => Err(ToolResult {
-            output: "This tool requires a selected workspace directory.".to_string(),
-            is_error: true,
-        }),
-    }
+    super::filesystem::resolve_context_path(ctx, ".")
+}
+
+pub(super) fn file_path_arg(
+    args: &serde_json::Value,
+    ctx: &super::ToolExecutionContext,
+) -> Result<String, ToolResult> {
+    let path = string_arg(args, "file_path")?;
+    super::filesystem::resolve_context_path(ctx, &path)
 }
 
 pub(super) fn string_arg(args: &serde_json::Value, key: &str) -> Result<String, ToolResult> {
@@ -92,7 +94,7 @@ pub(super) fn code_find_references() -> ToolDef {
                     Ok(dir) => dir,
                     Err(result) => return result,
                 };
-                let file_path = match string_arg(&args, "file_path") {
+                let file_path = match file_path_arg(&args, &ctx) {
                     Ok(value) => value,
                     Err(result) => return result,
                 };
@@ -178,7 +180,7 @@ pub(super) fn code_goto_definition() -> ToolDef {
                     Ok(dir) => dir,
                     Err(result) => return result,
                 };
-                let file_path = match string_arg(&args, "file_path") {
+                let file_path = match file_path_arg(&args, &ctx) {
                     Ok(value) => value,
                     Err(result) => return result,
                 };
@@ -402,7 +404,12 @@ pub(super) fn code_diagnostics() -> ToolDef {
                     .and_then(|v| v.as_str())
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
-                    .map(str::to_string);
+                    .map(|path| super::filesystem::resolve_context_path(&ctx, path))
+                    .transpose();
+                let file_path = match file_path {
+                    Ok(path) => path,
+                    Err(result) => return result,
+                };
                 let scope = match args
                     .get("scope")
                     .and_then(|v| v.as_str())
@@ -516,7 +523,7 @@ pub(super) fn code_hover() -> ToolDef {
                     Ok(dir) => dir,
                     Err(result) => return result,
                 };
-                let file_path = match string_arg(&args, "file_path") {
+                let file_path = match file_path_arg(&args, &ctx) {
                     Ok(value) => value,
                     Err(result) => return result,
                 };

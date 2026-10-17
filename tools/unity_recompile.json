@@ -5,7 +5,7 @@
     "properties": {
       "project_path": {
         "type": "string",
-        "description": "Absolute path to the Unity project root. Required."
+        "description": "Unity project root. Required. Absolute or relative to the current workspace working directory; '.' uses that workspace."
       },
       "editor_status": {
         "type": "string",

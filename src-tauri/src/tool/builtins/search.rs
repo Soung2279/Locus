@@ -45,7 +45,7 @@ pub(super) fn grep() -> ToolDef {
                     &pattern,
                     &search_path,
                     include.as_deref(),
-                    ctx.working_dir.as_deref(),
+                    ctx.working_root().and_then(std::path::Path::to_str),
                 )) {
                     Ok(output) => ToolResult {
                         output,
@@ -67,6 +67,32 @@ mod tests {
     use crate::tool::ToolExecutionContext;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn workspace_path_regression_grep_searches_relative_roots_and_files() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("nested/hit.txt"), "workspace_only_marker").unwrap();
+        let context = ToolExecutionContext {
+            working_dir: Some(root.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        for path in [".", "./", "nested", "./nested/hit.txt", "nested/../nested"] {
+            let result = (grep().execute)(json!({
+                "path": path, "pattern": "workspace_only_marker", "include": "*.txt"
+            }), context.clone()).await;
+            assert!(!result.is_error, "{path}: {}", result.output);
+            assert!(result.output.contains("nested/hit.txt:"), "{path}: {}", result.output);
+            assert!(result.output.contains("workspace_only_marker"));
+        }
+        let external = tempdir().unwrap();
+        std::fs::write(external.path().join("outside.txt"), "external_marker").unwrap();
+        let result = (grep().execute)(json!({
+            "path": external.path(), "pattern": "external_marker"
+        }), context).await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains(&external.path().to_string_lossy().replace('\\', "/")), "{}", result.output);
+    }
 
     #[test]
     fn grep_skips_generated_root_directories_by_default() {

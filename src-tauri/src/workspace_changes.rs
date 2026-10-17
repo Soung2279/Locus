@@ -548,14 +548,13 @@ pub fn acknowledge_unity_sync(project_root: &Path, snapshot: &UnitySyncSnapshot)
 
 pub fn normalize_workspace_relative_path(path: &str) -> Option<String> {
     let normalized = path.trim().replace('\\', "/");
-    let normalized = normalized.trim_start_matches("./").trim_matches('/');
+    if normalized.starts_with('/') || normalized.contains(':') || normalized.contains('\0') {
+        return None;
+    }
+    let normalized = normalized.trim_start_matches("./").trim_end_matches('/');
     if normalized.is_empty()
-        || normalized.contains("/../")
-        || normalized.starts_with("../")
-        || normalized.ends_with("/..")
-        || (!normalized.starts_with("Assets/")
-            && !normalized.starts_with("Packages/")
-            && !normalized.starts_with("Locus/knowledge/"))
+        || normalized.starts_with('/')
+        || normalized.split('/').any(|part| part == "..")
     {
         return None;
     }
@@ -564,7 +563,7 @@ pub fn normalize_workspace_relative_path(path: &str) -> Option<String> {
 
 pub fn is_unity_compile_input(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
-    if normalized.starts_with("Locus/knowledge/") {
+    if !normalized.starts_with("Assets/") && !normalized.starts_with("Packages/") {
         return false;
     }
     if is_package_control_path(&normalized) || normalized.ends_with(".meta") {
@@ -636,6 +635,21 @@ fn workspace_key(project_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn general_file_changes_are_observable_without_entering_the_unity_compile_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let hub = healthy_hub(temp.path());
+        for path in ["README.md", "docs/new.md", "src/Program.cs", "nested", "."] {
+            assert_eq!(hub.observe(path, WorkspaceChangeKind::Upsert, WorkspaceChangeSource::OsWatcher).unwrap().path, path);
+        }
+        assert_eq!(hub.status().pending_count, 0);
+        assert_eq!(hub.status().next_seq, 5);
+        assert!(is_unity_compile_input("Assets/Program.cs"));
+        for path in ["../outside.md", "docs/../../outside.md", "/absolute.md", "C:\\outside.md", ".."] {
+            assert!(normalize_workspace_relative_path(path).is_none(), "{path}");
+        }
+    }
 
     fn healthy_hub(root: &Path) -> Arc<WorkspaceChangeHub> {
         let hub = hub_for_workspace(root);

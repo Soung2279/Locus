@@ -5,7 +5,7 @@
     "properties": {
       "path": {
         "type": "string",
-        "description": "Root directory to list. Required. Pass an absolute path or a path relative to the selected project root."
+        "description": "Root directory to list. Required. Absolute or relative to the current workspace working directory; '.' lists that workspace."
       },
       "depth": {
         "type": "integer",

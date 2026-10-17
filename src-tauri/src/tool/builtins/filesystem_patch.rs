@@ -185,7 +185,7 @@ async fn prepare(
     let mut prepared = Vec::new();
     for file in files {
         for (raw, _) in file.targets() {
-            let path = filesystem::resolve_context_path(ctx, raw);
+            let path = ctx.resolve_path(raw)?;
             if !targets.insert(path_key(&path)?) {
                 return Err(format!("Multiple operations target {path}"));
             }
@@ -198,7 +198,7 @@ async fn prepare(
                 ));
             }
         }
-        let path = filesystem::resolve_context_path(ctx, &file.path);
+        let path = ctx.resolve_path(&file.path)?;
         let original = if matches!(file.change, Change::Add(_)) {
             if tokio::fs::try_exists(&path)
                 .await
@@ -222,7 +222,7 @@ async fn prepare(
                 let content = update_content(original.as_deref().unwrap(), &chunks)
                     .map_err(|error| format!("{path}: {error}"))?;
                 if let Some(destination) = move_to {
-                    let destination = filesystem::resolve_context_path(ctx, &destination);
+                    let destination = ctx.resolve_path(&destination)?;
                     if tokio::fs::try_exists(&destination)
                         .await
                         .map_err(|error| error.to_string())?

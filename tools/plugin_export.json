@@ -18,7 +18,7 @@
       },
       "filePath": {
         "type": "string",
-        "description": "Absolute or workspace-resolved .zip output path approved by the user."
+        "description": ".zip output path approved by the user, absolute or relative to the current workspace working directory."
       },
       "skillPackageIds": {
         "type": "array",

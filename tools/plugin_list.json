@@ -6,7 +6,7 @@
     "properties": {
       "workingDir": {
         "type": ["string", "null"],
-        "description": "Optional workspace path override. Omit to use the current agent workspace."
+        "description": "Optional workspace path override, absolute or relative to the current workspace working directory. Omit to use the current agent workspace."
       }
     }
   }

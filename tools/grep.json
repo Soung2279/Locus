@@ -9,7 +9,7 @@
       },
       "path": {
         "type": "string",
-        "description": "The directory to search in. Required."
+        "description": "File or directory to search. Required. Absolute or relative to the current workspace working directory; '.' searches that workspace."
       },
       "include": {
         "type": "string",

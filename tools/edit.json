@@ -6,7 +6,7 @@
     "properties": {
       "filePath": {
         "type": "string",
-        "description": "Absolute or relative path to the file to modify"
+        "description": "Absolute path or path relative to the current workspace working directory."
       },
       "edits": {
         "type": "array",

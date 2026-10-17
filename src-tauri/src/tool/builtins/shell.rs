@@ -243,14 +243,18 @@ pub(super) fn bash() -> ToolDef {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-                if workdir.is_none() {
-                    return ToolResult {
+                let workdir = match workdir {
+                    Some(dir) => match super::filesystem::resolve_context_path(&ctx, &dir) {
+                        Ok(path) => path,
+                        Err(result) => return result,
+                    },
+                    None => return ToolResult {
                         output: "Missing required parameter: workdir".to_string(),
                         is_error: true,
-                    };
-                }
+                    },
+                };
                 let process_owner = ctx.process_owner.clone().unwrap_or_else(|| ProcessOwner {
-                    working_dir: workdir.clone(),
+                    working_dir: Some(workdir.clone()),
                     ..Default::default()
                 });
 
@@ -290,7 +294,7 @@ pub(super) fn bash() -> ToolDef {
                     let run = run_interactive_command(
                         &command,
                         &interactive_sh_command,
-                        workdir.as_deref().unwrap_or_default(),
+                        &workdir,
                         &envs,
                         (!background).then_some(timeout_ms),
                         process_owner,
@@ -333,9 +337,7 @@ pub(super) fn bash() -> ToolDef {
                     cmd.env(key, value);
                 }
 
-                if let Some(ref dir) = workdir {
-                    cmd.current_dir(dir);
-                }
+                cmd.current_dir(&workdir);
 
                 if let Some(report) = progress.as_ref() {
                     report(format!("Command running: {}", command));
@@ -1029,6 +1031,29 @@ fn build_interactive_cmd_script(command: &str, workdir: &str, marker_path: &Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn workspace_path_regression_bash_runs_in_relative_workdir() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested folder");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.path().join("marker.txt"), "root_marker").unwrap();
+        std::fs::write(nested.join("marker.txt"), "nested_marker").unwrap();
+        let command = match detect_shell() {
+            ShellKind::Sh => "cat marker.txt",
+            ShellKind::Cmd => "type marker.txt",
+        };
+        for (workdir, marker) in [(".", "root_marker"), ("nested folder", "nested_marker")] {
+            let result = (bash().execute)(serde_json::json!({
+                "workdir":workdir, "command":command, "readonly":true, "timeout":10000
+            }), crate::tool::ToolExecutionContext {
+                working_dir: Some(root.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            }).await;
+            assert!(!result.is_error, "{}", result.output);
+            assert!(result.output.contains(marker), "{}", result.output);
+        }
+    }
 
     #[test]
     fn powershell_runtime_prompt_prefers_detected_pwsh() {

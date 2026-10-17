@@ -149,6 +149,7 @@ tools:
    - Register a `tools[]` entry only after the parameter schema, output schema, timeout, failure modes, and reuse value are stable enough for a narrow interface, or when a permission boundary or repeatable tool-call UI is required. For exploratory parsing of external files or APIs, provide reference docs plus library examples instead.
    - Choose narrow names such as `extract-psd-layer-tree`, `validate-manifest`, or `save-prefab`. Locus exposes the tool by the underscore form of `tools[].name` (`validate_manifest`); on a name conflict with a built-in or another package tool, it prefixes the package segment (`external_layout_validate_manifest`).
    - Runtimes: `python` runs a package-relative adapter with managed or system Python — use it for deterministic adapters around known operations; `bash` runs a package-local script or trusted command through `sh`; `cli` runs a mature package-local binary or PATH command directly (official or well-maintained CLIs with stable commands); `unity` is covered in step 7. Tool input defaults to JSON on stdin (`json-stdin`; alternatives `argv-json`, `none`); output defaults to `text` (use `json-stdout` for structured results).
+   - Python, bash, and CLI tools run in the selected workspace directory. Relative input/output paths resolve there; a workspace is required. Manifest script/binary paths remain package-relative. Access bundled resources through `LOCUS_SKILL_PACKAGE_ROOT` (or the script's own directory), and use `LOCUS_WORKING_DIR` for workspace files.
    - Minimal stable adapter example:
 
 ```json

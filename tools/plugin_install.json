@@ -24,7 +24,7 @@
       "source": {
         "type": ["object", "null"],
         "additionalProperties": false,
-        "description": "Advanced source object matching PluginDownloadSource. Use when path, url, or repo shortcut fields are insufficient.",
+        "description": "Advanced source object matching PluginDownloadSource. Local paths are absolute or relative to the current workspace working directory. Use when path, url, or repo shortcut fields are insufficient.",
         "properties": {
           "type": {
             "type": "string",
@@ -47,7 +47,7 @@
       },
       "path": {
         "type": ["string", "null"],
-        "description": "Local plugin directory or .zip archive path."
+        "description": "Local plugin directory or .zip archive path, absolute or relative to the current workspace working directory."
       },
       "url": {
         "type": ["string", "null"],

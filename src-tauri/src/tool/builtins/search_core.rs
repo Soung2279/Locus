@@ -1,7 +1,7 @@
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use std::collections::BinaryHeap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
@@ -100,11 +100,15 @@ impl Sink for FileSink {
 }
 
 pub(crate) fn run_grep(config: GrepConfig<'_>) -> Result<String, String> {
+    let search_root_path = crate::tool::path::resolve_workspace_path(
+        config.working_dir.map(Path::new),
+        config.search_path,
+    )?;
     let matcher = RegexMatcher::new(config.pattern)
         .map(Arc::new)
         .map_err(|error| format!("Invalid regex pattern '{}': {}", config.pattern, error))?;
 
-    let mut builder = ignore::WalkBuilder::new(config.search_path);
+    let mut builder = ignore::WalkBuilder::new(&search_root_path);
     builder
         .hidden(true)
         .git_ignore(true)
@@ -113,7 +117,7 @@ pub(crate) fn run_grep(config: GrepConfig<'_>) -> Result<String, String> {
         .follow_links(false)
         .threads(config.threads);
 
-    let mut overrides = ignore::overrides::OverrideBuilder::new(config.search_path);
+    let mut overrides = ignore::overrides::OverrideBuilder::new(&search_root_path);
     if let Some(include) = config.include {
         for pattern in glob_pattern_to_simple(include) {
             let _ = overrides.add(&pattern);
@@ -133,10 +137,9 @@ pub(crate) fn run_grep(config: GrepConfig<'_>) -> Result<String, String> {
         .working_dir
         .and_then(|working_dir| dunce::canonicalize(Path::new(working_dir)).ok())
         .unwrap_or_else(|| {
-            dunce::canonicalize(Path::new(config.search_path))
-                .unwrap_or_else(|_| PathBuf::from(config.search_path))
+            dunce::canonicalize(&search_root_path)
+                .unwrap_or_else(|_| search_root_path.clone())
         });
-    let search_root_path = PathBuf::from(config.search_path);
     // Lexical stripping preserves the old canonicalized output only when the
     // supplied root is already canonical. Relative roots, `..`, symlinks and
     // case aliases keep the canonicalize fallback.

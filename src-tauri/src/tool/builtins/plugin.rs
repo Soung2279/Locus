@@ -437,10 +437,45 @@ fn format_plugin_export_output(value: &crate::commands::PluginExportResult) -> S
 fn context_working_dir(
     ctx: &crate::tool::ToolExecutionContext,
     override_value: Option<String>,
-) -> String {
-    override_value
-        .or_else(|| ctx.working_dir.clone())
-        .unwrap_or_default()
+) -> Result<String, String> {
+    match override_value.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(path) => ctx.resolve_path(path),
+        None if ctx.working_root().is_some() => ctx.resolve_path("."),
+        None => Ok(String::new()), // App plugins can be listed without a workspace.
+    }
+}
+
+fn resolve_install_source_path(
+    ctx: &crate::tool::ToolExecutionContext,
+    mut source: crate::commands::PluginDownloadSource,
+) -> Result<crate::commands::PluginDownloadSource, String> {
+    let kind = source.kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "local" | "auto" | "") {
+        return Ok(source);
+    }
+    let input = [&source.input, &source.url, &source.repo]
+        .into_iter()
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+        .unwrap_or_default();
+    if kind != "local" && (input.contains("://") || input.starts_with("git@")) {
+        return Ok(source);
+    }
+    let resolved = ctx.resolve_path(input);
+    let explicit_path = kind == "local"
+        || input.starts_with('.')
+        || input.contains('\\')
+        || std::path::Path::new(input).has_root()
+        || input.to_ascii_lowercase().ends_with(".zip");
+    if explicit_path || resolved.as_ref().is_ok_and(|path| std::path::Path::new(path).exists()) {
+        source.input = resolved?;
+        source.kind = "local".to_string();
+    } else {
+        // Auto owner/repo inputs remain repositories. Do not let the downstream
+        // auto detector probe a same-named directory in Locus's process cwd.
+        source.kind = "repo".to_string();
+    }
+    Ok(source)
 }
 
 fn plugin_summary_matches(summary: &crate::commands::PluginRegistrySummary, query: &str) -> bool {
@@ -807,7 +842,10 @@ pub(super) fn plugin_list() -> ToolDef {
                         ));
                     }
                 };
-                let working_dir = context_working_dir(&ctx, parsed.working_dir);
+                let working_dir = match context_working_dir(&ctx, parsed.working_dir) {
+                    Ok(path) => path,
+                    Err(error) => return tool_error(error),
+                };
                 let plugins = crate::plugin::list_installed_plugin_summaries(&working_dir);
                 let value = PluginListToolOutput {
                     working_dir,
@@ -1030,6 +1068,10 @@ pub(super) fn plugin_install() -> ToolDef {
                             installed,
                         )
                     } else if let Some(source) = source {
+                        let source = match resolve_install_source_path(&ctx, source) {
+                            Ok(source) => source,
+                            Err(error) => return tool_error(error),
+                        };
                         let installed = match crate::commands::install_plugin_from_download_source(
                             &working_dir,
                             source,
@@ -1262,7 +1304,10 @@ pub(super) fn plugin_export() -> ToolDef {
                     id: parsed.id,
                     name: parsed.name,
                     version: parsed.version,
-                    file_path: parsed.file_path,
+                    file_path: match ctx.resolve_path(&parsed.file_path) {
+                        Ok(path) => path,
+                        Err(error) => return tool_error(error),
+                    },
                     skill_package_ids: parsed.skill_package_ids,
                     view_ids: parsed.view_ids,
                     rule_files: parsed.rule_files,
@@ -1318,6 +1363,65 @@ pub(super) fn plugin_export() -> ToolDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_path_regression_plugin_sources_and_workspace_override() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("plugin.zip"), "fixture").unwrap();
+        let ctx = crate::tool::ToolExecutionContext {
+            working_dir: Some(root.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        for args in [
+            serde_json::json!({"path":"plugin.zip"}),
+            serde_json::json!({"source":{"type":"local", "input":"plugin.zip"}}),
+            serde_json::json!({"source":{"type":"auto", "input":"plugin.zip"}}),
+        ] {
+            let parsed = serde_json::from_value(args).unwrap();
+            let source = resolve_install_source_path(&ctx, source_from_install_args(&parsed).unwrap()).unwrap();
+            assert_eq!(source.kind, "local");
+            assert_eq!(std::path::Path::new(&source.input), root.path().join("plugin.zip"));
+        }
+        for input in ["https://github.com/owner/plugin", "https://example.com/plugin.zip", "git@example.com:owner/plugin"] {
+            let source = resolve_install_source_path(&ctx, crate::commands::PluginDownloadSource {
+                kind: "auto".into(), input: input.into(), ..Default::default()
+            }).unwrap();
+            assert_eq!(source.input, input);
+            assert_eq!(source.kind, "auto");
+        }
+        let remote = resolve_install_source_path(&ctx, crate::commands::PluginDownloadSource {
+            kind: "auto".into(), input: "owner/plugin".into(), ..Default::default()
+        }).unwrap();
+        assert_eq!(remote.kind, "repo");
+        let override_dir = context_working_dir(&ctx, Some("nested".into())).unwrap();
+        assert_eq!(std::path::Path::new(&override_dir), root.path().join("nested"));
+        assert!(context_working_dir(&Default::default(), None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_path_regression_plugin_export_writes_into_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = crate::workspace_service::identity::ProjectIdResolver::resolve(root.path()).unwrap();
+        let runtime = crate::workspace_service::WorkspaceRuntime::new(identity, Vec::new(), 1);
+        let ctx = crate::tool::ToolExecutionContext {
+            execution: Some(std::sync::Arc::new(crate::workspace_service::AgentExecutionContext::new(
+                runtime, std::collections::HashMap::new(),
+            ))),
+            working_dir: Some(root.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let result = (plugin_export().execute)(serde_json::json!({
+            "id":"path-test", "name":"Path Test", "version":"0.1.0",
+            "filePath":"exports/path-test.zip",
+            "ruleFiles":[{"fileName":"test", "content":"# Test\n\nWorkspace rule."}],
+            "installAfterExport":false, "transferOwnership":false,
+            "auditSummary":"Test fixture with one standalone rule file.",
+            "structurePlan":"Package one rule under rules/test.md.",
+            "userApproval":"Test fixture export into an isolated temporary workspace."
+        }), ctx).await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(root.path().join("exports/path-test.zip").is_file());
+    }
     use crate::tool::{ToolExecutionContext, ToolRegistry};
 
     fn installed_plugin_summary() -> crate::plugin::InstalledPluginSummary {

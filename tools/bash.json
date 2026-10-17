@@ -25,7 +25,7 @@
       },
       "workdir": {
         "type": "string",
-        "description": "Working directory to run the command in. Required."
+        "description": "Working directory to run the command in. Required. Absolute or relative to the current workspace working directory; '.' uses that workspace."
       }
     },
     "required": ["command", "description", "readonly", "workdir"]

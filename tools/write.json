@@ -5,7 +5,7 @@
     "properties": {
       "filePath": {
         "type": "string",
-        "description": "Absolute or relative path to the file to write"
+        "description": "Absolute path or path relative to the current workspace working directory."
       },
       "content": {
         "type": "string",

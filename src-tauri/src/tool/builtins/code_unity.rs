@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::code::string_arg;
+use super::code::file_path_arg;
 use super::{make_exec, ToolDef, ToolResult};
 use crate::asset_db::types::{guid_to_hex, AssetKind, Guid};
 use crate::unity_project_config::{load_tag_manager, BUILTIN_TAGS};
@@ -71,7 +71,7 @@ pub(super) fn unity_code_usages() -> ToolDef {
                     );
                 };
                 let workspace = execution.root().to_string_lossy().to_string();
-                let file_path = match string_arg(&args, "file_path") {
+                let file_path = match file_path_arg(&args, &ctx) {
                     Ok(value) => value,
                     Err(result) => return result,
                 };

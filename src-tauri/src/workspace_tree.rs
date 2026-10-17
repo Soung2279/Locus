@@ -364,11 +364,17 @@ pub fn relocate_file_references(
         let value = path.to_string_lossy().replace('\\', "/");
         if cfg!(windows) { value.to_lowercase() } else { value }
     }
+    fn suffix_within(path: &Path, base: &Path) -> Option<PathBuf> {
+        let mut components = path.components();
+        for parent in base.components() {
+            if key(Path::new(components.next()?.as_os_str())) != key(Path::new(parent.as_os_str())) { return None; }
+        }
+        Some(components.collect())
+    }
     let lock = layout_lock(root)?;
     let _guard = lock.lock().map_err(|error| error.to_string())?;
     let index = ensure_layout(root, project_id)?;
     let originals = load_presets(root, project_id, &index)?;
-    let source_key = key(source);
     let mut updates = Vec::new();
     for original in &originals {
         let mut preset = original.clone();
@@ -376,23 +382,27 @@ pub fn relocate_file_references(
         let mut changed = false;
         for node in &mut preset.nodes {
             let Some(path) = node.source_path.clone() else { continue };
-            if key(Path::new(&path)) == source_key {
+            if let Some(suffix) = suffix_within(Path::new(&path), source) {
                 changed = true;
                 if let Some(target) = target {
-                    node.source_path = Some(target.to_string_lossy().into_owned());
-                    node.folder_name = target.file_name().map(|name| name.to_string_lossy().into_owned());
+                    let next_path = if suffix.as_os_str().is_empty() { target.to_path_buf() } else { target.join(suffix) };
+                    node.source_path = Some(next_path.to_string_lossy().into_owned());
+                    node.folder_name = next_path.file_name().map(|name| name.to_string_lossy().into_owned());
                 } else {
                     removed.insert(node.node_id.clone());
                 }
             } else {
                 for state in preset.item_states.iter_mut().filter(|state| state.node_id == node.node_id) {
                     let Some(relative) = &state.relative_path else { continue };
-                    if key(&Path::new(&path).join(relative)) != source_key { continue; }
+                    let Some(suffix) = suffix_within(&Path::new(&path).join(relative), source) else { continue; };
                     changed = true;
                     if let Some(target) = target {
-                        // Rename stays in the same directory, so the mount root is unchanged.
-                        state.relative_path = Some(Path::new(relative).with_file_name(target.file_name().unwrap())
-                            .to_string_lossy().replace('\\', "/"));
+                        if let Some(relative) = suffix_within(&target.join(suffix), Path::new(&path)) {
+                            state.relative_path = Some(relative.to_string_lossy().replace('\\', "/"));
+                        } else {
+                            state.pinned = false;
+                            state.highlighted = false;
+                        }
                     } else {
                         state.pinned = false;
                         state.highlighted = false;
@@ -2036,6 +2046,33 @@ mod tests {
         let other = switch_preset(&root, "project-a", &copy.preset_id).unwrap();
         assert!(other.item_states.is_empty());
         assert_eq!(other.nodes.len(), 1);
+    }
+
+    #[test]
+    fn moved_directories_rebase_descendant_mounts_and_pins() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let source = root.join("source");
+        let target = root.join("target/source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(source.join("nested/a.md"), "document").unwrap();
+        let initial = snapshot(&root, "project-move").unwrap();
+        apply_operations(&root, "project-move", initial.revision, "place", &[
+            ProjectExplorerOperation::MountPath { node_id: Some("file".into()), parent_node_id: None,
+                path: source.join("nested/a.md").to_string_lossy().into_owned(), source_kind: None, name: None, position: 0 },
+            ProjectExplorerOperation::MountPath { node_id: Some("directory".into()), parent_node_id: None,
+                path: root.to_string_lossy().into_owned(), source_kind: None, name: None, position: 1 },
+            ProjectExplorerOperation::SetItemState { node_id: "directory".into(), relative_path: Some("source/nested/a.md".into()),
+                pinned: Some(true), highlighted: Some(true) },
+        ]).unwrap();
+        std::fs::rename(&source, &target).unwrap();
+        let moved = relocate_file_references(&root, "project-move", &source, Some(&target)).unwrap();
+        let file = moved.nodes.iter().find(|node| node.node_id == "file").unwrap();
+        assert_eq!(Path::new(file.source_path.as_deref().unwrap()), target.join("nested").join("a.md"));
+        assert_eq!(file.folder_name.as_deref(), Some("a.md"));
+        assert_eq!(moved.item_states[0].relative_path.as_deref(), Some("target/source/nested/a.md"));
+        assert!(moved.item_states[0].pinned);
     }
 
     #[test]

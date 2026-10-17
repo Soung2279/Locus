@@ -52,7 +52,7 @@ describe("knowledge service visibility defaults", () => {
     }]);
   });
 
-  it.each([undefined, [], ["unity", "reviewer"]])("preserves injection targets when reading metadata: %j", async (injectAgents) => {
+  it.each([undefined, [], ["unity", "reviewer"], ["*"], ["team-*", "unity"]])("preserves injection targets when reading metadata: %j", async (injectAgents) => {
     mockedInvoke.mockResolvedValueOnce({
       kind: "document", path: "agents.md",
       document: { id: "kd_agents", type: "design", path: "agents.md", title: "Agents", injectMode: "full", injectAgents, body: "Body", updatedAt: 0 },

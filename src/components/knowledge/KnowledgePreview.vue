@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import type { Text } from "@codemirror/state";
+import { documentSaveStatus } from "../../document/documentSaveStatus";
 import type { EditorView } from "@codemirror/view";
-import { computed, inject, onUnmounted, ref, watch } from "vue";
+import { computed, inject, nextTick, onUnmounted, ref, watch } from "vue";
+import type { WorkbenchEditorTransferSnapshot } from "../../types/workbench";
 import { KNOWLEDGE_QUOTE_SELECTION_KEY, readKnowledgeDocumentSource } from "../../services/knowledgeSelection";
 import { knowledgeSelectionReference } from "./knowledgeSelectionReference";
 import type { MarkdownEditorSelection } from "../ui/markdown-editor/markdownEditorSelection";
@@ -37,6 +39,8 @@ import BaseDropdown from "../ui/BaseDropdown.vue";
 import KnowledgeInjectionAgents from "./KnowledgeInjectionAgents.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
+import MarkdownProperties from "../ui/MarkdownProperties.vue";
+import { KNOWLEDGE_RESERVED_PROPERTY_KEYS } from "./knowledgeProperties";
 import {
   markdownEditorTextHasContent,
   markdownEditorTextFromString,
@@ -75,6 +79,8 @@ import {
 import {
   KnowledgeEditorWorkspaceSessionStore,
   knowledgeDocumentEditorSessionKey,
+  serializeKnowledgeDocumentSession,
+  deserializeKnowledgeDocumentSession,
   type KnowledgeDocumentEditorSession,
   type KnowledgeEditorDraftValues,
   type KnowledgeSectionConflicts,
@@ -86,7 +92,7 @@ import {
 } from "../workbench/workbenchReferenceDrag";
 import { useMarkdownDocumentOutline } from "../../composables/useMarkdownDocumentOutline";
 
-const AUTO_SAVE_DELAY_MS = 700;
+import { useDocumentAutosave } from "../../composables/useDocumentAutosave";
 const notificationStore = useNotificationStore();
 const quoteInConversation = inject(KNOWLEDGE_QUOTE_SELECTION_KEY, null);
 const quotingSelection = ref(false);
@@ -118,6 +124,7 @@ const emit = defineEmits<{
   (e: "updateMeta", patch: KnowledgeDocumentPatch): void;
   (e: "referenceOpen", reference: MarkdownReferenceToken): void;
   (e: "dirtyChange", dirty: boolean): void;
+  (e: "externalChange"): void;
 }>();
 
 const summaryDraft = ref("");
@@ -131,6 +138,8 @@ const sectionTextBuffers = new Map<KnowledgeDocumentSection, Text>();
 const baseSectionTexts = new Map<KnowledgeDocumentSection, Text>();
 const fileNameDraft = ref("");
 const fileNameDirty = ref(false);
+const pendingTitleCommit = ref<string | null>(null);
+const titleCommitInFlight = ref(false);
 const dirtySections = ref<Set<KnowledgeDocumentSection>>(new Set());
 const baseDrafts = ref(createKnowledgeEditorDraftValues(null));
 const sectionConflicts = ref<Record<KnowledgeDocumentSection, KnowledgeTextConflict[]>>({
@@ -140,14 +149,19 @@ const sectionConflicts = ref<Record<KnowledgeDocumentSection, KnowledgeTextConfl
 });
 const conflictResolutionDrafts = ref(createKnowledgeEditorDraftValues(null));
 const saveBlockedSections = ref<Set<KnowledgeDocumentSection>>(new Set());
-const autoSaveQueued = ref(false);
 const autoSaveInFlight = ref(false);
 const skillCommandDraft = ref("");
 const skillArgumentHintDraft = ref("");
 const skillUnityStatus = ref<SkillUnityInstallStatus | null>(null);
 const skillUnityStatusLoading = ref(false);
 const skillUnityActionPending = ref(false);
-let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
+const autosave = useDocumentAutosave({
+  canSave: () => !!props.document && !props.loading && !props.saveLoading
+    && !autoSaveInFlight.value && !isReadOnly.value && !hasBlockingConflicts.value
+    && hasUnsavedSectionChanges.value,
+  save: () => flushPendingChanges("auto"),
+});
+const autoSaveQueued = autosave.queued;
 let skillUnityStatusRequestId = 0;
 
 const localEditorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
@@ -164,6 +178,12 @@ function packageIdForSkillDocument(document: KnowledgeDocument | null | undefine
 const isReadOnly = computed(() => !!props.document?.readOnly);
 const isPackageDocument = computed(() => props.document?.externalSource?.provider === "package");
 const documentPath = computed(() => props.document?.path?.trim() || "");
+const documentFilePath = computed(() => {
+  const doc = props.document;
+  if (!doc) return "";
+  const path = doc.path.replace(/\\/g, "/").replace(/^\/+/, "");
+  return `Locus/knowledge/${path.startsWith(`${doc.type}/`) ? path : `${doc.type}/${path}`}`;
+});
 const isPackageRootDocument = computed(() => {
   if (!isPackageDocument.value) return false;
   const segments = documentPath.value.replace(/\\/g, "/").split("/").filter(Boolean);
@@ -383,9 +403,7 @@ function isMarkdownEditorSessionPinned(section: KnowledgeDocumentSection): boole
 
 const statusLabel = computed(() => {
   if (!props.document) return "";
-  if (props.saveLoading && !autoSaveInFlight.value) return t("knowledge.editor.saving");
-  if (hasUnsavedChanges.value || autoSaveQueued.value || autoSaveInFlight.value) return t("knowledge.editor.unsaved");
-  return t("knowledge.editor.saved");
+  return documentSaveStatus(props.saveLoading || autoSaveInFlight.value, hasUnsavedChanges.value || autoSaveQueued.value);
 });
 
 const footerLabel = computed(() =>
@@ -606,10 +624,20 @@ watch(
 );
 
 watch(() => props.saveLoading, (loading, wasLoading) => {
+  if (!loading && wasLoading) titleCommitInFlight.value = false;
   if (!loading && wasLoading && !autoSaveInFlight.value) {
     maybeScheduleAutoSave();
   }
 });
+
+watch([() => props.saveLoading, autoSaveInFlight, activeDocumentSessionKey], ([saving, autosaving, key]) => {
+  if (pendingTitleCommit.value !== key) pendingTitleCommit.value = null;
+  if (!saving && !autosaving && pendingTitleCommit.value) {
+    pendingTitleCommit.value = null;
+    void flushPendingChanges("manual");
+  }
+});
+watch(activeDocumentSessionKey, () => { titleCommitInFlight.value = false; });
 
 watch(
   () => [props.document?.id ?? "", props.document?.modifiedAt ?? 0, props.document?.type ?? ""],
@@ -644,6 +672,36 @@ onUnmounted(() => {
   clearAutoSaveTimer();
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
 });
+
+function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
+  if (!props.document || props.loading) return { kind: "resource" };
+  captureEditorSession();
+  const session = editorSessions.get(activeDocumentSessionKey.value);
+  if (!session) return { kind: "resource" };
+  const view = bodyEditorRef.value?.getEditorView();
+  return { kind: "knowledge", documentId: props.document.id,
+    session: serializeKnowledgeDocumentSession(session),
+    selection: view ? { anchor: view.state.selection.main.anchor, head: view.state.selection.main.head } : null,
+    scrollTop: view?.scrollDOM.scrollTop,
+  };
+}
+
+async function restoreWorkState(snapshot: WorkbenchEditorTransferSnapshot): Promise<boolean> {
+  if (snapshot.kind !== "knowledge" || props.document?.id !== snapshot.documentId || props.loading) return false;
+  editorSessions.set(activeDocumentSessionKey.value, deserializeKnowledgeDocumentSession(snapshot.session));
+  // Reuse the existing three-way rebase and conflict UI when disk content changed.
+  restoreEditorSession(activeDocumentSessionKey.value, props.document);
+  await nextTick();
+  const view = bodyEditorRef.value?.getEditorView();
+  if (view && snapshot.selection) view.dispatch({ selection: {
+    anchor: Math.min(view.state.doc.length, Math.max(0, snapshot.selection.anchor)),
+    head: Math.min(view.state.doc.length, Math.max(0, snapshot.selection.head)),
+  } });
+  if (view && snapshot.scrollTop != null) view.scrollDOM.scrollTop = snapshot.scrollTop;
+  return true;
+}
+
+defineExpose({ exportTransferSnapshot, restoreWorkState });
 
 function currentDraftValues() {
   return {
@@ -899,11 +957,7 @@ function syncDrafts(
 }
 
 function clearAutoSaveTimer() {
-  if (autoSaveTimer !== null) {
-    clearTimeout(autoSaveTimer);
-    autoSaveTimer = null;
-  }
-  autoSaveQueued.value = false;
+  autosave.cancel();
 }
 
 function markDirty(section: KnowledgeDocumentSection, documentText?: Text) {
@@ -932,28 +986,15 @@ function markDirty(section: KnowledgeDocumentSection, documentText?: Text) {
 }
 
 function maybeScheduleAutoSave() {
-  clearAutoSaveTimer();
-  if (
-    !props.document
-    || props.loading
-    || props.saveLoading
-    || autoSaveInFlight.value
-    || isReadOnly.value
-    || hasBlockingConflicts.value
-    || !dirtySections.value.size
-  ) {
-    return;
-  }
-  if (!hasUnsavedSectionChanges.value) return;
-  autoSaveQueued.value = true;
-  autoSaveTimer = setTimeout(() => {
-    autoSaveTimer = null;
-    void flushPendingChanges("auto");
-  }, AUTO_SAVE_DELAY_MS);
+  autosave.schedule();
 }
 
 async function flushPendingChanges(mode: "auto" | "manual") {
-  if (!props.document || props.saveLoading || autoSaveInFlight.value || isReadOnly.value) return;
+  if (!props.document || isReadOnly.value) return;
+  if (props.saveLoading || autoSaveInFlight.value) {
+    if (mode === "manual" && fileNameDirty.value && !titleCommitInFlight.value) pendingTitleCommit.value = activeDocumentSessionKey.value;
+    return;
+  }
   const requestDocumentKey = activeDocumentSessionKey.value;
   if (!requestDocumentKey) return;
   const shouldRenameDocument = mode === "manual" && fileNameDirty.value;
@@ -1043,7 +1084,7 @@ const documentOutlineSource = computed(() => {
   // replaces this Set on every transaction and gives the computed a reactive
   // invalidation point without copying the full document into another ref.
   void dirtySections.value;
-  return sectionValue("body");
+  return sectionTextBuffers.get("body") ?? bodyDraft.value;
 });
 const {
   documentOutlineItems,
@@ -1180,8 +1221,10 @@ function buildPendingDocumentNamePatch(): KnowledgeDocumentPatch | null {
 }
 
 function persistDocumentNameChange() {
+  if (titleCommitInFlight.value) return;
   const patch = buildPendingDocumentNamePatch();
   if (!patch) return;
+  titleCommitInFlight.value = true;
   emit("updateMeta", patch);
 }
 
@@ -1195,6 +1238,7 @@ function onFileNameInputEvent(event: Event) {
 }
 
 function onFileNameKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return;
   if (event.key === "Enter") {
     event.preventDefault();
     void flushPendingChanges("manual");
@@ -1202,6 +1246,7 @@ function onFileNameKeydown(event: KeyboardEvent) {
   }
 
   if (event.key === "Escape") {
+    pendingTitleCommit.value = null;
     fileNameDraft.value = currentDocumentFileStem.value;
     fileNameDirty.value = false;
     (event.target as HTMLInputElement | null)?.blur();
@@ -1491,7 +1536,7 @@ function labelForProvider(provider?: string | null): string {
 </script>
 
 <template>
-  <div class="preview-panel">
+  <div class="preview-panel" data-search-surface>
     <div class="preview-shell">
       <div class="preview-main-column">
         <div
@@ -1712,6 +1757,17 @@ function labelForProvider(provider?: string | null): string {
               </div>
             </section>
 
+            <MarkdownProperties
+              v-if="document.propertiesYaml?.trim() || (!documentMetaDisabled && !isPackageDocument)"
+              :key="documentContentKey"
+              :title="t('editor.properties.customTitle')"
+              :yaml="document.propertiesYaml ?? ''"
+              :disabled="documentMetaDisabled || isPackageDocument || saveLoading"
+              :reserved-keys="KNOWLEDGE_RESERVED_PROPERTY_KEYS"
+              @change="updateMeta({ propertiesYaml: $event, expectedPropertiesYaml: document.propertiesYaml ?? '' })"
+              @shortcut-save="flushPendingChanges('manual')"
+            />
+
             <section
               v-if="summaryEnabled || !isReadOnly"
               class="document-inline-field document-inline-summary"
@@ -1738,12 +1794,15 @@ function labelForProvider(provider?: string | null): string {
                 :disabled="isReadOnly"
                 :view-mode="editorViewMode"
                 :content-key="`${documentContentKey}:summary`"
+                :saved-value="baseDrafts.summary"
+                :resource-path="documentFilePath"
                 auto-grow
                 :min-height="64"
                 :placeholder="t('knowledge.preview.summaryPlaceholder')"
                 @update:model-value="onSectionInput('summary', $event)"
                 @document-change="onSectionDocumentChange('summary', $event)"
                 @shortcut-save="flushPendingChanges('manual')"
+                @external-change="emit('externalChange')"
                 @reference-open="onEditorReferenceOpen"
                 @reference-pointer-down="onEditorReferencePointerDown"
               />
@@ -1784,12 +1843,15 @@ function labelForProvider(provider?: string | null): string {
                 :disabled="rulesEditorDisabled"
                 :view-mode="editorViewMode"
                 :content-key="`${documentContentKey}:maintenanceRules`"
+                :saved-value="baseDrafts.maintenanceRules"
+                :resource-path="documentFilePath"
                 auto-grow
                 :min-height="104"
                 :placeholder="t('knowledge.preview.rulesPlaceholder')"
                 @update:model-value="onSectionInput('maintenanceRules', $event)"
                 @document-change="onSectionDocumentChange('maintenanceRules', $event)"
                 @shortcut-save="flushPendingChanges('manual')"
+                @external-change="emit('externalChange')"
                 @reference-open="onEditorReferenceOpen"
                 @reference-pointer-down="onEditorReferencePointerDown"
               />
@@ -1821,6 +1883,7 @@ function labelForProvider(provider?: string | null): string {
                 </div>
                 <BaseMarkdownEditor
                   ref="bodyEditorRef"
+                  :search-priority="2"
                   :model-value="bodyDraft"
                   :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
                   @quote-selection="onQuoteSelection('body', $event)"
@@ -1833,12 +1896,15 @@ function labelForProvider(provider?: string | null): string {
                   :view-mode="editorViewMode"
                   :content-path="documentPath"
                   :content-key="`${documentContentKey}:body`"
+                  :saved-value="baseDrafts.body"
+                  :resource-path="documentFilePath"
                   auto-grow
                   :min-height="360"
                   :placeholder="t('knowledge.preview.bodyPlaceholder')"
                   @update:model-value="onSectionInput('body', $event)"
                   @document-change="onSectionDocumentChange('body', $event)"
                   @shortcut-save="flushPendingChanges('manual')"
+                  @external-change="emit('externalChange')"
                   @reference-open="onEditorReferenceOpen"
                   @reference-pointer-down="onEditorReferencePointerDown"
                 />
@@ -2587,44 +2653,6 @@ function labelForProvider(provider?: string | null): string {
   flex: none;
   align-items: center;
   gap: 4px;
-}
-
-.document-title-input-shell {
-  display: grid;
-  width: 100%;
-  min-width: 0;
-}
-
-.document-title-input-shell::after {
-  content: attr(data-value) " ";
-  grid-area: 1 / 1;
-  visibility: hidden;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.document-title-input {
-  grid-area: 1 / 1;
-  width: 100%;
-  min-width: 0;
-  padding: 2px 0 4px;
-  border: none;
-  border-bottom: 1px solid transparent;
-  background: transparent;
-  outline: none;
-}
-
-.document-title-input:hover {
-  border-bottom-color: var(--border-color);
-}
-
-.document-title-input:focus {
-  border-bottom-color: color-mix(in srgb, var(--accent-color) 48%, var(--border-color));
-}
-
-.document-title-input::placeholder {
-  color: var(--text-secondary);
-  opacity: 0.62;
 }
 
 .document-properties {

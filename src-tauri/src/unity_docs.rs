@@ -1984,6 +1984,7 @@ fn build_reference_document_from_raw_html(
     let final_path = format!("{}/{}", target_path, candidate.relative_markdown_path);
 
     Ok(KnowledgeDocument {
+        properties_yaml: String::new(),
         inject_agents: crate::knowledge_store::default_inject_agents(),
         id: stable_document_id(docs_version, &final_path),
         doc_type: KnowledgeType::Reference,
@@ -4440,7 +4441,8 @@ mod tests {
 
     fn test_unity_document(path: &str, title: &str) -> KnowledgeDocument {
         KnowledgeDocument {
-            inject_agents: crate::knowledge_store::default_inject_agents(),
+            properties_yaml: String::new(),
+            inject_agents: crate::knowledge_store::legacy_inject_agents(),
             id: format!("kd_test_{}", title.replace(' ', "_").to_lowercase()),
             doc_type: KnowledgeType::Reference,
             path: path.to_string(),

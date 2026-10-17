@@ -73,6 +73,7 @@ describe("BaseMarkdownEditor workspace images", () => {
     await vi.waitFor(() => expect(imageMocks.resolve).toHaveBeenCalledWith(
       { checkoutId: "checkout-a", expectedGeneration: 7 },
       "Assets/Docs/preview.png",
+      "design/rendering.md",
     ));
     await vi.waitFor(() => expect(
       root.querySelector<HTMLImageElement>(".cm-live-image")?.getAttribute("src"),

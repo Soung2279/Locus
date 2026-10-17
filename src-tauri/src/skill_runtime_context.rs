@@ -592,7 +592,8 @@ mod tests {
 
     fn debugger_document(storage_source: KnowledgeStorageSource) -> KnowledgeDocument {
         KnowledgeDocument {
-            inject_agents: crate::knowledge_store::default_inject_agents(),
+            properties_yaml: String::new(),
+            inject_agents: crate::knowledge_store::legacy_inject_agents(),
             id: DEBUGGER_SKILL_ID.to_string(),
             doc_type: KnowledgeType::Skill,
             path: DEBUGGER_DOCUMENT_PATH.to_string(),

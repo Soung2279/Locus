@@ -11,6 +11,7 @@ import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 import { useMarkdownEditorViewMode } from "../ui/markdownEditorViewMode";
 import { MarkdownEditorSessionCache } from "../ui/markdown-editor/markdownEditorSessionCache";
+import { rebaseDocumentText } from "../../document/documentText";
 
 export interface AgentDocumentTarget {
   kind: AgentDocumentKind | "rule";
@@ -27,6 +28,7 @@ interface Draft {
   path: string;
   saving: boolean;
 }
+export type SavedAgentDocumentDraft = Omit<Draft, "workspaceRef" | "saving"> & { checkoutId: string };
 const props = defineProps<{
   target: AgentDocumentTarget | null;
   workspaceRef: WorkspaceRef | null;
@@ -106,12 +108,42 @@ async function saveFile(): Promise<boolean> {
   }
   return true;
 }
+async function refreshDraft(item: Draft): Promise<void> {
+  try {
+    const remote = item.target.kind === "rule"
+      ? { content: await readRule(item.workspaceRef, item.agentId, item.target.name), revision: null }
+      : await readWorkspaceAgentDocument(item.workspaceRef, item.agentId, item.target.kind, item.target.name);
+    const merged = rebaseDocumentText(item.saved, item.content, remote.content);
+    if (merged.conflicts.length) return;
+    item.content = merged.text;
+    item.saved = remote.content;
+    item.revision = remote.revision;
+  } catch (cause) { error.value = normalizeAppError(cause).message; }
+}
 function forgetRule(name: string) {
   for (const [draftKey, item] of drafts) {
     if (item.agentId === props.agentId && item.target.kind === "rule" && item.target.name === name) drafts.delete(draftKey);
   }
 }
-defineExpose({ saveFile, forgetRule });
+function exportWorkState(): SavedAgentDocumentDraft[] {
+  return [...drafts.values()].filter(item => item.content !== item.saved).map(({ workspaceRef, saving: _saving, ...item }) =>
+    ({ ...item, target: { ...item.target }, checkoutId: workspaceRef.checkoutId }));
+}
+function restoreWorkState(saved: SavedAgentDocumentDraft[]): boolean {
+  if (!props.workspaceRef) return false;
+  request += 1;
+  loading.value = false;
+  for (const item of saved) {
+    if (item.checkoutId !== props.workspaceRef.checkoutId || item.agentId !== props.agentId) continue;
+    const restoredKey = `${props.workspaceRef.checkoutId}:${props.workspaceRef.expectedGeneration}:${props.workspaceRef.expectedMaterializationEpoch}:${props.agentId}:${item.target.kind}:${item.target.name}`;
+    // Keep the original revision/base text: the existing save API detects any
+    // external edits instead of silently overwriting them after restart.
+    drafts.set(restoredKey, { ...item, workspaceRef: { ...props.workspaceRef }, saving: false });
+  }
+  void load();
+  return true;
+}
+defineExpose({ saveFile, forgetRule, exportWorkState, restoreWorkState });
 </script>
 
 <template>
@@ -130,10 +162,11 @@ defineExpose({ saveFile, forgetRule });
     <div v-if="error" class="document-error" role="alert">{{ error }}</div>
     <div v-if="loading" class="document-loading">{{ t('common.loading') }}</div>
     <BaseMarkdownEditor v-else-if="draft" v-model="draft.content" class="document-body"
+      :saved-value="draft.saved"
       :session-cache="editorSessions" :session-pinned="draft.content !== draft.saved"
       :content-key="key" :content-path="target?.kind === 'tool' ? `${draft.path}.md` : draft.path"
       :workspace-ref="draft.workspaceRef" :active="active !== false && !!target" :view-mode="markdownEditorViewMode"
-      @shortcut-save="saveDraft(draft)" />
+      @shortcut-save="saveDraft(draft)" @external-change="refreshDraft(draft)" />
     <footer v-if="draft" class="document-footer" :title="draft.path">
       <span>{{ t('agent.editor.projectFile') }}</span>
       <span class="document-path">{{ draft.path }}</span>

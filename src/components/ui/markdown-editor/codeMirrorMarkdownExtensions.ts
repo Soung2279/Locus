@@ -152,6 +152,10 @@ const locusEditorTheme = EditorView.theme({
     color: "var(--text-secondary)",
     opacity: "0.55",
   },
+  ".cm-panels": { backgroundColor: "var(--panel-bg)", color: "var(--text-color)" },
+  ".cm-panels-top": { borderBottom: "none" },
+  ".cm-searchMatch": { backgroundColor: "var(--accent-soft)", outline: "1px solid var(--border-strong)" },
+  ".cm-searchMatch-selected": { backgroundColor: "color-mix(in srgb, var(--accent-color) 28%, transparent)" },
 });
 
 export function markdownEditorBaseExtensions(onSave: () => void): Extension[] {
@@ -184,7 +188,8 @@ export function markdownEditorBaseExtensions(onSave: () => void): Extension[] {
       ...markdownKeymap,
       ...defaultKeymap,
       ...historyKeymap,
-      ...searchKeymap,
+      // Opening search is routed through the configurable, focus-aware shortcut.
+      ...searchKeymap.filter((binding) => binding.key !== "Mod-f"),
     ]),
     markdownEditorPasteExtension(),
     syntaxHighlighting(locusHighlightStyle),

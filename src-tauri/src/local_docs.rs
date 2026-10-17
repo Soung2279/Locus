@@ -230,7 +230,7 @@ fn reference_managed_path(target_path: &str) -> String {
 }
 
 fn library_dir(working_dir: &str) -> PathBuf {
-    Path::new(working_dir).join("Library").join("Locus")
+    crate::knowledge_index::library_dir_for_working_dir(working_dir)
 }
 
 fn temp_root_path(working_dir: &str) -> PathBuf {
@@ -756,6 +756,7 @@ fn build_local_document(
     let body = normalize_imported_body(&raw, &planned.source_abs);
     let read_only = !(mode == KnowledgeLocalSourceMode::Snapshot && ai_editable);
     Ok(KnowledgeDocument {
+        properties_yaml: String::new(),
         inject_agents: crate::knowledge_store::default_inject_agents(),
         id: stable_document_id(source_root, &planned.source_rel),
         doc_type: KnowledgeType::Reference,
@@ -1219,6 +1220,7 @@ fn live_synthetic_document(
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_else(now_millis);
     let document = KnowledgeDocument {
+        properties_yaml: String::new(),
         inject_agents: crate::knowledge_store::default_inject_agents(),
         id: stable_document_id(&source_root, inner_rel),
         doc_type: KnowledgeType::Reference,

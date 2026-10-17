@@ -28,7 +28,7 @@ describe("KnowledgePreview continuous document layout", () => {
     expect(preview).toContain('class="document-title-input"');
     expect(preview).toContain('@blur="flushPendingChanges(\'manual\')"');
     expect(preview).toContain("function buildPendingDocumentNamePatch()");
-    expect(preview).toMatch(/\.document-title-input\s*\{[\s\S]*border-bottom:\s*1px solid transparent;/);
+    expect(read("src/components/ui/markdown-document.css")).toMatch(/\.document-title-input\s*\{[\s\S]*border-bottom:\s*1px solid transparent;/);
   });
 
   it("renders document metadata as compact property rows", () => {
@@ -107,7 +107,7 @@ describe("KnowledgePreview continuous document layout", () => {
   it("uses the full preview width without an embedded chat rail", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
-    expect(preview).toContain('<div class="preview-panel">');
+    expect(preview).toMatch(/<div\b[^>]*class="preview-panel"[^>]*>/u);
     expect(preview).not.toContain("KnowledgeChatPane");
     expect(preview).not.toContain("preview-side-rail");
     expect(preview).not.toContain("preview-side-resize-handle");

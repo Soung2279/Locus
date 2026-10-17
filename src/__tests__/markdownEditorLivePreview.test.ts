@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 import { markdown } from "@codemirror/lang-markdown";
-import { Compartment, EditorState, Transaction } from "@codemirror/state";
+import { Compartment, EditorState, StateEffect, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { GFM } from "@lezer/markdown";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { markdownLivePreview } from "../components/ui/markdown-editor/markdownLivePreview";
 
 let view: EditorView | null = null;
@@ -111,24 +111,57 @@ describe("markdown Live Preview", () => {
     expect(parent.querySelectorAll(".cm-editor")).toHaveLength(1);
   });
 
-  it("keeps inline formatting rendered while editing its text", () => {
-    const editor = mountLivePreview("plain **bold** and *italic*");
-
-    expect(editor.contentDOM.textContent).toContain("plain bold and italic");
-    expect(editor.contentDOM.textContent).not.toContain("**bold**");
+  it.each([
+    ["**", "strong"], ["__", "strong"], ["*", "emphasis"], ["_", "emphasis"],
+    ["~~", "strikethrough"], ["`", "inline-code"], ["``", "inline-code"],
+  ])("reveals paired %s markers only for the active formatted text", (marker, style) => {
+    const doc = `plain ${marker}text${marker} and **other**`;
+    const editor = mountLivePreview(doc);
+    const from = doc.indexOf("text");
+    expect(editor.contentDOM.textContent).toBe("plain text and other");
 
     editor.focus();
-    editor.dispatch({ selection: { anchor: 9 } });
-    expect(editor.contentDOM.textContent).toContain("plain bold and italic");
-    expect(editor.contentDOM.textContent).not.toContain("**bold**");
+    editor.dispatch({ selection: { anchor: from + 2 } });
+    expect(editor.contentDOM.textContent).toBe(`plain ${marker}text${marker} and other`);
+    expect(editor.dom.querySelector(`.cm-live-${style}`)).not.toBeNull();
+    expect(Array.from(editor.dom.querySelectorAll(".cm-live-syntax-marker"), el => el.textContent)).toEqual([marker, marker]);
 
-    editor.dispatch({ selection: { anchor: 8, head: 12 } });
-    expect(editor.contentDOM.textContent).not.toContain("**bold**");
+    editor.dispatch({ selection: { anchor: from, head: from + 4 } });
+    expect(editor.contentDOM.textContent).toBe(`plain ${marker}text${marker} and other`);
 
-    editor.dispatch({ selection: { anchor: 7 } });
-    expect(editor.contentDOM.textContent).not.toContain("**bold");
-    expect(editor.contentDOM.textContent).not.toContain("**bold**");
-    expect(editor.contentDOM.textContent).not.toContain("*italic*");
+    editor.dispatch({ selection: { anchor: 1 } });
+    expect(editor.contentDOM.textContent).toBe("plain text and other");
+    expect(editor.dom.querySelector(".cm-live-syntax-marker")).toBeNull();
+    expect(editor.state.doc.toString()).toBe(doc);
+  });
+
+  it("reveals both enclosing pairs for nested formatting", () => {
+    const doc = "plain **bold *italic* text** and ~~other~~";
+    const editor = mountLivePreview(doc);
+    editor.focus();
+    editor.dispatch({ selection: { anchor: doc.indexOf("italic") + 2 } });
+    expect(editor.contentDOM.textContent).toBe("plain **bold *italic* text** and other");
+    expect(Array.from(editor.dom.querySelectorAll(".cm-live-syntax-marker"), el => el.textContent)).toEqual(["**", "*", "*", "**"]);
+
+    editor.dispatch({ selection: { anchor: doc.indexOf("bold") + 2 } });
+    expect(editor.contentDOM.textContent).toBe("plain **bold italic text** and other");
+  });
+
+  it("reveals all inline pairs covered by a selection and hides them on blur or in read-only mode", async () => {
+    const doc = "plain **bold** and *italic* with ~~old~~ `code`";
+    const editor = mountLivePreview(doc);
+    editor.focus();
+    editor.dispatch({ selection: { anchor: 6, head: doc.length } });
+    expect(editor.contentDOM.textContent).toBe(doc);
+
+    editor.contentDOM.blur();
+    await vi.waitFor(() => expect(editor.dom.querySelector(".cm-live-syntax-marker")).toBeNull());
+    expect(editor.contentDOM.textContent).toBe("plain bold and italic with old code");
+
+    editor.dispatch({ effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)) });
+    editor.focus();
+    editor.dispatch({ selection: { anchor: 6, head: doc.length } });
+    expect(editor.contentDOM.textContent).toBe("plain bold and italic with old code");
   });
 
   it("keeps list and task markers rendered while editing item text", () => {
@@ -153,23 +186,62 @@ describe("markdown Live Preview", () => {
     expect(editor.contentDOM.textContent).not.toContain("[ ]");
   });
 
-  it("keeps heading and quote markers hidden at their source tokens", () => {
-    const doc = "## Heading\n\n> quote";
+  it.each([1, 2, 3, 4, 5, 6])("reveals the level %i heading prefix only while editing that heading", (level) => {
+    const prefix = "#".repeat(level);
+    const doc = `${prefix} Heading\n\n> quote`;
     const editor = mountLivePreview(doc);
+    expect(editor.contentDOM.textContent).not.toContain("#");
     editor.focus();
 
     editor.dispatch({ selection: { anchor: doc.indexOf("Heading") + 2 } });
-    expect(editor.contentDOM.textContent).not.toContain("##");
+    expect(editor.contentDOM.textContent).toContain(`${prefix} Heading`);
+    expect(editor.dom.querySelector(".cm-live-heading-marker")?.textContent).toBe(prefix);
+
+    editor.dispatch({ selection: { anchor: doc.indexOf("Heading"), head: doc.indexOf("Heading") + 7 } });
+    expect(editor.contentDOM.textContent).toContain(`${prefix} Heading`);
 
     editor.dispatch({ selection: { anchor: 1 } });
-    expect(editor.contentDOM.textContent).not.toContain("## Heading");
+    expect(editor.contentDOM.textContent).toContain(`${prefix} Heading`);
 
     editor.dispatch({ selection: { anchor: doc.indexOf("quote") + 2 } });
     expect(editor.contentDOM.textContent).not.toContain(">");
-    expect(editor.contentDOM.textContent).not.toContain("##");
+    expect(editor.contentDOM.textContent).not.toContain("#");
+    expect(editor.dom.querySelector(".cm-live-heading-marker")).toBeNull();
 
     editor.dispatch({ selection: { anchor: doc.indexOf(">") } });
     expect(editor.contentDOM.textContent).not.toContain("> quote");
+    expect(editor.state.doc.toString()).toBe(doc);
+  });
+
+  it("updates the visible heading level without revealing optional closing marks", () => {
+    const editor = mountLivePreview("## Heading ##");
+    editor.focus();
+    editor.dispatch({ selection: { anchor: 5 } });
+    expect(editor.dom.querySelectorAll(".cm-live-heading-marker")).toHaveLength(1);
+    expect(editor.contentDOM.textContent?.trim()).toBe("## Heading");
+
+    editor.dispatch({ changes: { from: 0, insert: "#" } });
+    expect(editor.dom.querySelector(".cm-live-heading-marker")?.textContent).toBe("###");
+    expect(editor.dom.querySelector(".cm-live-heading-3")).not.toBeNull();
+
+    editor.dispatch({ changes: { from: 0, to: 4 } });
+    expect(editor.dom.querySelector(".cm-live-heading-marker")).toBeNull();
+    expect(editor.dom.querySelector(".cm-live-heading")).toBeNull();
+  });
+
+  it("hides heading prefixes on blur and in read-only previews", async () => {
+    const editor = mountLivePreview("## Heading", 5);
+    editor.focus();
+    await vi.waitFor(() => expect(editor.dom.querySelector(".cm-live-heading-marker")).not.toBeNull());
+
+    editor.contentDOM.blur();
+    await vi.waitFor(() => expect(editor.dom.querySelector(".cm-live-heading-marker")).toBeNull());
+
+    editor.dispatch({ effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)) });
+    editor.focus();
+    editor.dispatch({ selection: { anchor: 3, head: 10 } });
+    expect(editor.hasFocus).toBe(true);
+    expect(editor.contentDOM.textContent).not.toContain("#");
   });
 
   it("keeps link labels rendered when a selection lands in the destination", () => {
@@ -187,7 +259,7 @@ describe("markdown Live Preview", () => {
     expect(editor.contentDOM.textContent).toBe("label");
   });
 
-  it("keeps inline and fenced code delimiters local to the edited token", () => {
+  it("reveals inline code pairs while keeping fenced code delimiters local to the edited token", () => {
     const doc = [
       "`inline`",
       "",
@@ -199,13 +271,13 @@ describe("markdown Live Preview", () => {
     editor.focus();
 
     editor.dispatch({ selection: { anchor: doc.indexOf("inline") + 2 } });
-    expect(editor.contentDOM.textContent).not.toContain("`inline`");
+    expect(editor.contentDOM.textContent).toContain("`inline`");
 
     editor.dispatch({ selection: { anchor: 0 } });
-    expect(editor.contentDOM.textContent).not.toContain("`inline");
-    expect(editor.contentDOM.textContent).not.toContain("`inline`");
+    expect(editor.contentDOM.textContent).toContain("`inline`");
 
     editor.dispatch({ selection: { anchor: doc.indexOf("const") + 3 } });
+    expect(editor.contentDOM.textContent).not.toContain("`inline`");
     expect(editor.contentDOM.textContent).not.toContain("```ts");
 
     editor.dispatch({ selection: { anchor: doc.indexOf("ts") + 1 } });

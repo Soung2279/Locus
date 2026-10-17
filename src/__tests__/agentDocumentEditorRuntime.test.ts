@@ -28,7 +28,8 @@ function mount() {
   host = document.createElement("div"); document.body.appendChild(host);
   app = createApp(() => h(AgentDocumentEditor, { ...props, ref: value => { editor = value as typeof editor; }, onDirtyChange: dirty }));
   app.mount(host);
-  return { props, dirty, save: () => editor!.saveFile() };
+  return { props, dirty, save: () => editor!.saveFile(),
+    snapshot: () => editor!.exportWorkState(), restore: (saved: ReturnType<InstanceType<typeof AgentDocumentEditor>["exportWorkState"]>) => editor!.restoreWorkState(saved) };
 }
 async function edit(content: string) {
   const input = host.querySelector("textarea")!;
@@ -45,6 +46,30 @@ beforeEach(() => {
 afterEach(() => { app?.unmount(); document.body.innerHTML = ""; });
 
 describe("Agent document editing", () => {
+  it("restores unsaved agent files with the new process scope and keeps their original revision for conflict checks", async () => {
+    api.read.mockResolvedValue({ content: "baseline", path: "soul.md", revision: "disk-v1" });
+    const original = mount(); await flush(); await edit("unsaved soul");
+    const snapshot = JSON.parse(JSON.stringify(original.snapshot()));
+    app!.unmount();
+    api.read.mockResolvedValue({ content: "external edit", path: "soul.md", revision: "disk-v2" });
+    const restarted = mount();
+    restarted.props.workspaceRef.expectedGeneration = 12;
+    await flush();
+    expect(restarted.restore(snapshot)).toBe(true); await flush();
+    expect(host.querySelector("textarea")!.value).toBe("unsaved soul");
+    api.save.mockRejectedValueOnce(new Error("Changed on disk"));
+    expect(await restarted.save()).toBe(false);
+    expect(api.save).toHaveBeenLastCalledWith({ ...workspaceRef, expectedGeneration: 12 }, "unity", "soul", "", "unsaved soul", "disk-v1");
+    expect(restarted.snapshot()[0]?.content).toBe("unsaved soul");
+  });
+
+  it("does not import an agent draft into another checkout", async () => {
+    const original = mount(); await flush(); await edit("checkout A draft");
+    const snapshot = original.snapshot();
+    original.props.workspaceRef.checkoutId = "b"; await flush();
+    original.restore(snapshot); await flush();
+    expect(host.querySelector("textarea")!.value).toBe("b:unity:soul:");
+  });
   it("retains edits across soul, rule and tool navigation and saves to their captured workspace", async () => {
     const vm = mount(); await flush();
     await edit("# Project soul");

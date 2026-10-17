@@ -1,7 +1,8 @@
-import { computed, onScopeDispose, ref, shallowRef } from "vue";
+import { computed, onScopeDispose, ref, shallowRef, watch } from "vue";
+import { useDocumentAutosave } from "./useDocumentAutosave";
 
 export interface DocumentFileSessionOptions<TDocument, TDraft> {
-  /** Immutable resource identity, including the workspace lifetime. */
+  /** Resource identity, including the workspace lifetime; relocate can rebind it. */
   key: () => string;
   emptyDraft: () => TDraft;
   read: () => Promise<TDocument>;
@@ -10,6 +11,9 @@ export interface DocumentFileSessionOptions<TDocument, TDraft> {
   equals: (left: TDraft, right: TDraft) => boolean;
   canSave: (document: TDocument) => boolean;
   errorMessage: (error: unknown) => string;
+  autoSave?: () => boolean;
+  /** Return null to leave conflicting drafts untouched. */
+  mergeDrafts?: (base: TDraft, local: TDraft, remote: TDraft) => TDraft | null;
 }
 
 /**
@@ -27,6 +31,7 @@ export function useDocumentFileSession<TDocument, TDraft>(
   const modelDraft = shallowRef<TDraft>(draft.value);
   const loading = ref(false);
   const saving = ref(false);
+  const relocating = ref(false);
   const error = ref("");
   const dirty = computed(() => document.value !== null
     && !options.equals(draft.value, baseDraft.value));
@@ -34,6 +39,14 @@ export function useDocumentFileSession<TDocument, TDraft>(
   let draftRevision = 0;
   let documentKey = "";
   let disposed = false;
+  let activeSave: Promise<boolean> | null = null;
+  const autosave = useDocumentAutosave({
+    canSave: () => !!options.autoSave?.() && dirty.value && !loading.value && !saving.value && !relocating.value
+      && !error.value && document.value !== null && options.canSave(document.value),
+    save,
+    onError: (cause) => { error.value = options.errorMessage(cause); },
+  });
+  watch([draft, saving, loading, () => options.autoSave?.()], () => autosave.schedule());
 
   function updateDraft(value: TDraft): void {
     draft.value = value;
@@ -48,6 +61,7 @@ export function useDocumentFileSession<TDocument, TDraft>(
     keepCurrent?: boolean;
     /** Explicitly accept a new disk baseline while retaining the local draft. */
     keepDraft?: boolean;
+    mergeDraft?: boolean;
     /** Adapter-specific protection for uncommitted input or companion drafts. */
     canApply?: () => boolean;
   } = {}): Promise<boolean> {
@@ -75,7 +89,11 @@ export function useDocumentFileSession<TDocument, TDraft>(
       // baseline. The caller can now present its ordinary conflict choices.
       if (keepCurrent && revision !== draftRevision && !settings.keepDraft) return false;
       const nextDraft = options.toDraft(next);
-      if (!keepCurrent || !settings.keepDraft) updateDraft(nextDraft);
+      if (keepCurrent && settings.mergeDraft && dirty.value && options.mergeDrafts) {
+        const merged = options.mergeDrafts(baseDraft.value, draft.value, nextDraft);
+        if (merged === null) return false;
+        updateDraft(merged);
+      } else if (!keepCurrent || !settings.keepDraft) updateDraft(nextDraft);
       document.value = next;
       baseDraft.value = nextDraft;
       modelDraft.value = draft.value;
@@ -89,7 +107,16 @@ export function useDocumentFileSession<TDocument, TDraft>(
   }
 
   /** True only if the current draft is saved; continued typing remains dirty. */
-  async function save(): Promise<boolean> {
+  function save(): Promise<boolean> {
+    if (activeSave || relocating.value) return Promise.resolve(false);
+    const request = saveDraft();
+    activeSave = request;
+    void request.finally(() => { if (activeSave === request) activeSave = null; });
+    return request;
+  }
+
+  async function saveDraft(): Promise<boolean> {
+    autosave.cancel();
     const current = document.value;
     const key = options.key();
     if (disposed || current === null || documentKey !== key || loading.value || saving.value
@@ -117,7 +144,36 @@ export function useDocumentFileSession<TDocument, TDraft>(
     }
   }
 
+  /** Move the same file without reloading its draft or resetting editor history.
+   * The adapter updates its resource key inside move, before returning metadata.
+   * Foreground navigation can still call load to invalidate this operation.
+   */
+  async function relocate(move: (current: TDocument) => Promise<TDocument>): Promise<boolean> {
+    if (disposed || relocating.value || document.value === null || documentKey !== options.key()) return false;
+    relocating.value = true;
+    autosave.cancel();
+    error.value = "";
+    let requestEpoch = epoch;
+    const key = options.key();
+    try {
+      // A write already sent to the old path must finish before moving the file.
+      await activeSave;
+      if (!isCurrent(requestEpoch, key) || error.value) return false;
+      requestEpoch = ++epoch;
+      loading.value = false;
+      const next = await move(document.value!);
+      if (disposed || epoch !== requestEpoch) return false;
+      documentKey = options.key();
+      document.value = next;
+      error.value = "";
+      return true;
+    } finally {
+      relocating.value = false;
+      autosave.schedule();
+    }
+  }
+
   onScopeDispose(() => { disposed = true; epoch += 1; });
 
-  return { document, baseDraft, draft, modelDraft, loading, saving, error, dirty, updateDraft, load, save };
+  return { document, baseDraft, draft, modelDraft, loading, saving, relocating, error, dirty, updateDraft, load, save, relocate };
 }

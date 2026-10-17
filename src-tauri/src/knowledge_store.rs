@@ -225,13 +225,15 @@ pub struct KnowledgeConfigSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeDocument {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub properties_yaml: String,
     pub id: String,
     #[serde(rename = "type")]
     pub doc_type: KnowledgeType,
     pub path: String,
     pub title: String,
     pub inject_mode: KnowledgeInjectMode,
-    #[serde(default = "default_inject_agents")]
+    #[serde(default = "legacy_inject_agents")]
     pub inject_agents: Vec<String>,
     #[serde(default)]
     pub inherit_inject_mode: bool,
@@ -272,6 +274,11 @@ pub struct KnowledgeDocument {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct KnowledgeFrontmatter {
+    #[serde(default, rename = "scope", skip_serializing)]
+    pub _legacy_scope: Option<serde_yaml::Value>,
+    #[serde(default, flatten)]
+    pub properties: serde_yaml::Mapping,
+    #[serde(default)]
     pub id: String,
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub doc_type: Option<KnowledgeType>,
@@ -283,7 +290,10 @@ struct KnowledgeFrontmatter {
     pub body_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_mode: Option<KnowledgeFrontmatterInjectMode>,
-    #[serde(default = "default_inject_agents")]
+    #[serde(
+        default = "legacy_inject_agents",
+        deserialize_with = "deserialize_inject_agents"
+    )]
     pub inject_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_inject_mode: Option<bool>,
@@ -406,7 +416,7 @@ pub struct KnowledgeListItem {
     pub path: String,
     pub title: String,
     pub inject_mode: KnowledgeInjectMode,
-    #[serde(default = "default_inject_agents")]
+    #[serde(default = "legacy_inject_agents")]
     pub inject_agents: Vec<String>,
     pub summary_enabled: bool,
     pub command_enabled: bool,
@@ -719,6 +729,10 @@ pub struct KnowledgeDocumentEditOperation {
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeDocumentPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties_yaml: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_properties_yaml: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub doc_type: Option<KnowledgeType>,
@@ -958,6 +972,8 @@ impl Default for KnowledgeUpdateOp {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeUpdateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties_yaml: Option<String>,
     pub op: KnowledgeUpdateOp,
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1010,14 +1026,81 @@ fn now_millis() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-pub fn default_inject_agents() -> Vec<String> {
+/// `injectAgents` pattern that matches every Agent.
+pub const ALL_AGENTS_INJECT_PATTERN: &str = "*";
+
+/// Injection targets of a document that predates or omits `injectAgents`.
+/// Reading such a document keeps its original Unity-only full and rule
+/// injection.
+pub fn legacy_inject_agents() -> Vec<String> {
     vec![crate::agent::definition::DEFAULT_AGENT_ID.to_string()]
 }
 
+/// Injection targets written for documents that Locus creates: every Agent.
+pub fn default_inject_agents() -> Vec<String> {
+    vec![ALL_AGENTS_INJECT_PATTERN.to_string()]
+}
+
+/// Accepts `injectAgents: "*"` as well as a list of Agent ids or patterns.
+fn deserialize_inject_agents<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum InjectAgentsValue {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match InjectAgentsValue::deserialize(deserializer)? {
+        InjectAgentsValue::One(value) => vec![value],
+        InjectAgentsValue::Many(values) => values,
+    })
+}
+
+fn is_inject_agent_pattern(value: &str) -> bool {
+    value.contains('*')
+}
+
+/// Matches an `injectAgents` entry against an Agent id. `*` matches any
+/// sequence of characters, so `*` selects every Agent and `team-*` selects
+/// ids with that prefix. Entries without `*` compare canonical Agent ids.
+pub fn inject_agent_pattern_matches(pattern: &str, agent_id: &str) -> bool {
+    let pattern = pattern.trim();
+    let agent_id = crate::agent::definition::canonical_agent_id(agent_id.trim());
+    if !is_inject_agent_pattern(pattern) {
+        return crate::agent::definition::canonical_agent_id(pattern) == agent_id;
+    }
+
+    let mut parts = pattern.split('*');
+    let prefix = parts.next().unwrap_or_default();
+    let Some(mut rest) = agent_id.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut middle = parts.collect::<Vec<_>>();
+    let suffix = middle.pop().unwrap_or_default();
+    for part in middle {
+        if part.is_empty() {
+            continue;
+        }
+        let Some(index) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[index + part.len()..];
+    }
+    rest.len() >= suffix.len() && rest.ends_with(suffix)
+}
+
 fn normalize_inject_agents(agents: Vec<String>) -> Vec<String> {
-    let mut result = Vec::new();
+    let mut result: Vec<String> = Vec::new();
     for agent in agents {
-        let agent = crate::agent::definition::canonical_agent_id(agent.trim());
+        let agent = agent.trim();
+        let agent = if is_inject_agent_pattern(agent) {
+            agent
+        } else {
+            crate::agent::definition::canonical_agent_id(agent)
+        };
         if !agent.is_empty() && !result.iter().any(|existing| existing == agent) {
             result.push(agent.to_string());
         }
@@ -1027,10 +1110,10 @@ fn normalize_inject_agents(agents: Vec<String>) -> Vec<String> {
 
 pub fn document_allows_agent_injection(document: &KnowledgeDocument, agent_id: &str) -> bool {
     !matches!(document.inject_mode, KnowledgeInjectMode::Full | KnowledgeInjectMode::Rule)
-        || document.inject_agents.iter().any(|agent| {
-            crate::agent::definition::canonical_agent_id(agent.trim())
-                == crate::agent::definition::canonical_agent_id(agent_id.trim())
-        })
+        || document
+            .inject_agents
+            .iter()
+            .any(|pattern| inject_agent_pattern_matches(pattern, agent_id))
 }
 
 fn system_time_millis(value: std::time::SystemTime) -> Option<i64> {
@@ -1383,9 +1466,7 @@ fn migrate_legacy_memory_project_understanding(working_dir: &str) -> Result<(), 
 }
 
 fn memory_builtin_seed_marker_path(working_dir: &str) -> PathBuf {
-    Path::new(working_dir)
-        .join("Library")
-        .join("Locus")
+    crate::knowledge_index::library_dir_for_working_dir(working_dir)
         .join("memory_builtin_seed_version.txt")
 }
 
@@ -1408,9 +1489,7 @@ fn write_memory_builtin_seed_version(working_dir: &str, version: u32) -> Result<
 }
 
 fn unified_knowledge_tree_migration_marker_path(working_dir: &str) -> PathBuf {
-    Path::new(working_dir)
-        .join("Library")
-        .join("Locus")
+    crate::knowledge_index::library_dir_for_working_dir(working_dir)
         .join("knowledge_unified_tree_version.txt")
 }
 
@@ -1701,6 +1780,7 @@ pub fn ensure_memory_builtin_documents(working_dir: &str) -> Result<(), String> 
         save_document(
             working_dir,
             KnowledgeDocument {
+                properties_yaml: String::new(),
                 inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: seed.id.to_string(),
                 doc_type: KnowledgeType::Memory,
@@ -2035,6 +2115,8 @@ fn type_root(working_dir: &str, doc_type: KnowledgeType) -> PathBuf {
 }
 
 pub fn ensure_knowledge_roots(working_dir: &str) -> Result<(), String> {
+    crate::workspace::require_knowledge_enabled(working_dir)?;
+    crate::knowledge_index::migrate_legacy_non_unity_storage(working_dir)?;
     std::fs::create_dir_all(knowledge_root(working_dir))
         .map_err(|e| format!("Failed to create knowledge root: {}", e))?;
     for doc_type in KnowledgeType::all() {
@@ -2143,9 +2225,7 @@ fn preserve_superseded_root_config(
     doc_type: KnowledgeType,
     legacy_config: &Path,
 ) -> Result<(), String> {
-    let backup_dir = Path::new(working_dir)
-        .join("Library")
-        .join("Locus")
+    let backup_dir = crate::knowledge_index::library_dir_for_working_dir(working_dir)
         .join("knowledge_migration_backups");
     std::fs::create_dir_all(&backup_dir).map_err(|e| {
         format!(
@@ -2308,6 +2388,9 @@ fn ensure_unified_knowledge_tree_layout_locked(working_dir: &str) -> Result<(), 
     if working_dir.trim().is_empty() {
         return Ok(());
     }
+
+    crate::workspace::require_knowledge_enabled(working_dir)?;
+    crate::knowledge_index::migrate_legacy_non_unity_storage(working_dir)?;
 
     let previous_version = read_unified_knowledge_tree_migration_version(working_dir);
     if previous_version >= UNIFIED_KNOWLEDGE_TREE_MIGRATION_VERSION {
@@ -3763,6 +3846,21 @@ pub fn edit_document(
     let old_type = doc.doc_type;
     let old_path = doc.path.clone();
 
+    if let Some(yaml) = patch.properties_yaml.as_ref() {
+        if is_csv_document(&doc.path) {
+            return Err("CSV documents do not support Markdown properties".to_string());
+        }
+        if let Some(expected) = patch.expected_properties_yaml.as_ref() {
+            if parse_custom_properties(expected)? != parse_custom_properties(&doc.properties_yaml)? {
+                return Err("Document properties changed externally. Reload and retry.".to_string());
+            }
+        }
+        let properties = parse_custom_properties(yaml)?;
+        doc.properties_yaml = if properties.is_empty() { String::new() } else {
+            serde_yaml::to_string(&properties).map_err(|error| error.to_string())?
+        };
+    }
+
     if let Some(doc_type) = patch.doc_type {
         doc.doc_type = doc_type;
     }
@@ -3885,20 +3983,19 @@ pub fn guess_type_from_path(path: &str) -> Option<KnowledgeType> {
 }
 
 fn split_frontmatter(content: &str) -> Result<(&str, &str), String> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
+    let trimmed = content.trim_start_matches('\u{feff}').trim_start();
+    let opening_end = trimmed.find('\n').ok_or("Knowledge document frontmatter is missing")? + 1;
+    if trimmed[..opening_end].trim_end() != "---" {
         return Err("Knowledge document frontmatter is missing".to_string());
     }
-
-    let after_open = &trimmed[3..];
-    let Some(end) = after_open.find("\n---") else {
-        return Err("Knowledge document frontmatter is not terminated".to_string());
-    };
-
-    let yaml = &after_open[..end];
-    let consumed = 3 + end + 4;
-    let body = &trimmed[consumed..];
-    Ok((yaml, body))
+    let mut offset = opening_end;
+    for line in trimmed[opening_end..].split_inclusive('\n') {
+        if matches!(line.trim_end(), "---" | "...") {
+            return Ok((&trimmed[opening_end..offset], &trimmed[offset + line.trim_end_matches(['\r', '\n']).len()..]));
+        }
+        offset += line.len();
+    }
+    Err("Knowledge document frontmatter is not terminated".to_string())
 }
 
 fn parse_frontmatter(content: &str) -> Result<(KnowledgeFrontmatter, &str), String> {
@@ -3908,7 +4005,7 @@ fn parse_frontmatter(content: &str) -> Result<(KnowledgeFrontmatter, &str), Stri
     Ok((frontmatter, body))
 }
 
-const CANONICAL_FRONTMATTER_KEYS: &[&str] = &[
+pub(crate) const CANONICAL_FRONTMATTER_KEYS: &[&str] = &[
     "id",
     "injectMode",
     "injectAgents",
@@ -3924,6 +4021,28 @@ const CANONICAL_FRONTMATTER_KEYS: &[&str] = &[
     "tools",
 ];
 
+pub(crate) const LEGACY_FRONTMATTER_KEYS: &[&str] = &[
+    "scope",
+    "type", "path", "title", "bodyFormat", "inheritInjectMode", "summaryEnabled", "summaryCache",
+    "commandEnabled", "aiMaintained", "inheritAiConfig", "explicitMaintenanceRules",
+    "maintenanceRulesCache", "createdAt", "updatedAt",
+];
+
+fn parse_custom_properties(yaml: &str) -> Result<serde_yaml::Mapping, String> {
+    if yaml.trim().is_empty() { return Ok(serde_yaml::Mapping::new()); }
+    if yaml.len() > 256_000 { return Err("Document properties are too large".to_string()); }
+    let properties: serde_yaml::Mapping = serde_yaml::from_str(yaml)
+        .map_err(|error| format!("Invalid document properties: {error}"))?;
+    for key in properties.keys() {
+        let key = key.as_str().filter(|key| !key.trim().is_empty())
+            .ok_or("Property names must be non-empty text")?;
+        if CANONICAL_FRONTMATTER_KEYS.contains(&key) || LEGACY_FRONTMATTER_KEYS.contains(&key) {
+            return Err(format!("Reserved document property: {key}"));
+        }
+    }
+    Ok(properties)
+}
+
 fn frontmatter_needs_normalization(content: &str) -> bool {
     let Ok((yaml, _)) = split_frontmatter(content) else {
         return false;
@@ -3933,14 +4052,14 @@ fn frontmatter_needs_normalization(content: &str) -> bool {
     };
     mapping.keys().any(|key| {
         key.as_str()
-            .is_some_and(|key| !CANONICAL_FRONTMATTER_KEYS.contains(&key))
+            .is_some_and(|key| LEGACY_FRONTMATTER_KEYS.contains(&key))
     }) || mapping
         .get(&serde_yaml::Value::String("readOnly".to_string()))
         .is_some_and(|value| value.as_bool() == Some(false))
 }
 
 fn has_frontmatter_opening(content: &str) -> bool {
-    content.trim_start().starts_with("---")
+    content.trim_start_matches('\u{feff}').trim_start().lines().next().is_some_and(|line| line.trim_end() == "---")
 }
 
 fn uses_raw_markdown_body_format(content: &str) -> bool {
@@ -4182,6 +4301,8 @@ fn parse_memory_body_sections(
 
 fn render_frontmatter(doc: &KnowledgeDocument) -> Result<String, String> {
     let frontmatter = KnowledgeFrontmatter {
+        _legacy_scope: None,
+        properties: parse_custom_properties(&doc.properties_yaml)?,
         id: doc.id.clone(),
         doc_type: None,
         path: None,
@@ -4249,6 +4370,7 @@ pub fn prepare_generic_knowledge_write(
         });
     }
     let mut document = KnowledgeDocument {
+        properties_yaml: String::new(),
         inject_agents: crate::knowledge_store::default_inject_agents(),
         id: format!("kd_{}", uuid::Uuid::new_v4()),
         doc_type,
@@ -4522,7 +4644,12 @@ fn parse_document(
 
     let mut doc = KnowledgeDocument {
         inject_agents: normalize_inject_agents(frontmatter.inject_agents),
-        id: frontmatter.id,
+        properties_yaml: if frontmatter.properties.is_empty() { String::new() } else {
+            serde_yaml::to_string(&frontmatter.properties).map_err(|error| error.to_string())?
+        },
+        id: if frontmatter.id.trim().is_empty() {
+            format!("kd_{}", blake3::hash(format!("{}:{path}", doc_type.as_str()).as_bytes()).to_hex())
+        } else { frontmatter.id },
         doc_type,
         path,
         title,
@@ -4578,7 +4705,8 @@ fn convert_plain_markdown_document(
     let normalized_path = normalize_relative_path(path)?;
     let timestamp = now_millis();
     let document = KnowledgeDocument {
-        inject_agents: crate::knowledge_store::default_inject_agents(),
+        properties_yaml: String::new(),
+        inject_agents: crate::knowledge_store::legacy_inject_agents(),
         id: format!("kd_{}", uuid::Uuid::new_v4()),
         doc_type,
         path: normalized_path.clone(),
@@ -6395,6 +6523,7 @@ pub fn update_document(
                 .ok_or_else(|| "create requires body".to_string())?;
             let maintenance_rules = request.maintenance_rules.and_then(|value| value);
             let mut doc = KnowledgeDocument {
+                properties_yaml: request.properties_yaml.unwrap_or_default(),
                 inject_agents: normalize_inject_agents(request.inject_agents.unwrap_or_else(default_inject_agents)),
                 id: request
                     .id
@@ -6451,6 +6580,8 @@ pub fn update_document(
             request.doc_type,
             KnowledgeDocumentPatch {
                 id: request.id,
+                properties_yaml: request.properties_yaml,
+                expected_properties_yaml: None,
                 doc_type: request.doc_type,
                 title: request.title,
                 inject_mode: request.inject_mode,
@@ -6500,6 +6631,10 @@ pub fn update_document(
             }
             let old_type = doc.doc_type;
             let old_path = doc.path.clone();
+            if let Some(yaml) = request.properties_yaml {
+                parse_custom_properties(&yaml)?;
+                doc.properties_yaml = yaml;
+            }
             if let Some(doc_type) = request.doc_type {
                 doc.doc_type = doc_type;
             }
@@ -6918,12 +7053,79 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn inject_agents_default_to_unity_and_round_trip_empty_selection() {
+    fn custom_properties_import_and_round_trip_without_catalog_id() {
+        let source = "---\n类型: 角色\n别名: [女剑士, Elora]\n主角: true\n年龄: 19\n战斗: { hp: 100 }\n---\n\n# 艾洛拉\n\n正文\n";
+        let doc = parse_document(source, Some(KnowledgeType::Design), Some("人物.md")).unwrap();
+        let again = parse_document(source, Some(KnowledgeType::Design), Some("人物.md")).unwrap();
+        assert_eq!(doc.id, again.id);
+        assert!(!doc.id.is_empty());
+        let properties = parse_custom_properties(&doc.properties_yaml).unwrap();
+        assert_eq!(properties["类型"].as_str(), Some("角色"));
+        assert_eq!(properties["别名"].as_sequence().unwrap().len(), 2);
+        assert!(!frontmatter_needs_normalization(source));
+        let reloaded = parse_document(&render_document(&doc).unwrap(), Some(KnowledgeType::Design), Some("人物.md")).unwrap();
+        assert_eq!(parse_custom_properties(&reloaded.properties_yaml).unwrap(), properties);
+        assert_eq!(reloaded.body, doc.body);
+    }
+
+    #[test]
+    fn custom_properties_survive_body_edit_rename_and_property_deletion() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_str().unwrap();
+        let mut doc = sample_doc();
+        doc.properties_yaml = "类型: 角色\n别名: [Elora]\n".into();
+        let original = save_document(root, doc).unwrap();
+        let changed = edit_document(root, &original.path, Some(original.doc_type), KnowledgeDocumentPatch {
+            body: Some(Some("正文已修改".into())),
+            new_path: Some("人物/艾洛拉.md".into()),
+            ..Default::default()
+        }).unwrap();
+        let reloaded = load_document_by_path(root, changed.doc_type, &changed.path).unwrap();
+        assert_eq!(parse_custom_properties(&reloaded.properties_yaml).unwrap(), parse_custom_properties(&original.properties_yaml).unwrap());
+        let edited = edit_document(root, &reloaded.path, Some(reloaded.doc_type), KnowledgeDocumentPatch {
+            properties_yaml: Some("类型: 主角\n年龄: 19\n".into()),
+            expected_properties_yaml: Some(reloaded.properties_yaml.clone()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(edited.body, reloaded.body);
+        assert_eq!(parse_custom_properties(&edited.properties_yaml).unwrap()["类型"].as_str(), Some("主角"));
+        let cleared = edit_document(root, &edited.path, Some(edited.doc_type), KnowledgeDocumentPatch {
+            properties_yaml: Some(String::new()), ..Default::default()
+        }).unwrap();
+        assert!(load_document_by_path(root, cleared.doc_type, &cleared.path).unwrap().properties_yaml.is_empty());
+    }
+
+    #[test]
+    fn custom_properties_reject_reserved_names_invalid_yaml_and_stale_updates() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_str().unwrap();
+        let original = save_document(root, sample_doc()).unwrap();
+        for yaml in ["id: overridden", "injectMode: full", "summaryCache: old", "- not a mapping", "类型: [broken"] {
+            assert!(edit_document(root, &original.path, Some(original.doc_type), KnowledgeDocumentPatch {
+                properties_yaml: Some(yaml.into()), ..Default::default()
+            }).is_err(), "{yaml}");
+        }
+        assert!(edit_document(root, &original.path, Some(original.doc_type), KnowledgeDocumentPatch {
+            properties_yaml: Some("类型: 角色".into()), expected_properties_yaml: Some("类型: 地点".into()), ..Default::default()
+        }).is_err());
+        let reloaded = load_document_by_path(root, original.doc_type, &original.path).unwrap();
+        assert_eq!(reloaded.body, original.body);
+        assert!(reloaded.properties_yaml.is_empty());
+    }
+
+    #[test]
+    fn missing_inject_agents_keep_legacy_unity_target_and_round_trip_empty_selection() {
         let source = "---\nid: kd_agents\ninjectMode: full\n---\n\nAgent-specific knowledge";
         let mut doc = parse_document(source, Some(KnowledgeType::Design), Some("agents.md")).unwrap();
         assert_eq!(doc.inject_agents, vec!["unity"]);
         assert!(document_allows_agent_injection(&doc, "unity"));
+        assert!(!document_allows_agent_injection(&doc, "general"));
         assert!(!document_allows_agent_injection(&doc, "reviewer"));
+
+        let explicit = "---\nid: kd_agents\ninjectMode: full\ninjectAgents:\n- unity\n---\n\nAgent-specific knowledge";
+        let explicit = parse_document(explicit, Some(KnowledgeType::Design), Some("agents.md")).unwrap();
+        assert_eq!(explicit.inject_agents, vec!["unity"]);
+        assert!(!document_allows_agent_injection(&explicit, "general"));
 
         doc.inject_agents.clear();
         let rendered = render_document(&doc).unwrap();
@@ -6937,6 +7139,118 @@ mod tests {
             doc.inject_mode = mode;
             assert!(document_allows_agent_injection(&doc, "reviewer"));
         }
+    }
+
+    #[test]
+    fn inject_agent_patterns_support_wildcards() {
+        for (pattern, agent, expected) in [
+            ("*", "unity", true),
+            ("*", "general", true),
+            ("*", "custom-reviewer", true),
+            (" * ", "simple", true),
+            ("team-*", "team-reviewer", true),
+            ("team-*", "team-", true),
+            ("team-*", "teams", false),
+            ("*-reviewer", "code-reviewer", true),
+            ("*-reviewer", "reviewer", false),
+            ("a*b*c", "axxbyyc", true),
+            ("a*b*c", "acb", false),
+            ("ab*b", "ab", false),
+            ("ab*b", "abb", true),
+            ("unity", "unity", true),
+            ("unity", "general", false),
+            ("doc", "unity", true),
+            ("Unity", "unity", false),
+        ] {
+            assert_eq!(
+                inject_agent_pattern_matches(pattern, agent),
+                expected,
+                "pattern {pattern:?} against {agent:?}"
+            );
+        }
+
+        let mut doc = parse_document(
+            "---\nid: kd_agents\ninjectMode: rule\ninjectAgents:\n- 'team-*'\n- ' doc '\n- unity\n---\n\nBody",
+            Some(KnowledgeType::Design),
+            Some("agents.md"),
+        )
+        .unwrap();
+        assert_eq!(doc.inject_agents, vec!["team-*", "unity"]);
+        assert!(document_allows_agent_injection(&doc, "team-a"));
+        assert!(document_allows_agent_injection(&doc, "unity"));
+        assert!(!document_allows_agent_injection(&doc, "general"));
+        doc.inject_agents = vec!["*".into()];
+        assert!(document_allows_agent_injection(&doc, "general"));
+        assert!(document_allows_agent_injection(&doc, "researcher"));
+    }
+
+    #[test]
+    fn frontmatter_accepts_scalar_or_list_wildcards_and_round_trips() {
+        for source in [
+            "---\nid: kd_all\ninjectMode: full\ninjectAgents: '*'\n---\n\nBody",
+            "---\nid: kd_all\ninjectMode: full\ninjectAgents: [\"*\"]\n---\n\nBody",
+            "---\nid: kd_all\ninjectMode: full\ninjectAgents:\n- '*'\n---\n\nBody",
+        ] {
+            let doc = parse_document(source, Some(KnowledgeType::Memory), Some("all.md")).unwrap();
+            assert_eq!(doc.inject_agents, vec!["*"], "{source}");
+            assert!(document_allows_agent_injection(&doc, "simple"));
+
+            let rendered = render_document(&doc).unwrap();
+            assert!(!frontmatter_needs_normalization(&rendered));
+            let reloaded = parse_document(&rendered, Some(KnowledgeType::Memory), Some("all.md")).unwrap();
+            assert_eq!(reloaded.inject_agents, vec!["*"], "{rendered}");
+        }
+    }
+
+    #[test]
+    fn documents_created_by_locus_inject_into_every_agent() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let created = update_document(
+            &working_dir,
+            KnowledgeUpdateRequest {
+                op: KnowledgeUpdateOp::Create,
+                path: "all-agents.md".to_string(),
+                doc_type: Some(KnowledgeType::Design),
+                title: Some("All Agents".to_string()),
+                inject_mode: Some(KnowledgeInjectMode::Full),
+                body: Some(Some("Shared design".to_string())),
+                ..Default::default()
+            },
+        )
+        .expect("create");
+        assert_eq!(created.inject_agents, vec!["*"]);
+        let reloaded = load_document_by_path(&working_dir, created.doc_type, &created.path).unwrap();
+        assert_eq!(reloaded.inject_agents, vec!["*"]);
+        for agent in ["unity", "general", "simple", "custom"] {
+            assert!(document_allows_agent_injection(&reloaded, agent), "{agent}");
+        }
+        assert_eq!(document_to_list_item(reloaded).inject_agents, vec!["*"]);
+
+        let explicit = update_document(
+            &working_dir,
+            KnowledgeUpdateRequest {
+                op: KnowledgeUpdateOp::Create,
+                path: "unity-only.md".to_string(),
+                doc_type: Some(KnowledgeType::Design),
+                title: Some("Unity Only".to_string()),
+                inject_agents: Some(vec!["unity".to_string()]),
+                body: Some(Some("Unity design".to_string())),
+                ..Default::default()
+            },
+        )
+        .expect("create explicit");
+        assert_eq!(explicit.inject_agents, vec!["unity"]);
+
+        let prepared = prepare_generic_knowledge_write(
+            &working_dir,
+            KnowledgeType::Memory,
+            "written.md",
+            "Written by an Agent",
+        )
+        .unwrap();
+        let written = parse_document(&prepared.content, Some(KnowledgeType::Memory), Some("written.md")).unwrap();
+        assert_eq!(written.inject_agents, vec!["*"]);
     }
 
     #[test]
@@ -6988,7 +7302,8 @@ mod tests {
 
     fn sample_doc() -> KnowledgeDocument {
         KnowledgeDocument {
-            inject_agents: crate::knowledge_store::default_inject_agents(),
+            properties_yaml: String::new(),
+            inject_agents: crate::knowledge_store::legacy_inject_agents(),
             id: "kd_test".to_string(),
             doc_type: KnowledgeType::Design,
             path: "gameplay/core-loop.md".to_string(),
@@ -7191,7 +7506,8 @@ mod tests {
 
     fn sample_unity_bundle_doc() -> KnowledgeDocument {
         KnowledgeDocument {
-            inject_agents: crate::knowledge_store::default_inject_agents(),
+            properties_yaml: String::new(),
+            inject_agents: crate::knowledge_store::legacy_inject_agents(),
             id: "kd_unity_bundle_doc".to_string(),
             doc_type: KnowledgeType::Reference,
             path: "unity-official-docs/manual/ExecutionOrder.md".to_string(),
@@ -7233,7 +7549,8 @@ mod tests {
 
     fn sample_memory_doc() -> KnowledgeDocument {
         KnowledgeDocument {
-            inject_agents: crate::knowledge_store::default_inject_agents(),
+            properties_yaml: String::new(),
+            inject_agents: crate::knowledge_store::legacy_inject_agents(),
             id: "kd_memory_test".to_string(),
             doc_type: KnowledgeType::Memory,
             path: MEMORY_USER_PREFERENCE_PATH.to_string(),
@@ -7424,9 +7741,7 @@ mod tests {
         let migrated_root = read_directory_config(&working_dir, KnowledgeType::Memory, "")
             .expect("read preserved root config");
         assert_eq!(migrated_root.config.summary, "当前根配置");
-        assert!(Path::new(&working_dir)
-            .join("Library")
-            .join("Locus")
+        assert!(crate::knowledge_index::library_dir_for_working_dir(&working_dir)
             .join("knowledge_migration_backups")
             .join("memory-wrapped-root.locus-meta")
             .is_file());
@@ -8073,7 +8388,8 @@ updatedAt: 2
     #[test]
     fn render_and_parse_skill_round_trip_preserves_skill_fields() {
         let doc = KnowledgeDocument {
-            inject_agents: crate::knowledge_store::default_inject_agents(),
+            properties_yaml: String::new(),
+            inject_agents: crate::knowledge_store::legacy_inject_agents(),
             id: "kd_skill".to_string(),
             doc_type: KnowledgeType::Skill,
             path: "create-skill.md".to_string(),
@@ -9289,7 +9605,8 @@ Body content
             save_document(
                 &working_dir,
                 KnowledgeDocument {
-                    inject_agents: crate::knowledge_store::default_inject_agents(),
+                    properties_yaml: String::new(),
+                    inject_agents: crate::knowledge_store::legacy_inject_agents(),
                     id: id.to_string(),
                     doc_type: KnowledgeType::Memory,
                     path: path.to_string(),
@@ -9358,7 +9675,8 @@ Body content
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_builtin_memory_project_mistake_note".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: MEMORY_PROJECT_MISTAKE_NOTE_PATH.to_string(),
@@ -9413,7 +9731,8 @@ Body content
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_builtin_memory_user_preference".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: MEMORY_USER_PREFERENCE_LEGACY_PATH.to_string(),
@@ -9473,7 +9792,8 @@ Body content
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_builtin_memory_user_preference".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: MEMORY_USER_PREFERENCE_PATH.to_string(),
@@ -9572,7 +9892,8 @@ Body content
             save_document(
                 &working_dir,
                 KnowledgeDocument {
-                    inject_agents: crate::knowledge_store::default_inject_agents(),
+                    properties_yaml: String::new(),
+                    inject_agents: crate::knowledge_store::legacy_inject_agents(),
                     id: id.to_string(),
                     doc_type: KnowledgeType::Memory,
                     path: path.to_string(),
@@ -9704,7 +10025,8 @@ Body content
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_custom_project_understanding".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: "project-understanding.md".to_string(),

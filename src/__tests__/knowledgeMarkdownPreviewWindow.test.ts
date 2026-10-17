@@ -115,7 +115,8 @@ describe("knowledgeMarkdownPreviewWindow", () => {
     expect(documentOpen).toContain('displaySettings.memoryFileOpenTarget === "window"');
     expect(assetChip).toContain("await openKnowledgeDocument(knowledgeRef.value.docType");
     expect(windowApp).toContain('kind: "knowledge-markdown-preview"');
-    expect(viewer).toContain("<MarkdownRenderer v-else :content=\"content\" text-zoom />");
+    expect(viewer).toContain("<SearchableContent v-else>");
+    expect(viewer).toContain("<MarkdownRenderer :content=\"content\" text-zoom />");
     expect(viewer).toContain('part: "full"');
     expect(capabilities).toContain('"knowledge-markdown-preview"');
   });

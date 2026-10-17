@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch, watchPostEffect } from "vue";
+import { computed, inject, onUnmounted, ref, watch, watchPostEffect } from "vue";
 import type {
   KnowledgeDocumentPatch,
   KnowledgeDocumentEditOperation,
@@ -33,17 +33,9 @@ import { KnowledgeEditorWorkspaceSessionStore } from "./knowledge/knowledgeEdito
 import type { MarkdownReferenceToken } from "./ui/markdown-editor/markdownComplexTokens";
 import { knowledgeRead } from "../services/knowledge";
 import { readKnowledgeDocumentCached } from "../composables/knowledgeDocumentCache";
-import {
-  openFileExternal,
-  openUnityAssetInspector,
-  openUnitySceneObjectInspector,
-  showInFolder,
-} from "../services/unity";
-import { viewRun, viewTree, type ViewPackageSummary } from "../services/view";
-import {
-  parseUnityPropertyFence,
-  unityPropertyFenceUnitySelectionTarget,
-} from "../composables/unityPropertyFence";
+import { openMarkdownReference } from "../services/markdownReference";
+import { useOpenView } from "../composables/useOpenView";
+import { WORKBENCH_FILE_OPEN_KEY, openWorkbenchFileTab } from "../services/workbenchFile";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "../stores/notification";
 import type { KnowledgeWorkbenchPage } from "../types/workbench";
@@ -51,13 +43,19 @@ import type { WorkbenchEditorTransferSnapshot } from "../types/workbench";
 import type { ToolFilePreviewHighlight } from "../services/toolFilePreviewWindow";
 
 const csvPreview = ref<InstanceType<typeof WorkspaceCsvEditor> | null>(null);
+const documentPreview = ref<InstanceType<typeof KnowledgePreview> | null>(null);
+const knowledgeSidebarRef = ref<HTMLElement | null>(null);
 defineExpose({
   saveFile: async () => await csvPreview.value?.saveFile() ?? false,
   discardChanges: () => csvPreview.value?.discardChanges(),
   refreshIfChanged: async () => { await csvPreview.value?.refreshIfChanged(); },
   revealToolFileHighlight: async (highlight?: ToolFilePreviewHighlight) => await csvPreview.value?.revealToolFileHighlight(highlight) ?? false,
-  exportTransferSnapshot: (): WorkbenchEditorTransferSnapshot => csvPreview.value?.exportTransferSnapshot() ?? { kind: "resource" },
-  applyTransferSnapshot: async (snapshot: WorkbenchEditorTransferSnapshot) => await csvPreview.value?.applyTransferSnapshot(snapshot) ?? false,
+  exportTransferSnapshot: (): WorkbenchEditorTransferSnapshot => csvPreview.value?.exportTransferSnapshot()
+    ?? documentPreview.value?.exportTransferSnapshot() ?? { kind: "resource" },
+  applyTransferSnapshot: async (snapshot: WorkbenchEditorTransferSnapshot) => snapshot.kind === "knowledge"
+    ? await documentPreview.value?.restoreWorkState(snapshot) ?? false : await csvPreview.value?.applyTransferSnapshot(snapshot) ?? false,
+  restoreWorkState: async (snapshot: WorkbenchEditorTransferSnapshot) => snapshot.kind === "knowledge"
+    ? await documentPreview.value?.restoreWorkState(snapshot) ?? false : await csvPreview.value?.applyTransferSnapshot(snapshot, true) ?? false,
 });
 
 const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
@@ -147,6 +145,7 @@ const {
   beginExplorerDrag,
   endExplorerDrag,
   refreshKnowledgeData,
+  refreshSelectedDocument,
   saveGeneralConfigPatch,
   setSemanticSearchEnabled,
   setEmbeddingDevicePolicy,
@@ -508,86 +507,12 @@ async function openKnowledgeEditorReference(reference: MarkdownReferenceToken): 
   await selectDocument(document);
 }
 
-function normalizeViewReferenceKey(value: string): string {
-  return normalizeReferencePath(value).replace(/^\/+|\/+$/g, "").toLowerCase();
-}
-
-function viewMatchesReference(view: ViewPackageSummary, referenceKey: string): boolean {
-  return [view.id, view.displayPath, view.packageRelPath, view.name]
-    .some((candidate) => candidate && normalizeViewReferenceKey(candidate) === referenceKey);
-}
-
-async function openViewEditorReference(reference: MarkdownReferenceToken, workspaceRef: WorkspaceRef): Promise<void> {
-  const referenceKey = normalizeViewReferenceKey(reference.path);
-  const snapshot = await viewTree(workspaceRef);
-  const viewId = snapshot.views.find((view) => viewMatchesReference(view, referenceKey))?.id
-    ?? reference.path;
-  await viewRun(workspaceRef, viewId);
-}
-
-function unitySceneObjectTarget(path: string): { scenePath: string; objectPath: string } | null {
-  const normalized = normalizeReferencePath(path);
-  const match = normalized.match(/^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i);
-  if (!match?.[1] || !match[2]) return null;
-  return { scenePath: match[1], objectPath: match[2].replace(/^\/+|\/+$/g, "") };
-}
-
-async function openUnityEditorReference(
-  reference: MarkdownReferenceToken,
-  workspaceRef: WorkspaceRef,
-): Promise<void> {
-  if (reference.kind === "unity-property") {
-    const parsed = parseUnityPropertyFence(reference.raw);
-    const target = parsed.entries[0]
-      ? unityPropertyFenceUnitySelectionTarget(parsed.entries[0].target)
-      : null;
-    if (target?.kind === "sceneObject") {
-      await openUnitySceneObjectInspector(workspaceRef, target.scenePath, target.objectPath);
-      return;
-    }
-    if (target?.kind === "asset") {
-      await openUnityAssetInspector(workspaceRef, target.path);
-      return;
-    }
-  }
-
-  const sceneObject = unitySceneObjectTarget(reference.path);
-  if (sceneObject) {
-    await openUnitySceneObjectInspector(workspaceRef, sceneObject.scenePath, sceneObject.objectPath);
-    return;
-  }
-  const assetPath = normalizeReferencePath(reference.path).replace(/#fileID:-?\d+$/i, "");
-  await openUnityAssetInspector(workspaceRef, assetPath);
-}
+const openReferencedFile = inject(WORKBENCH_FILE_OPEN_KEY, openWorkbenchFileTab);
+const openViewPackage = useOpenView();
 
 async function handleEditorReferenceOpen(reference: MarkdownReferenceToken): Promise<void> {
   try {
-    if (reference.kind === "knowledge") {
-      await openKnowledgeEditorReference(reference);
-      return;
-    }
-    const workspaceRef = props.workspaceRef;
-    if (!workspaceRef) return;
-    if (reference.kind === "view") {
-      await openViewEditorReference(reference, workspaceRef);
-      return;
-    }
-    if (
-      reference.kind === "unity-asset"
-      || reference.kind === "unity-scene-object"
-      || reference.kind === "unity-property"
-    ) {
-      await openUnityEditorReference(reference, workspaceRef);
-      return;
-    }
-
-    const path = normalizeReferencePath(reference.path).replace(/\/+$/, "");
-    if (!path) return;
-    if (/\/$/.test(reference.raw.trim())) {
-      await showInFolder(workspaceRef, path);
-      return;
-    }
-    await openFileExternal(workspaceRef, path);
+    if (props.workspaceRef) await openMarkdownReference(reference, props.workspaceRef, openReferencedFile, openKnowledgeEditorReference, openViewPackage);
   } catch (cause) {
     const error = normalizeAppError(cause);
     notificationStore.addNotice("warning", error.message, {
@@ -820,10 +745,14 @@ onUnmounted(() => {
     <template v-else>
       <div
         v-if="!props.embedded"
+        ref="knowledgeSidebarRef"
         class="kx-side"
+        tabindex="-1"
         :style="props.listOnly ? undefined : { width: sidebarWidth + 'px' }"
       >
         <KnowledgeSearchBar
+          :scope="knowledgeSidebarRef"
+          :active="props.active"
           :query="searchQuery"
           :searching="searching"
           @update:query="updateSearchQuery"
@@ -943,12 +872,14 @@ onUnmounted(() => {
             @dirty-change="emit('dirtyChange', $event)"
           />
           <KnowledgePreview
+            ref="documentPreview"
             v-else-if="selectedDocument"
             :document="selectedDocument"
             :search-context="selectedSearchContext"
             :loading="selectedDocumentLoading"
             :save-loading="savingDocument"
             :save-edits="handleSaveEdits"
+            @external-change="refreshSelectedDocument()"
             :embedded="props.embedded"
             :active="props.active"
             :workspace-ref="props.workspaceRef ?? null"

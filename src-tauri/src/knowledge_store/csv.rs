@@ -37,7 +37,8 @@ pub(super) fn parse_csv_document(
         return Err("CSV documents cannot be executable skills".to_string());
     }
     let mut doc = KnowledgeDocument {
-        inject_agents: crate::knowledge_store::default_inject_agents(),
+        properties_yaml: String::new(),
+        inject_agents: crate::knowledge_store::legacy_inject_agents(),
         id: csv_document_id(doc_type, &path),
         title: default_document_title_from_path(&path)?,
         path,

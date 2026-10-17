@@ -8,6 +8,7 @@ import {
 } from "./markdownInject";
 import { markdownMathExtension } from "./markdownMath";
 import { wrapMarkdownTables } from "./markdownTableHtml";
+import { sessionIdFromReference } from "./sessionReferences";
 
 export function escapeMarkdownHtml(source: string): string {
   return source
@@ -48,6 +49,14 @@ export const markdownEngine = new Marked(
   {
     breaks: true,
     gfm: true,
+    renderer: {
+      link(token) {
+        const sessionId = sessionIdFromReference(token.href);
+        if (!sessionId) return false;
+        // Keep DOMPurify's protocol allowlist unchanged. Only validated IDs get an internal anchor.
+        return `<a href="#locus-session/${sessionId}">${this.parser.parseInline(token.tokens)}</a>`;
+      },
+    },
     hooks: {
       postprocess(html) {
         return wrapMarkdownTables(html);

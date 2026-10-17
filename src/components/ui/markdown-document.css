@@ -101,6 +101,50 @@
   overflow-wrap: anywhere;
 }
 
+.document-title-input-shell {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+}
+
+.document-title-input-shell::after {
+  content: attr(data-value) " ";
+  grid-area: 1 / 1;
+  visibility: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.document-title-input {
+  grid-area: 1 / 1;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 0 4px;
+  border: none;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  outline: none;
+}
+
+.document-title-input:hover {
+  border-bottom-color: var(--border-color);
+}
+
+.document-title-input:focus {
+  border-bottom-color: color-mix(in srgb, var(--accent-color) 48%, var(--border-color));
+}
+
+.document-title-input::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.62;
+}
+
+.document-title-error {
+  margin-top: 6px;
+  color: var(--status-error-fg);
+  font-size: 12px;
+}
+
 .document-body {
   min-height: 360px;
   padding-top: 20px;
@@ -111,6 +155,16 @@
   min-height: 360px;
   height: auto;
   padding-bottom: 32px;
+}
+
+.document-body-with-properties {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.document-body-with-properties :deep(.base-markdown-editor-host) {
+  padding-top: 20px;
+  border-top: 1px solid var(--border-color);
 }
 
 .document-body :deep(.base-markdown-editor .cm-scroller) {

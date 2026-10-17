@@ -7,6 +7,8 @@ import BaseMarkdownEditor from "../components/ui/BaseMarkdownEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../components/ui/markdown-editor/markdownEditorDocumentChange";
 import type { MarkdownReferenceToken } from "../components/ui/markdown-editor/markdownComplexTokens";
 import { MarkdownEditorSessionCache } from "../components/ui/markdown-editor/markdownEditorSessionCache";
+import { useDocumentEditingSettings } from "../composables/useDocumentEditingSettings";
+import { EditorView as CodeMirrorView } from "@codemirror/view";
 
 type EditorExpose = {
   getEditorView(): EditorView | null;
@@ -39,10 +41,48 @@ beforeEach(() => {
 afterEach(() => {
   app?.unmount();
   app = null;
+  useDocumentEditingSettings().setPunctuationPairing(false);
   document.body.replaceChildren();
 });
 
 describe("BaseMarkdownEditor runtime", () => {
+  it("applies the default-off pairing setting live in both document modes", async () => {
+    const settings = useDocumentEditingSettings();
+    expect(settings.state.punctuationPairing).toBe(false);
+    const editorRef = ref<EditorExpose | null>(null);
+    const mode = ref<"rendered" | "native">("rendered");
+    const model = ref("");
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    app = createApp({ setup: () => () => h(BaseMarkdownEditor, {
+      ref: editorRef, modelValue: model.value, viewMode: mode.value,
+      contentPath: "notes.md", "onUpdate:modelValue": (value: string) => { model.value = value; },
+    }) });
+    app.mount(root);
+    await nextTick();
+    const view = editorRef.value!.getEditorView()!;
+    function input(text: string) {
+      const { from, to } = view.state.selection.main;
+      const insert = () => view.state.update(view.state.replaceSelection(text), { userEvent: "input.type" });
+      if (!view.state.facet(CodeMirrorView.inputHandler).some(handler => handler(view, from, to, text, insert))) view.dispatch(insert());
+    }
+    input("(");
+    expect(model.value).toBe("(");
+    settings.setPunctuationPairing(true);
+    await nextTick();
+    input("「");
+    expect(model.value).toBe("(「」");
+    mode.value = "native";
+    await nextTick();
+    input("[");
+    expect(model.value).toBe("(「[]」");
+    settings.setPunctuationPairing(false);
+    await nextTick();
+    input("{");
+    expect(model.value).toBe("(「[{]」");
+    expect(editorRef.value!.getEditorView()).toBe(view);
+  });
+
   it("emits an immutable document transaction without materializing v-model per keystroke", async () => {
     const root = document.createElement("div");
     document.body.appendChild(root);

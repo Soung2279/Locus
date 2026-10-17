@@ -875,6 +875,43 @@ function collectInlineCodePathCandidatesFromSource(source: string): string[] {
   return [normalizeMarkdownPathStatusKey(parsed.path)];
 }
 
+const MARKDOWN_FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
+const MARKDOWN_INLINE_CODE_RE = /(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g;
+
+/**
+ * Collects inline code path candidates directly from markdown source, so their
+ * statuses can be resolved before a transcript renders. It is a cheap superset
+ * of collectInlineCodePathCandidates on the parsed HTML: a candidate it misses
+ * is still resolved by the renderer, only later.
+ */
+export function collectMarkdownInlineCodePathCandidates(markdown: string): string[] {
+  if (!markdown.includes("`")) return [];
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  let fence: string | null = null;
+  for (const line of markdown.split("\n")) {
+    const fenceMatch = line.match(MARKDOWN_FENCE_RE);
+    if (fence) {
+      if (fenceMatch && fenceMatch[1][0] === fence[0] && fenceMatch[1].length >= fence.length) fence = null;
+      continue;
+    }
+    if (fenceMatch) {
+      fence = fenceMatch[1];
+      continue;
+    }
+    if (!line.includes("`")) continue;
+    for (const match of line.matchAll(MARKDOWN_INLINE_CODE_RE)) {
+      for (const candidate of collectInlineCodePathCandidatesFromSource(escapeAttr(match[2]))) {
+        const key = normalizeMarkdownPathStatusKey(candidate);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        candidates.push(key);
+      }
+    }
+  }
+  return candidates;
+}
+
 export function collectInlineCodePathCandidates(html: string): string[] {
   const parts = html.split(/(<[^>]+>)/);
   const candidates: string[] = [];

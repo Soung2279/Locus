@@ -32,8 +32,10 @@ import { markdownTableEditing, markdownTableLayout } from "./markdownTableEditin
 import { markdownVisualCommands } from "./markdownVisualCommands";
 import { markdownRichPaste } from "./markdownRichPaste";
 import { decodeMarkdownDestination, markdownLinkTarget } from "./markdownEditTarget";
+import { markdownLinkHref, markdownLinkIconKind, markdownLinkKeyboard, MarkdownLinkEntityWidget, MarkdownLinkIconWidget } from "./markdownLinkWidgets";
 import { Prec } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
+import { frontmatterEnd } from "./markdownFrontmatter";
 
 function selectionTouches(view: EditorView, from: number, to: number): boolean {
   if (!view.hasFocus || view.state.readOnly) return false;
@@ -165,7 +167,15 @@ function syntaxTokenActivationRange(
 }
 
 function syntaxTokenIsActive(view: EditorView, node: MarkdownSyntaxNode): boolean {
-  if (!["CodeMark", "CodeInfo"].includes(node.name) || closestSyntaxNode(node, "InlineCode")) return false;
+  const parent = node.parent;
+  if (parent && (
+    node.name === "EmphasisMark"
+    || node.name === "StrikethroughMark"
+    || (node.name === "CodeMark" && parent.name === "InlineCode")
+  )) {
+    return selectionTouches(view, parent.from, parent.to);
+  }
+  if (!["CodeMark", "CodeInfo"].includes(node.name)) return false;
   const range = syntaxTokenActivationRange(view, node);
   return selectionTouches(view, range.from, range.to);
 }
@@ -376,6 +386,8 @@ function buildLivePreviewDecorations(
   };
 
   const tree = syntaxTree(view.state);
+  const metadataEnd = frontmatterEnd(view.state);
+  occupy(0, metadataEnd);
   for (const visibleRange of view.visibleRanges) {
     tree.iterate({
       from: visibleRange.from,
@@ -383,6 +395,7 @@ function buildLivePreviewDecorations(
       enter(nodeRef) {
         const node = nodeRef.node;
         const { name, from, to } = nodeRef;
+        if (name !== "Document" && from < metadataEnd) return false;
 
         if (name === "Table") {
           if (!markdownTableLayout(view.state, node)) return false;
@@ -512,20 +525,46 @@ function buildLivePreviewDecorations(
           return;
         }
         if (name === "Link") {
-          add(from, to, Decoration.mark({ class: "cm-live-link" }), "link");
+          const target = markdownLinkTarget(view.state, from);
+          const href = target ? markdownLinkHref(target.url) : null;
+          if (href) {
+            add(from, to, Decoration.mark({
+              tagName: "a", class: "cm-live-link",
+              attributes: { href, title: target?.title || href, tabindex: "0", "data-link-from": String(from) },
+            }), "link");
+            const kind = markdownLinkIconKind(href);
+            const labelFrom = node.getChildren("LinkMark")[0]?.to;
+            if (kind && labelFrom !== undefined) {
+              add(labelFrom, labelFrom, Decoration.widget({ widget: new MarkdownLinkIconWidget(kind), side: -1 }), "link-icon");
+            }
+          }
+          return;
+        }
+
+        if ((name === "Escape" || name === "Entity") && closestSyntaxNode(node as unknown as MarkdownSyntaxNode, "Link")) {
+          if (name === "Escape") {
+            add(from, from + 1, Decoration.replace({}), "hide-link-escape");
+          } else {
+            add(from, to, Decoration.replace({ widget: new MarkdownLinkEntityWidget(view.state.sliceDoc(from, to)) }), "link-entity");
+          }
           return;
         }
 
         if (name === "HeaderMark") {
           if (node.parent?.name.startsWith("SetextHeading")) return false;
-          if (!syntaxTokenIsActive(view, node as unknown as MarkdownSyntaxNode)) {
+          const heading = node.parent;
+          if (heading && from === heading.from && selectionTouches(view, heading.from, heading.to)) {
+            add(from, to, Decoration.mark({ class: "cm-live-heading-marker" }), "heading-marker");
+          } else {
             add(from, to, Decoration.replace({}), "hide-header-mark");
           }
           return;
         }
 
         if (name === "EmphasisMark" || name === "StrikethroughMark") {
-          if (!syntaxTokenIsActive(view, node as unknown as MarkdownSyntaxNode)) {
+          if (syntaxTokenIsActive(view, node as unknown as MarkdownSyntaxNode)) {
+            add(from, to, Decoration.mark({ class: "cm-live-syntax-marker" }), `syntax-marker-${name}`);
+          } else {
             add(from, to, Decoration.replace({}), `hide-${name}`);
           }
           return;
@@ -545,6 +584,8 @@ function buildLivePreviewDecorations(
         if (name === "CodeMark" || name === "CodeInfo") {
           if (!syntaxTokenIsActive(view, node as unknown as MarkdownSyntaxNode)) {
             add(from, to, Decoration.replace({}), `hide-code-${name}`);
+          } else if (name === "CodeMark") {
+            add(from, to, Decoration.mark({ class: "cm-live-syntax-marker" }), "syntax-marker-code");
           }
           return;
         }
@@ -582,6 +623,10 @@ function buildLivePreviewDecorations(
         }
 
         if (name === "Blockquote") {
+          if (!node.parent || !closestSyntaxNode(node.parent, "Blockquote")) {
+            addLine(from, "cm-live-blockquote-start");
+            addLine(Math.max(from, to - 1), "cm-live-blockquote-end");
+          }
           let line = view.state.doc.lineAt(from);
           while (line.from <= to) {
             addLine(line.from, "cm-live-blockquote");
@@ -1010,14 +1055,39 @@ export function markdownLivePreview(options: MarkdownLivePreviewOptions = {}): E
     markdownTableEditing(),
     markdownVisualCommands(),
     markdownRichPaste(),
+    markdownLinkKeyboard(options),
     EditorView.domEventHandlers({
       click(event, view) {
-        if (view.state.readOnly || !(event.target instanceof Element)) return false;
+        if (!(event.target instanceof Element)) return false;
         const link = event.target.closest(".cm-live-link");
         if (!link) return false;
-        const target = markdownLinkTarget(view.state, view.posAtDOM(link));
-        if (target) options.onEditTarget?.(target);
-        return false;
+        event.preventDefault();
+        const selection = view.dom.ownerDocument.getSelection();
+        if (event.button !== 0 || event.detail > 1 || (selection && !selection.isCollapsed
+          && Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index)).some(range => range.intersectsNode(link)))) return true;
+        const href = link.getAttribute("href");
+        if (href) options.onLinkOpen?.(href);
+        return true;
+      },
+      auxclick(event) {
+        if (!(event.target instanceof Element)) return false;
+        const link = event.target.closest(".cm-live-link");
+        if (!link) return false;
+        event.preventDefault();
+        const href = link.getAttribute("href");
+        if (event.button === 1 && href) options.onLinkOpen?.(href);
+        return true;
+      },
+      contextmenu(event, view) {
+        if (view.state.readOnly || !(event.target instanceof Element)) return false;
+        const link = event.target.closest<HTMLElement>(".cm-live-link");
+        if (!link || link.closest(".cm-live-table-cell")) return false;
+        const target = markdownLinkTarget(view.state, Number(link.dataset.linkFrom));
+        if (!target || !options.onEditTarget) return false;
+        event.preventDefault();
+        event.stopPropagation();
+        options.onEditTarget(target);
+        return true;
       },
     }),
     Prec.high(keymap.of([{ key: "Mod-k", run(view) {

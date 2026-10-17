@@ -905,7 +905,7 @@ fn external_to_list_item_for(
     let file_path = record.root.join(doc_rel_path);
     let updated_at = get_updated_at(&file_path).max(record.updated_at);
     knowledge_store::KnowledgeListItem {
-        inject_agents: crate::knowledge_store::default_inject_agents(),
+        inject_agents: crate::knowledge_store::legacy_inject_agents(),
         id: external_document_id_for(record, doc_rel_path),
         doc_type: KnowledgeType::Skill,
         path: external_document_virtual_path(record, doc_rel_path),
@@ -975,7 +975,8 @@ pub(crate) fn external_to_document_for(
     };
     let updated_at = get_updated_at(&file_path).max(record.updated_at);
     Some(KnowledgeDocument {
-        inject_agents: crate::knowledge_store::default_inject_agents(),
+        properties_yaml: String::new(),
+        inject_agents: crate::knowledge_store::legacy_inject_agents(),
         id: external_document_id_for(record, doc_rel_path),
         doc_type: KnowledgeType::Skill,
         path: external_document_virtual_path(record, doc_rel_path),

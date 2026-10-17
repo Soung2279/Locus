@@ -11,11 +11,13 @@ const DOCUMENT_OUTLINE_BOTTOM_GUTTER = 24;
 
 type MarkdownDocumentOutlineOptions = {
   documentKey: () => string;
-  source: () => string;
+  source: () => string | { toString(): string };
   active: () => boolean;
   scroller: Ref<HTMLElement | null>;
   page: Ref<HTMLElement | null>;
   body: Ref<HTMLElement | null>;
+  /** The prose can start below properties inside a shared Markdown editor. */
+  bodyStart?: () => HTMLElement | null;
   editor: Ref<{ getEditorView: () => EditorView | null } | null>;
 };
 
@@ -114,7 +116,7 @@ export function useMarkdownDocumentOutline(options: MarkdownDocumentOutlineOptio
   function updateDocumentOutlineLayout(): void {
     const scroller = options.scroller.value;
     const page = options.page.value;
-    const body = options.body.value;
+    const body = options.bodyStart?.() ?? options.body.value;
     outlineViewportHeight.value = scroller?.clientHeight ?? 0;
     if (!scroller || !page || !body) {
       outlineViewportTop.value = DOCUMENT_OUTLINE_STICKY_TOP;
@@ -153,14 +155,18 @@ export function useMarkdownDocumentOutline(options: MarkdownDocumentOutlineOptio
   }
 
   watch(
-    [options.scroller, options.page, options.body],
-    ([scroller, page, body]) => observeDocumentOutlineLayout(scroller, page, body),
+    [options.scroller, options.page, options.body, () => options.bodyStart?.() ?? null],
+    ([scroller, page, body, bodyStart]) => {
+      observeDocumentOutlineLayout(scroller, page, body);
+      if (bodyStart && bodyStart !== body) outlineResizeObserver?.observe(bodyStart);
+      void nextTick(scheduleDocumentOutlineActiveUpdate);
+    },
     { flush: "post" },
   );
 
-  function applyDocumentOutlineSource(source: string): void {
+  function applyDocumentOutlineSource(source: string | { toString(): string }): void {
     outlineRefreshTimer = null;
-    documentOutlineItems.value = extractKnowledgeDocumentOutline(source);
+    documentOutlineItems.value = extractKnowledgeDocumentOutline(source.toString());
     if (!documentOutlineItems.value.some((item) => item.id === activeOutlineId.value)) {
       activeOutlineId.value = documentOutlineItems.value[0]?.id ?? "";
     }

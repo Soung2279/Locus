@@ -3965,6 +3965,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
       body: _patchBody,
       summary: _patchSummary,
       maintenanceRules: _patchMaintenanceRules,
+      propertiesYaml: _patchPropertiesYaml,
+      expectedPropertiesYaml: _patchExpectedPropertiesYaml,
       ...optimisticFields
     } = meta;
     const hasOptimisticFields = Object.keys(optimisticFields).length > 0;
@@ -5036,6 +5038,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     endExplorerDrag,
     markKnowledgeDataDirty,
     refreshKnowledgeData,
+    refreshSelectedDocument: () => loadSelectedDocument(undefined, { force: true, silent: true }),
     refreshRetrievalState,
     saveGeneralConfigPatch,
     saveEmbeddingConfigPatch,

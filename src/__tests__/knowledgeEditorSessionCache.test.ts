@@ -5,9 +5,32 @@ import {
   KnowledgeEditorWorkspaceSessionStore,
   knowledgeDirectoryEditorSessionKey,
   knowledgeDocumentEditorSessionKey,
+  serializeKnowledgeDocumentSession,
+  deserializeKnowledgeDocumentSession,
+  type KnowledgeDocumentEditorSession,
 } from "../components/knowledge/knowledgeEditorWorkspaceSession";
 
 describe("KnowledgeEditorSessionCache", () => {
+  it("round trips durable knowledge drafts, their baseline and blocked sections without CodeMirror objects", () => {
+    const session: KnowledgeDocumentEditorSession = {
+      drafts: { summary: "summary draft", maintenanceRules: "rules", body: "unsaved body" },
+      baseDrafts: { summary: "saved summary", maintenanceRules: "rules", body: "saved body" },
+      conflictResolutionDrafts: { summary: "remote", maintenanceRules: "rules", body: "remote body" },
+      dirtySections: new Set(["summary", "body"]), saveBlockedSections: new Set(["body"]),
+      sectionConflicts: { summary: [], maintenanceRules: [], body: [] },
+      sectionTextBuffers: new Map(), baseSectionTexts: new Map(),
+      fileNameDraft: "renamed", fileNameDirty: true, saveRevision: 4,
+    };
+    const saved = JSON.parse(JSON.stringify(serializeKnowledgeDocumentSession(session)));
+    const restored = deserializeKnowledgeDocumentSession(saved);
+    expect(restored.drafts).toEqual(session.drafts);
+    expect(restored.baseDrafts).toEqual(session.baseDrafts);
+    expect(restored.dirtySections).toEqual(session.dirtySections);
+    expect(restored.saveBlockedSections).toEqual(new Set(["body"]));
+    expect(restored.sectionTextBuffers.get("body")?.toString()).toBe("unsaved body");
+    expect(restored.baseSectionTexts.get("body")?.toString()).toBe("saved body");
+    expect(restored.fileNameDirty).toBe(true);
+  });
   it("evicts the least recently used session at its capacity", () => {
     const cache = new KnowledgeEditorSessionCache<number>(2);
     cache.set("a", 1);

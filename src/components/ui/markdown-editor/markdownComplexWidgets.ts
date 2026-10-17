@@ -32,6 +32,7 @@ export type MarkdownImageResolver = (
 ) => MarkdownImageResolution | string | null | Promise<MarkdownImageResolution | string | null>;
 
 export interface MarkdownLivePreviewOptions {
+  onLinkOpen?: (url: string) => void;
   onEditTarget?: (target: MarkdownEditTarget) => void;
   imageResolver?: MarkdownImageResolver;
   imageContext?: MarkdownImageResolverContext;

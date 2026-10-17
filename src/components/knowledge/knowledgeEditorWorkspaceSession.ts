@@ -1,4 +1,5 @@
 import type { Text } from "@codemirror/state";
+import { markdownEditorTextFromString } from "../ui/markdown-editor/markdownEditorDocumentChange";
 import type {
   KnowledgeDirectoryConfig,
   KnowledgeDirectoryConfigRecord,
@@ -41,6 +42,26 @@ export interface KnowledgeDirectoryEditorSession {
   markdownDirtyFields: Set<DirectoryMarkdownField>;
   submittedDraft: KnowledgeDirectoryConfig | null;
   dirty: boolean;
+}
+
+export type SavedKnowledgeDocumentSession = Omit<KnowledgeDocumentEditorSession,
+  "dirtySections" | "saveBlockedSections" | "sectionTextBuffers" | "baseSectionTexts"> & {
+    dirtySections: KnowledgeDocumentSection[];
+    saveBlockedSections: KnowledgeDocumentSection[];
+  };
+
+export function serializeKnowledgeDocumentSession(session: KnowledgeDocumentEditorSession): SavedKnowledgeDocumentSession {
+  const { sectionTextBuffers: _text, baseSectionTexts: _base, dirtySections, saveBlockedSections, ...values } = session;
+  return JSON.parse(JSON.stringify({ ...values, dirtySections: [...dirtySections], saveBlockedSections: [...saveBlockedSections] }));
+}
+
+export function deserializeKnowledgeDocumentSession(saved: SavedKnowledgeDocumentSession): KnowledgeDocumentEditorSession {
+  const sections = ["summary", "maintenanceRules", "body"] as const;
+  return { ...saved,
+    dirtySections: new Set(saved.dirtySections), saveBlockedSections: new Set(saved.saveBlockedSections),
+    sectionTextBuffers: new Map(sections.map(section => [section, markdownEditorTextFromString(saved.drafts[section])])),
+    baseSectionTexts: new Map(sections.map(section => [section, markdownEditorTextFromString(saved.baseDrafts[section])])),
+  };
 }
 
 export function knowledgeDocumentEditorSessionKey(

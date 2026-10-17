@@ -9,8 +9,10 @@ import LucideIcon from "../../icons/LucideIcon.vue";
 import type { WorkspaceRef } from "../../../services/project";
 import { mapMarkdownEditTarget, serializeMarkdownEdit, type MarkdownEditTarget } from "./markdownEditTarget";
 import { searchMarkdownEditorResources, type MarkdownResourceOption } from "./markdownEditorResources";
+import { importMarkdownImage, relativeMarkdownResource } from "../../../services/markdownImage";
+import { extractKnowledgeDocumentOutline } from "../../knowledge/knowledgeDocumentOutline";
 
-const props = defineProps<{ view: EditorView; workspaceRef?: WorkspaceRef | null }>();
+const props = defineProps<{ view: EditorView; workspaceRef?: WorkspaceRef | null; contentPath?: string }>();
 const owner = `markdown-controls-${Math.random().toString(36).slice(2)}`;
 const target = shallowRef<MarkdownEditTarget | null>(null);
 const url = ref("");
@@ -87,7 +89,11 @@ async function chooseFile() {
   try {
     const { open: selectFile } = await import("@tauri-apps/plugin-dialog");
     const selected = await selectFile({ multiple: false, filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"] }] });
-    if (target.value === current && typeof selected === "string") url.value = selected.replace(/\\/g, "/");
+    if (target.value === current && typeof selected === "string") {
+      const imported = props.workspaceRef && props.contentPath
+        ? await importMarkdownImage(props.workspaceRef, props.contentPath, selected) : null;
+      if (target.value === current) url.value = imported?.relativePath ?? selected.replace(/\\/g, "/");
+    }
   } catch { if (target.value === current) error.value = "无法选择文件"; }
 }
 
@@ -101,7 +107,10 @@ async function search() {
   try {
     const result = await searchMarkdownEditorResources(query.value, current, workspaceRef);
     if (disposed || sequence !== searchSequence || target.value !== current) return;
-    resources.value = result;
+    const headings = current.kind === "link"
+      ? extractKnowledgeDocumentOutline(props.view.state.doc.toString()).filter(item => item.text.toLowerCase().includes(query.value.toLowerCase()))
+        .map(item => ({ path: `#${encodeURIComponent(item.text)}`, name: item.text })) : [];
+    resources.value = [...headings, ...result];
     highlighted.value = 0;
   } catch { if (sequence === searchSequence) error.value = "资源搜索失败"; }
   finally { if (sequence === searchSequence) searching.value = false; }
@@ -115,7 +124,15 @@ function startSearch() {
 }
 watch(query, () => { clearTimeout(searchTimer); searchSequence++; searchTimer = setTimeout(() => void search(), 150); });
 watch(() => `${props.workspaceRef?.checkoutId}:${props.workspaceRef?.expectedGeneration}:${props.workspaceRef?.expectedMaterializationEpoch}`, () => close());
-function selectResource(resource: MarkdownResourceOption) { url.value = resource.path; searchOpen.value = false; searchSequence++; }
+async function selectResource(resource: MarkdownResourceOption) {
+  const current = target.value;
+  try {
+    const path = current?.kind !== "reference" && props.workspaceRef && props.contentPath && !resource.path.startsWith("#")
+      ? await relativeMarkdownResource(props.workspaceRef, props.contentPath, resource.path) : resource.path;
+    if (target.value !== current) return;
+    url.value = path; searchOpen.value = false; searchSequence++;
+  } catch (reason) { error.value = String(reason); }
+}
 function searchKey(event: KeyboardEvent) {
   if (event.key === "ArrowDown" || event.key === "ArrowUp") {
     event.preventDefault();
@@ -140,7 +157,7 @@ defineExpose({ open, update });
       <label class="md-edit-field"><span>{{ target.kind === 'reference' ? '目标' : '地址' }}</span><input v-model="url" aria-label="地址" spellcheck="false" /></label>
       <label v-if="target.kind === 'image'" class="md-edit-field"><span>说明</span><input v-model="label" aria-label="图片说明" /></label>
       <div class="md-edit-file-actions">
-        <BaseButton v-if="workspaceRef && target.kind !== 'link'" @click="startSearch">选择资源</BaseButton>
+        <BaseButton v-if="workspaceRef" @click="startSearch">选择资源</BaseButton>
         <BaseButton v-if="target.kind === 'image'" @click="chooseFile">选择文件</BaseButton>
       </div>
       <template v-if="searchOpen">

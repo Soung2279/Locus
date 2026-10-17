@@ -9,6 +9,8 @@ import {
 } from "../composables/markdownImages";
 import { escapeMarkdownHtml, markdownEngine } from "../composables/markdownEngine";
 import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLinks";
+import { openSessionReference } from "../services/sessionReference";
+import "../styles/markdown-links.css";
 import {
   collectInlineCodePathCandidates,
   injectAssetRefs,
@@ -24,7 +26,11 @@ import { resolveMathSentinels } from "../composables/markdownMath";
 import { prepareMarkdownCitations } from "../composables/markdownCitations";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
-import { loadCachedMarkdownPathStatuses } from "../composables/markdownPathStatusCache";
+import {
+  loadCachedMarkdownPathStatuses,
+  peekCachedMarkdownPathStatuses,
+} from "../composables/markdownPathStatusCache";
+import { useSurfaceContentReadiness } from "../composables/surfaceContentReadiness";
 import { useInternalDragController } from "../composables/useInternalDrag";
 import { useTextViewerZoom } from "../composables/useTextViewerZoom";
 import { workspaceFileChangeMatches } from "../composables/useFileChangeRevalidation";
@@ -32,7 +38,8 @@ import { resolveMarkdownImage } from "../services/markdownImage";
 import { subscribeWorkspaceFileChanges } from "../services/workspaceExplorer";
 import type { RuntimeUnsubscribe } from "../services/locusRuntime";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
-import { normalizeViewError, viewRun, viewTree, type ViewPackageSummary } from "../services/view";
+import { normalizeViewError, viewTree, type ViewPackageSummary } from "../services/view";
+import { useOpenView } from "../composables/useOpenView";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
@@ -64,12 +71,14 @@ const emit = defineEmits<{
 
 const rootRef = ref<HTMLElement | null>(null);
 const notificationStore = useNotificationStore();
+const openViewPackage = useOpenView();
 const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
 const internalDrag = useInternalDragController();
 const { textViewerZoomStyle, handleTextViewerZoomWheel } = useTextViewerZoom();
 const viewRefSummaries = ref<ViewPackageSummary[]>([]);
 const inlinePathStatuses = ref<Map<string, MarkdownPathStatus>>(new Map());
+const surfaceContentReadiness = useSurfaceContentReadiness();
 const markdownPreviewRevisionEpoch = ref(0);
 const appContext = getCurrentInstance()?.appContext ?? null;
 const markdownUnityObjectPreviewHosts = new Set<HTMLElement>();
@@ -177,6 +186,32 @@ function resolveInlinePathStatus(path: string): MarkdownPathStatus | null | unde
   return inlinePathStatuses.value.get(normalizeMarkdownPathStatusKey(path));
 }
 
+function sameInlinePathStatuses(
+  current: Map<string, MarkdownPathStatus>,
+  next: Map<string, MarkdownPathStatus>,
+): boolean {
+  if (current.size !== next.size) return false;
+  for (const [path, status] of next) {
+    const previous = current.get(path);
+    if (
+      !previous
+      || previous.path !== status.path
+      || previous.exists !== status.exists
+      || previous.entryKind !== status.entryKind
+    ) return false;
+  }
+  return true;
+}
+
+function applyInlinePathStatuses(statuses: Map<string, MarkdownPathStatus>) {
+  const next = new Map<string, MarkdownPathStatus>();
+  for (const [path, status] of statuses) {
+    next.set(normalizeMarkdownPathStatusKey(path), status);
+  }
+  // An unchanged revalidation must not re-render the markdown.
+  if (!sameInlinePathStatuses(inlinePathStatuses.value, next)) inlinePathStatuses.value = next;
+}
+
 async function loadInlinePathStatuses(html: string) {
   const candidates = collectInlineCodePathCandidates(html);
   const focusedWorkspaceRef = workspaceContextStore.focusedWorkspaceRef;
@@ -186,15 +221,24 @@ async function loadInlinePathStatuses(html: string) {
   const run = ++markdownInlinePathStatusLoadRun;
 
   if (!candidates.length) {
-    inlinePathStatuses.value = new Map();
+    applyInlinePathStatuses(new Map());
     return;
   }
   const workspaceRef = focusedWorkspaceRef;
   if (!workspaceRef) {
-    inlinePathStatuses.value = new Map();
+    applyInlinePathStatuses(new Map());
     return;
   }
 
+  // Known statuses render with the text itself, so a remounted transcript
+  // never swaps code spans for file references after its first frame.
+  const cached = peekCachedMarkdownPathStatuses(projectStore.workingDir, candidates, workspaceRef);
+  applyInlinePathStatuses(cached.statuses);
+  if (!cached.missing.length && !cached.stale) return;
+
+  // Unknown statuses change the layout once resolved; the owning surface stays
+  // unpresented until then. Stale ones only revalidate in the background.
+  const release = cached.missing.length ? surfaceContentReadiness?.hold() : undefined;
   try {
     const statuses = await loadCachedMarkdownPathStatuses(
       projectStore.workingDir,
@@ -202,15 +246,11 @@ async function loadInlinePathStatuses(html: string) {
       workspaceRef,
     );
     if (run !== markdownInlinePathStatusLoadRun) return;
-    const next = new Map<string, MarkdownPathStatus>();
-    for (const [path, status] of statuses) {
-      next.set(normalizeMarkdownPathStatusKey(path), status);
-    }
-    inlinePathStatuses.value = next;
+    applyInlinePathStatuses(statuses);
   } catch {
-    if (run === markdownInlinePathStatusLoadRun) {
-      inlinePathStatuses.value = new Map();
-    }
+    // The last known statuses stay rendered.
+  } finally {
+    release?.();
   }
 }
 
@@ -654,7 +694,7 @@ async function openMarkdownViewRef(button: HTMLButtonElement) {
     const viewId = await resolveMarkdownViewId(rawViewId);
     const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
     if (!workspaceRef) return;
-    await viewRun(workspaceRef, viewId);
+    await openViewPackage(workspaceRef, viewId);
   } catch (error) {
     const err = normalizeViewError(error);
     notificationStore.addNotice("error", err.message, {
@@ -686,7 +726,13 @@ function handleMarkdownContentActivation(event: MouseEvent) {
     event.preventDefault();
     event.stopPropagation();
 
-    const href = normalizeExternalMarkdownHref(anchor.getAttribute("href"));
+    const rawHref = anchor.getAttribute("href");
+    const sessionId = /^#locus-session\/([A-Za-z0-9_-]+)$/.exec(rawHref ?? "")?.[1];
+    if (sessionId) {
+      void openSessionReference(sessionId, anchor.textContent || sessionId);
+      return;
+    }
+    const href = normalizeExternalMarkdownHref(rawHref);
     if (!href) return;
 
     void openMarkdownHref(href);
@@ -834,19 +880,6 @@ function handleMarkdownWheel(event: WheelEvent) {
 
 .markdown-body blockquote > :last-child {
   margin-bottom: 0;
-}
-
-.markdown-body a {
-  color: var(--accent-color);
-  text-decoration-line: underline;
-  text-decoration-thickness: 1px;
-  text-underline-offset: 0.16em;
-  text-decoration-color: color-mix(in srgb, var(--accent-color) 40%, transparent);
-  transition: color 0.15s ease, text-decoration-color 0.15s ease;
-}
-
-.markdown-body a:hover {
-  text-decoration-color: currentColor;
 }
 
 .markdown-body hr {

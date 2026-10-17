@@ -3,16 +3,23 @@ import { redo, redoDepth, selectAll, undo, undoDepth } from "@codemirror/command
 import type { EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { nextTick, onBeforeUnmount, ref, shallowRef, useId, watch } from "vue";
+import {
+  BetweenHorizontalEnd, BetweenHorizontalStart, BetweenVerticalEnd, BetweenVerticalStart,
+  ClipboardPaste, Copy, History, Redo2, Scissors, SquareDashedMousePointer, TextQuote, Trash2, Undo2,
+  type IconNode,
+} from "lucide";
 import { t } from "../../../i18n";
+import LucideIcon from "../../icons/LucideIcon.vue";
 import BaseContextMenu from "../BaseContextMenu.vue";
 import { normalizeMarkdownEditorLineEndings } from "../markdownEditorFormatting";
 import { captureMarkdownEditorSelection, syncMarkdownDOMSelection, type MarkdownEditorSelection } from "./markdownEditorSelection";
 import { editMarkdownTable, markdownTableTarget, type MarkdownTableAction, type MarkdownTableTarget } from "./markdownTableEditing";
 
-const props = defineProps<{ view: EditorView; canQuote?: boolean }>();
+const props = defineProps<{ view: EditorView; canQuote?: boolean; canHistory?: boolean }>();
 const emit = defineEmits<{
   quoteSelection: [selection: MarkdownEditorSelection];
   actionError: [error: unknown];
+  history: [];
 }>();
 const position = ref<{ x: number; y: number } | null>(null);
 const menuId = useId();
@@ -25,6 +32,19 @@ const tableTarget = shallowRef<MarkdownTableTarget | null>(null);
 const tableActions: MarkdownTableAction[] = ["row-before", "row-after", "row-delete", "column-before", "column-after", "column-delete", "table-delete"];
 const actions = ["undo", "redo", "cut", "copy", "paste", "delete", "selectAll"] as const;
 type EditorAction = typeof actions[number] | "quoteSelection";
+const actionIcons: Record<EditorAction, IconNode> = {
+  undo: Undo2, redo: Redo2, cut: Scissors, copy: Copy, paste: ClipboardPaste,
+  delete: Trash2, selectAll: SquareDashedMousePointer, quoteSelection: TextQuote,
+};
+const tableActionIcons: Record<MarkdownTableAction, IconNode> = {
+  "row-before": BetweenHorizontalStart,
+  "row-after": BetweenHorizontalEnd,
+  "row-delete": Trash2,
+  "column-before": BetweenVerticalStart,
+  "column-after": BetweenVerticalEnd,
+  "column-delete": Trash2,
+  "table-delete": Trash2,
+};
 const shortcuts: Record<string, string> = {
   undo: "Ctrl+Z", redo: "Ctrl+Y", cut: "Ctrl+X", copy: "Ctrl+C", paste: "Ctrl+V", delete: "Del", selectAll: "Ctrl+A",
 };
@@ -117,6 +137,17 @@ async function run(action: EditorAction): Promise<void> {
       if (navigator.clipboard.read) {
         try {
           const items = await navigator.clipboard.read();
+          const images: File[] = [];
+          for (const entry of items) {
+            const type = entry.types.find(type => type.startsWith("image/"));
+            if (type) images.push(new File([await entry.getType(type)], `image.${type.split("/")[1]}`, { type }));
+          }
+          if (images.length) {
+            if (disposed || view.state !== state || view.state.readOnly) return;
+            const clipboardData = new DataTransfer();
+            for (const file of images) clipboardData.items.add(file);
+            if (!view.contentDOM.dispatchEvent(new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }))) return;
+          }
           const item = items.find((candidate) => candidate.types.includes("text/plain") || candidate.types.includes("text/html"));
           if (item?.types.includes("text/plain")) text = await (await item.getType("text/plain")).text();
           if (item?.types.includes("text/html")) html = await (await item.getType("text/html")).text();
@@ -163,7 +194,6 @@ defineExpose({ open, onKeydown, close });
     class="markdown-editor-context-menu"
     :x="position.x"
     :y="position.y"
-    :min-width="210"
     :aria-label="t('editor.contextMenu')"
     @close="close()"
     @mousedown.prevent
@@ -172,11 +202,17 @@ defineExpose({ open, onKeydown, close });
     <template v-if="tableTarget">
       <template v-for="action in tableActions" :key="action">
         <div v-if="action === 'column-before' || action === 'table-delete'" class="base-context-menu-separator" role="separator" />
-        <button type="button" role="menuitem" :data-table-action="action" @click="runTable(action)">{{ t(`editor.table.${action}`) }}</button>
+        <button type="button" role="menuitem" :data-table-action="action" :class="{ danger: action.endsWith('-delete') }" @click="runTable(action)">
+          <LucideIcon :icon="tableActionIcons[action]" :size="13" />
+          <span>{{ t(`editor.table.${action}`) }}</span>
+        </button>
       </template>
       <div class="base-context-menu-separator" role="separator" />
     </template>
-    <button v-if="canQuote" type="button" role="menuitem" :disabled="!hasSelection" @click="run('quoteSelection')">{{ t('editor.quoteSelection') }}</button>
+    <button v-if="canQuote" type="button" role="menuitem" :disabled="!hasSelection" @click="run('quoteSelection')">
+      <LucideIcon :icon="actionIcons.quoteSelection" :size="13" />
+      <span>{{ t('editor.quoteSelection') }}</span>
+    </button>
     <div v-if="canQuote" class="base-context-menu-separator" role="separator" />
     <template v-for="action in actions" :key="action">
       <div v-if="action === 'cut' || action === 'selectAll'" class="base-context-menu-separator" role="separator" />
@@ -184,10 +220,20 @@ defineExpose({ open, onKeydown, close });
         type="button"
         role="menuitem"
         :data-editor-action="action"
+        :class="{ danger: action === 'delete' }"
         :disabled="isDisabled(action)"
         @click="run(action)"
       >
-        <span>{{ t(`editor.${action}`) }}</span><span class="editor-menu-shortcut">{{ shortcuts[action] }}</span>
+        <LucideIcon :icon="actionIcons[action]" :size="13" />
+        <span>{{ t(`editor.${action}`) }}</span>
+        <span class="editor-menu-shortcut">{{ shortcuts[action] }}</span>
+      </button>
+    </template>
+    <template v-if="canHistory">
+      <div class="base-context-menu-separator" role="separator" />
+      <button type="button" role="menuitem" @click="close(); emit('history')">
+        <LucideIcon :icon="History" :size="13" />
+        <span>版本历史</span>
       </button>
     </template>
   </BaseContextMenu>
@@ -195,8 +241,9 @@ defineExpose({ open, onKeydown, close });
 
 <style scoped>
 .editor-menu-shortcut {
+  flex-shrink: 0;
   margin-left: auto;
-  padding-left: 24px;
+  padding-left: 16px;
   color: var(--text-secondary);
   font-size: 11px;
 }

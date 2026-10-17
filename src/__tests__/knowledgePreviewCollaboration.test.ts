@@ -71,6 +71,8 @@ async function mountPreview(saveEdits = vi.fn()) {
   const document = ref(makeDocument("alpha\nbeta\ngamma"));
   const workspaceRef = ref({ checkoutId: "checkout-a", expectedGeneration: 1 });
   const visible = ref(true);
+  const saveLoading = ref(false);
+  const updateMeta = vi.fn();
   const sessionStore = new KnowledgeEditorWorkspaceSessionStore();
   const host = documentOwner().createElement("div");
   documentOwner().body.appendChild(host);
@@ -78,7 +80,8 @@ async function mountPreview(saveEdits = vi.fn()) {
     ? h(KnowledgePreview, {
         document: document.value,
         loading: false,
-        saveLoading: false,
+        saveLoading: saveLoading.value,
+        onUpdateMeta: updateMeta,
         embedded: true,
         workspaceRef: workspaceRef.value,
         sessionStore,
@@ -89,7 +92,7 @@ async function mountPreview(saveEdits = vi.fn()) {
   app.use(createPinia());
   app.mount(host);
   await nextTick();
-  return { app, document, host, saveEdits, sessionStore, visible, workspaceRef };
+  return { app, document, host, saveEdits, sessionStore, visible, workspaceRef, saveLoading, updateMeta };
 }
 
 function documentOwner(): Document {
@@ -104,7 +107,7 @@ function bodyEditor(host: HTMLElement): HTMLTextAreaElement {
   return editor;
 }
 
-function input(editor: HTMLTextAreaElement, value: string) {
+function input(editor: HTMLTextAreaElement | HTMLInputElement, value: string) {
   editor.value = value;
   editor.dispatchEvent(new Event("input", { bubbles: true }));
 }
@@ -116,6 +119,43 @@ afterEach(() => {
 });
 
 describe("KnowledgePreview collaborative editing", () => {
+  it("commits a blurred title once an in-flight body autosave finishes", async () => {
+    vi.useFakeTimers();
+    let resolveSave!: (document: KnowledgeDocument) => void;
+    const mounted = await mountPreview(vi.fn(() => new Promise<KnowledgeDocument>((resolve) => { resolveSave = resolve; })));
+    input(bodyEditor(mounted.host), "saved body");
+    vi.advanceTimersByTime(800);
+    await nextTick();
+    const title = mounted.host.querySelector<HTMLInputElement>(".document-title-input")!;
+    input(title, "New title");
+    title.dispatchEvent(new Event("blur"));
+    await nextTick();
+    expect(mounted.updateMeta).not.toHaveBeenCalled();
+    resolveSave(makeDocument("saved body", 2));
+    for (let i = 0; i < 10; i++) await nextTick();
+    expect(mounted.updateMeta).toHaveBeenCalledExactlyOnceWith({ newPath: "combat/New title.md" });
+    expect(bodyEditor(mounted.host).value).toBe("saved body");
+    mounted.app.unmount();
+  });
+
+  it("cancels a queued title with Escape and ignores IME confirmation", async () => {
+    const mounted = await mountPreview();
+    const title = mounted.host.querySelector<HTMLInputElement>(".document-title-input")!;
+    input(title, "输入中");
+    title.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true }));
+    await nextTick();
+    expect(mounted.updateMeta).not.toHaveBeenCalled();
+    mounted.saveLoading.value = true;
+    await nextTick();
+    title.dispatchEvent(new Event("blur"));
+    title.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    mounted.saveLoading.value = false;
+    await nextTick();
+    expect(mounted.updateMeta).not.toHaveBeenCalled();
+    expect(title.value).toBe("core-loop");
+    mounted.app.unmount();
+  });
+
   it("restores a dirty document session after the preview is unmounted", async () => {
     const mounted = await mountPreview();
     input(bodyEditor(mounted.host), "alpha\nbeta-local\ngamma");

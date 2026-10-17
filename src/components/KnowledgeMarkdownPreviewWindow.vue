@@ -15,6 +15,7 @@ import {
 import { getSubWindowClaimedQuery } from "../services/subWindow";
 import LucideIcon from "./icons/LucideIcon.vue";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
+import SearchableContent from "./ui/SearchableContent.vue";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 const appWindow = getCurrentWindow();
@@ -111,7 +112,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="markdown-preview-window-root">
+  <main class="markdown-preview-window-root" data-search-boundary>
     <header class="markdown-preview-titlebar" data-tauri-drag-region>
       <div class="markdown-preview-title" data-tauri-drag-region>
         <span class="markdown-preview-title-main">{{ title || t("knowledge.markdownPreview.title") }}</span>
@@ -133,7 +134,7 @@ onUnmounted(() => {
       <div v-else-if="!content.trim()" class="markdown-preview-state">
         {{ t("knowledge.markdownPreview.empty") }}
       </div>
-      <MarkdownRenderer v-else :content="content" text-zoom />
+      <SearchableContent v-else><MarkdownRenderer :content="content" text-zoom /></SearchableContent>
     </section>
   </main>
 </template>
@@ -212,11 +213,14 @@ onUnmounted(() => {
 }
 
 .markdown-preview-body {
+  display: flex;
+  flex-direction: column;
   flex: 1;
   min-height: 0;
-  overflow: auto;
-  padding: 18px 22px;
+  overflow: hidden;
 }
+
+.markdown-preview-body :deep(.searchable-content-body) { padding: 18px 22px; }
 
 .markdown-preview-body :deep(.markdown-body) {
   max-width: 860px;

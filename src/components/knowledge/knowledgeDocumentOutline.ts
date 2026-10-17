@@ -1,4 +1,5 @@
 import { parser } from "@lezer/markdown";
+import { frontmatterRange } from "../../document/markdownProperties";
 
 export type KnowledgeDocumentOutlineItem = {
   id: string;
@@ -34,8 +35,11 @@ export function extractKnowledgeDocumentOutline(
 
   const items: KnowledgeDocumentOutlineItem[] = [];
   const tree = parser.parse(markdown);
+  const metadata = frontmatterRange(markdown);
+  const metadataEnd = metadata?.closed ? metadata.to : 0;
   tree.iterate({
     enter(node) {
+      if (node.name !== "Document" && node.from < metadataEnd) return false;
       const atxMatch = ATX_HEADING_NAME.exec(node.name);
       const setextMatch = SETEXT_HEADING_NAME.exec(node.name);
       const level = Number(atxMatch?.[1] ?? setextMatch?.[1] ?? 0);

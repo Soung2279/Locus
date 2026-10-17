@@ -1,5 +1,6 @@
 import { ipcInvoke } from "./ipc";
 import type { WorkspaceRef } from "./project";
+import { legacyKnowledgeInjectAgents } from "../config/knowledgeInjection";
 import type {
   KnowledgeConfigSource,
   KnowledgeDirectoryConfigRecord,
@@ -52,6 +53,7 @@ import type {
 } from "../types";
 
 interface KnowledgeReadPayload {
+  propertiesYaml?: string;
   id: string;
   type: KnowledgeDocument["type"];
   path: string;
@@ -114,7 +116,7 @@ interface KnowledgeQueryPayload {
 interface KnowledgeDocumentSummaryPayload
   extends Omit<
     KnowledgeReadPayload,
-    "body" | "maintenanceRules" | "part" | "fileMetadata"
+    "body" | "maintenanceRules" | "part" | "fileMetadata" | "propertiesYaml"
   > {
   hasBodyContent?: boolean;
   byteSize?: number | null;
@@ -253,7 +255,7 @@ function normalizeDocument(payload: KnowledgeReadPayload): KnowledgeDocument {
     title: payload.title,
     injectMode,
     effectiveInjectMode: payload.injectMode,
-    injectAgents: payload.injectAgents ?? ["unity"],
+    injectAgents: payload.injectAgents ?? legacyKnowledgeInjectAgents(),
     injectModeSource: payload.injectModeSource ?? { kind: "self", path: null },
     readOnly: payload.readOnly,
     aiEditMode,
@@ -269,6 +271,7 @@ function normalizeDocument(payload: KnowledgeReadPayload): KnowledgeDocument {
     tools: payload.tools ?? [],
     summary,
     body: payload.body ?? "",
+    propertiesYaml: payload.propertiesYaml ?? "",
     maintenanceRules,
     effectiveMaintenanceRules: payload.maintenanceRules ?? null,
     modifiedAt: payload.updatedAt,
@@ -290,6 +293,7 @@ function normalizeDocumentSummary(
     maintenanceRules: _maintenanceRules,
     effectiveMaintenanceRules: _effectiveMaintenanceRules,
     fileMetadata: _fileMetadata,
+    propertiesYaml: _propertiesYaml,
     ...summary
   } = document;
   return {

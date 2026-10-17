@@ -1133,6 +1133,9 @@ fn merge_document_create_patch(
     mut base: KnowledgeDocumentPatch,
     patch: KnowledgeDocumentPatch,
 ) -> KnowledgeDocumentPatch {
+    if let Some(yaml) = patch.properties_yaml {
+        base.properties_yaml = Some(yaml);
+    }
     if let Some(id) = patch.id {
         base.id = Some(id);
     }
@@ -1379,6 +1382,7 @@ pub(crate) fn execute_knowledge_create_request(
                 working_dir,
                 KnowledgeUpdateRequest {
                     op: KnowledgeUpdateOp::Create,
+                    properties_yaml: document_patch.properties_yaml.take(),
                     path: normalized_path.clone(),
                     id: document_patch.id.take(),
                     doc_type: Some(doc_type),
@@ -1455,6 +1459,7 @@ pub(crate) fn execute_knowledge_edit_request(
     working_dir: &str,
     request: KnowledgeEditRequest,
 ) -> Result<KnowledgeMutationResponse, String> {
+    let _document_guard = super::view_documents::DOCUMENT_WRITE_LOCK.lock().map_err(|error| error.to_string())?;
     if request.path.trim().is_empty() {
         return Err("knowledge_edit requires 'path'".to_string());
     }
@@ -3957,12 +3962,21 @@ fn resolve_markdown_image_path(
 pub async fn resolve_markdown_image(
     workspace_ref: WorkspaceRef,
     source: String,
+    content_path: Option<String>,
     registry: State<'_, Arc<ProjectRegistry>>,
     binary_cache: State<'_, Arc<BinaryCache>>,
 ) -> Result<MarkdownImagePreview, AppError> {
     let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
     let working_dir = scope.runtime().root().to_string_lossy().into_owned();
-    let canonical = resolve_markdown_image_path(&source, &working_dir)?;
+    let canonical = if let Some(path) = content_path.as_deref().filter(|p| !p.is_empty()) {
+        let root = std::path::Path::new(&working_dir);
+        if let Some(local) = crate::markdown_attachments::resolve_local(root, &root.join(path), &source) {
+            if !is_absolute_local_path(&source) && !crate::knowledge_source_registry::path_is_within(&local, root) {
+                return Err(AppError::new("markdown_image.outside_workspace", "Relative images must stay within the workspace"));
+            }
+            canonicalize_existing_path(&local)?
+        } else { resolve_markdown_image_path(&source, &working_dir)? }
+    } else { resolve_markdown_image_path(&source, &working_dir)? };
     if !canonical.is_file() {
         return Err(AppError::new(
             "markdown_image.not_file",

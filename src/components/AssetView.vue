@@ -8,6 +8,7 @@ import AssetExplorer from "./asset/AssetExplorer.vue";
 import AssetLegacyExplorer from "./asset/AssetLegacyExplorer.vue";
 import AssetDirectoryList from "./asset/AssetDirectoryList.vue";
 import AssetSearchBar from "./asset/AssetSearchBar.vue";
+import ExplorerSearchBar from "./explorer/ExplorerSearchBar.vue";
 import AssetSearchResults from "./asset/AssetSearchResults.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
 import ResourceFileMenuItems from "./explorer/ResourceFileMenuItems.vue";
@@ -18,7 +19,9 @@ import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import AssetStatsView from "./asset/AssetStatsView.vue";
 import WorkspaceRequiredState from "./WorkspaceRequiredState.vue";
 import type { WorkspaceRef } from "../services/project";
+import type { FileHistoryTarget } from "../services/fileHistory";
 import { useInternalDragController } from "../composables/useInternalDrag";
+import { useWorkspaceFileDrop } from "../composables/useWorkspaceFileDrop";
 import {
   workbenchReferenceInternalDragSource,
 } from "./workbench/workbenchReferenceDrag";
@@ -31,32 +34,65 @@ const WorkspaceAssetPreview = defineAsyncComponent(
   () => import("./asset/WorkspaceAssetPreview.vue"),
 );
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   workingDir: string;
   workspaceRef?: WorkspaceRef | null;
   projectId?: string | null;
   active?: boolean;
   listOnly?: boolean;
-}>();
-const emit = defineEmits<{ openFile: [file: { path: string; name: string }]; resourceChanged: [target: ExplorerResourceTarget, newPath: string | null] }>();
-const fileMenu = ref<{ x: number; y: number; target: ExplorerResourceTarget } | null>(null);
+}>(), { active: true });
+const emit = defineEmits<{ openFile: [file: { path: string; name: string }]; resourceChanged: [target: ExplorerResourceTarget, newPath: string | null]; fileHistory: [target: FileHistoryTarget] }>();
+type FileMenuSource = "tree" | "directory" | "search";
+const fileMenu = ref<{ x: number; y: number; target: ExplorerResourceTarget; source: FileMenuSource; rowKey: string } | null>(null);
 const resourceActions = ref<InstanceType<typeof ExplorerResourceActions> | null>(null);
+const renameSource = ref<FileMenuSource | null>(null);
 const workspaceContexts = useWorkspaceContextStore();
-function openFileMenu(file: AssetExplorerNode | AssetSearchResult, event: MouseEvent) {
-  if (("kind" in file && file.kind === "folder") || ("isDirectory" in file && file.isDirectory)) return;
+const fileDropRoot = ref<HTMLElement | null>(null);
+const fileSearchRoot = ref<HTMLElement | null>(null);
+const assetProjectId = computed(() => props.projectId
+  ?? (props.workspaceRef ? workspaceContexts.checkoutsById[props.workspaceRef.checkoutId]?.projectId : undefined));
+useWorkspaceFileDrop({
+  root: () => fileDropRoot.value,
+  resolve: hit => {
+    if (!props.workspaceRef || !assetProjectId.value || props.active === false) return null;
+    const row = hit.closest<HTMLElement>("[data-file-drop-directory]");
+    const list = hit.closest<HTMLElement>(".file-tree-list");
+    if (!row && !list) return null;
+    return { projectId: assetProjectId.value, root: props.workingDir, workspaceRef: props.workspaceRef,
+      directory: row?.dataset.fileDropDirectory ?? (hit.closest(".ax-pane-directory") ? selectedFolderPath.value ?? "." : "."),
+      element: row ?? list! };
+  },
+  expand: target => {
+    if (target.directory !== "." && !isPathExpanded(target.directory)) void togglePath(target.directory);
+  },
+});
+function openFileMenu(file: AssetExplorerNode | AssetSearchResult, event: MouseEvent, source: FileMenuSource) {
+  const isDirectory = ("kind" in file && file.kind === "folder") || ("isDirectory" in file && file.isDirectory === true);
   const projectId = props.projectId ?? (props.workspaceRef ? workspaceContexts.checkoutsById[props.workspaceRef.checkoutId]?.projectId : null);
   if (!projectId || !props.workspaceRef) return;
   event.preventDefault();
-  fileMenu.value = { x: event.clientX, y: event.clientY, target: { projectId, root: props.workingDir,
-    path: explorerFilePath(props.workingDir, file.path), workspaceRef: { ...props.workspaceRef } } };
+  event.stopPropagation();
+  listSelectedPath.value = file.path;
+  const rowKey = "isSubAsset" in file && file.isSubAsset
+    ? file.objectKey || `${file.path}/${file.name.trim()}` : ("objectKey" in file && file.objectKey) || file.path;
+  fileMenu.value = { x: event.clientX, y: event.clientY, source, rowKey, target: { projectId, root: props.workingDir,
+    path: explorerFilePath(props.workingDir, file.path), isDirectory, workspaceRef: { ...props.workspaceRef } } };
 }
 function runFileAction(action: ExplorerResourceAction) {
-  const target = fileMenu.value?.target;
+  const menu = fileMenu.value;
   fileMenu.value = null;
-  if (target) void resourceActions.value?.run(action, target);
+  if (!menu) return;
+  if (action === "rename") {
+    if (resourceActions.value?.draft?.busy) return;
+    renameSource.value = menu.source;
+  }
+  void resourceActions.value?.run(action, menu.target, menu.rowKey);
 }
 async function resourceChanged(target: ExplorerResourceTarget, newPath: string | null) {
   emit("resourceChanged", target, newPath);
+  if (listSelectedPath.value === resourceRelativePath(target)) {
+    listSelectedPath.value = newPath ? resourceRelativePath({ ...target, path: newPath }) : null;
+  }
   await applyExplorerFileChange(resourceRelativePath(target), "delete");
   if (newPath) await applyExplorerFileChange(resourceRelativePath({ ...target, path: newPath }), "upsert");
   if (searchQuery.value.trim()) await runFilenameSearch(searchQuery.value);
@@ -111,7 +147,12 @@ const {
   applyExplorerFileChange,
   onResizeStart,
   onDirectoryResizeStart,
-} = useAssetState(props);
+} = useAssetState({
+  get workingDir() { return props.workingDir; },
+  get workspaceRef() { return props.workspaceRef; },
+  get active() { return props.active; },
+  get includeFilesInTree() { return props.listOnly || layoutMode.value === "single"; },
+});
 
 if (props.listOnly) updateSearchScope("global");
 
@@ -124,11 +165,11 @@ function selectListNode(node: AssetExplorerNode) {
   emit("openFile", { path: node.path, name: node.name });
 }
 
-async function selectListSearchResult(result: AssetSearchResult) {
+function selectListSearchResult(result: AssetSearchResult) {
   listSelectedPath.value = result.path;
   if (result.isDirectory) {
-    await selectFromSearchResult(result);
-    searchQuery.value = "";
+    void selectFromSearchResult(result);
+    runFilenameSearch("");
     return;
   }
   emit("openFile", { path: result.path, name: result.name });
@@ -155,7 +196,7 @@ type AssetLayoutMode = "single" | "double";
 const hasWorkspace = computed(() => !!props.workingDir.trim());
 const selectedAssetPath = computed(() => selectedNode.value?.path ?? null);
 const workspaceDragEnabled = computed(() => (
-  !!props.projectId?.trim()
+  !!assetProjectId.value?.trim()
   && !!props.workspaceRef
   && !!props.workingDir.trim()
 ));
@@ -202,9 +243,9 @@ const layoutToggleTitle = computed(() => (
 ));
 
 function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerEvent): void {
-  if (!props.projectId || !props.workspaceRef) return;
+  if (!assetProjectId.value || !props.workspaceRef) return;
   const data = assetWorkspaceReferenceDragData({
-    projectId: props.projectId,
+    projectId: assetProjectId.value,
     workspaceRef: props.workspaceRef,
     workspaceRoot: props.workingDir,
   }, entry);
@@ -217,7 +258,7 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
 </script>
 
 <template>
-  <div class="asset-view" :class="{ 'is-list-only': props.listOnly }">
+  <div ref="fileDropRoot" class="asset-view" :class="{ 'is-list-only': props.listOnly }">
     <WorkspaceRequiredState
       v-if="!hasWorkspace"
       :description="t('workspace.required.assetDescription')"
@@ -227,17 +268,20 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
       <div v-if="error" class="ax-error" @click="error = ''">{{ error }}</div>
 
       <div v-if="props.listOnly" class="ax-workspace">
-        <section class="ax-pane ax-pane-tree ax-secondary-tree">
-          <AssetSearchBar
+        <section ref="fileSearchRoot" class="ax-pane ax-pane-tree ax-secondary-tree" tabindex="-1">
+          <ExplorerSearchBar
+            :scope="fileSearchRoot"
+            :active="props.active"
             :query="searchQuery"
             :searching="searching"
-            scope="global"
-            @update:query="searchQuery = $event"
-            @clear="searchQuery = ''"
+            :placeholder="t('asset.search.placeholder')"
+            @update:query="runFilenameSearch"
+            @clear="runFilenameSearch('')"
           />
           <div class="ax-pane-body">
-            <AssetSearchResults :working-dir="workingDir" @file-contextmenu="openFileMenu"
+            <AssetSearchResults :resource-rename="renameSource === 'search' ? resourceActions?.draft : null"
               v-if="searchQuery.trim()"
+              :working-dir="workingDir"
               :results="searchResults"
               :query="searchQuery"
               :searching="searching"
@@ -246,11 +290,16 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
               :selected-path="listSelectedPath"
               :drag-enabled="workspaceDragEnabled"
               @select="selectListSearchResult"
+              @file-contextmenu="(file, event) => openFileMenu(file, event, 'search')"
               @drag-pointer-down="startAssetWorkspaceDrag"
             />
-            <AssetLegacyExplorer :working-dir="workingDir" @file-contextmenu="openFileMenu"
+            <AssetLegacyExplorer
+              :resource-rename="renameSource === 'tree' ? resourceActions?.draft : null"
+              :working-dir="workingDir"
+              @file-contextmenu="(file, event) => openFileMenu(file, event, 'tree')"
               v-else
               workspace-style
+              :searchable="false"
               :tree="explorerTree"
               :selected-path="listSelectedPath"
               :is-path-expanded="isPathExpanded"
@@ -289,7 +338,10 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
             </button>
           </div>
           <div class="ax-pane-body">
-            <AssetLegacyExplorer :working-dir="workingDir" @file-contextmenu="openFileMenu"
+            <AssetLegacyExplorer
+              :resource-rename="renameSource === 'tree' ? resourceActions?.draft : null"
+              :working-dir="workingDir"
+              @file-contextmenu="(file, event) => openFileMenu(file, event, 'tree')"
               :tree="explorerTree"
               :selected-path="legacySelectedPath"
               :is-path-expanded="isPathExpanded"
@@ -312,7 +364,10 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
             @clear="runFilenameSearch('')"
           />
           <div class="ax-pane-body ax-pane-preview-body">
-            <AssetSearchResults :working-dir="workingDir" @file-contextmenu="openFileMenu"
+            <AssetSearchResults
+              :resource-rename="renameSource === 'search' ? resourceActions?.draft : null"
+              :working-dir="workingDir"
+              @file-contextmenu="(file, event) => openFileMenu(file, event, 'search')"
               v-if="searchQuery.trim() && searchScope === 'global'"
               :results="searchResults"
               :query="searchQuery"
@@ -412,7 +467,10 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
             @clear="runFilenameSearch('')"
           />
           <div class="ax-pane-body">
-            <AssetSearchResults :working-dir="workingDir" @file-contextmenu="openFileMenu"
+            <AssetSearchResults
+              :resource-rename="renameSource === 'search' ? resourceActions?.draft : null"
+              :working-dir="workingDir"
+              @file-contextmenu="(file, event) => openFileMenu(file, event, 'search')"
               v-if="searchQuery.trim() && searchScope === 'global'"
               :results="searchResults"
               :query="searchQuery"
@@ -426,7 +484,10 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
               @drag-pointer-down="startAssetWorkspaceDrag"
             />
 
-            <AssetDirectoryList :working-dir="workingDir" @file-contextmenu="openFileMenu"
+            <AssetDirectoryList
+              :resource-rename="renameSource === 'directory' ? resourceActions?.draft : null"
+              :working-dir="workingDir"
+              @file-contextmenu="(file, event) => openFileMenu(file, event, 'directory')"
               v-else
               :items="visibleDirectoryEntries"
               :selected-path="selectedAssetPath"
@@ -481,7 +542,7 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
     <BaseContextMenu v-if="fileMenu" :x="fileMenu.x" :y="fileMenu.y" @close="fileMenu = null">
       <ResourceFileMenuItems :target="fileMenu.target" @action="runFileAction" @close="fileMenu = null" />
     </BaseContextMenu>
-    <ExplorerResourceActions ref="resourceActions" @changed="resourceChanged" />
+    <ExplorerResourceActions ref="resourceActions" @changed="resourceChanged" @history="emit('fileHistory', $event)" />
   </div>
 </template>
 

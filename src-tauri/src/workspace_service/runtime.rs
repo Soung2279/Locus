@@ -160,6 +160,7 @@ pub struct WorkspaceCoreServices {
     knowledge_index:
         Arc<std::sync::Mutex<Option<Arc<crate::knowledge_index::KnowledgeIndexState>>>>,
     asset_watcher: Arc<std::sync::Mutex<Option<crate::asset_db::watcher::AssetDbWatcher>>>,
+    file_watch: crate::workspace_file_watcher::WorkspaceFileWatchState,
     workspace_changes: Arc<crate::workspace_changes::WorkspaceChangeHub>,
     knowledge_watcher: Arc<std::sync::Mutex<Option<crate::knowledge_watcher::KnowledgeFsWatcher>>>,
     background_watchers_lifecycle: Arc<std::sync::Mutex<()>>,
@@ -201,6 +202,7 @@ impl WorkspaceCoreServices {
             asset_db: Arc::new(std::sync::Mutex::new(asset_db)),
             knowledge_index: Arc::new(std::sync::Mutex::new(None)),
             asset_watcher: Arc::new(std::sync::Mutex::new(None)),
+            file_watch: crate::workspace_file_watcher::WorkspaceFileWatchState::default(),
             workspace_changes: crate::workspace_changes::hub_for_workspace(&identity.root),
             knowledge_watcher: Arc::new(std::sync::Mutex::new(None)),
             background_watchers_lifecycle: Arc::new(std::sync::Mutex::new(())),
@@ -256,6 +258,10 @@ impl WorkspaceCoreServices {
         &self.dir_entries_page_cache
     }
 
+    pub fn file_watch(&self) -> &crate::workspace_file_watcher::WorkspaceFileWatchState {
+        &self.file_watch
+    }
+
     pub fn ref_graph_scan_tasks(&self) -> &crate::commands::RefGraphScanTaskState {
         &self.ref_graph_scan_tasks
     }
@@ -294,6 +300,7 @@ impl WorkspaceCoreServices {
         event_scope: crate::workspace_service::event::WorkspaceEventScope,
         app_handle: &tauri::AppHandle,
     ) -> Result<Arc<crate::knowledge_index::KnowledgeIndexState>, String> {
+        crate::workspace::require_knowledge_enabled(&self.root.to_string_lossy())?;
         let mut current = self
             .knowledge_index
             .lock()
@@ -303,6 +310,7 @@ impl WorkspaceCoreServices {
         }
         let library_dir =
             crate::knowledge_index::library_dir_for_working_dir(&self.root.to_string_lossy());
+        crate::knowledge_index::migrate_legacy_non_unity_storage(&self.root.to_string_lossy())?;
         let storage_dir = crate::commands::resolve_runtime_storage_dir(app_handle)?;
         let runtime = crate::knowledge_index::KnowledgeRuntime::open(&library_dir, &storage_dir)
             .map_err(|error| format!("Failed to initialize workspace knowledge index: {error}"))?;
@@ -324,7 +332,7 @@ impl WorkspaceCoreServices {
     }
 
     pub fn watchers_running(&self) -> bool {
-        self.asset_watcher
+        self.file_watch.is_running() || self.asset_watcher
             .lock()
             .map(|watcher| watcher.is_some())
             .unwrap_or(false)
@@ -377,6 +385,7 @@ impl WorkspaceCoreServices {
                 .lock()
                 .map_err(|error| format!("workspace knowledge watcher lock poisoned: {error}"))?;
             if watcher.is_none()
+                && crate::workspace::knowledge_enabled(&self.root.to_string_lossy())
                 && crate::knowledge_store::knowledge_root(&self.root.to_string_lossy()).is_dir()
             {
                 *watcher = Some(crate::knowledge_watcher::KnowledgeFsWatcher::start(
@@ -422,6 +431,16 @@ impl WorkspaceCoreServices {
         if let Ok(mut index) = self.knowledge_index.lock() {
             index.take();
         }
+    }
+
+    pub fn stop_knowledge_watchers(&self) {
+        let _lifecycle = self.background_watchers_lifecycle.lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::local_docs::clear_live_watchers(&self.knowledge_operations.local_reference_watcher);
+        if let Ok(mut watcher) = self.knowledge_watcher.lock() {
+            if let Some(watcher) = watcher.take() { watcher.stop(); }
+        }
+        if let Ok(mut index) = self.knowledge_index.lock() { index.take(); }
     }
 }
 
@@ -1111,11 +1130,13 @@ impl ProjectRegistry {
                     identity.root.display()
                 ));
             }
+            crate::workspace::initialize_workspace_setup(&identity.root.to_string_lossy())?;
             self.ensure_runtime_initialized(&existing)?;
             return Ok(existing);
         }
 
         let materialization_lease = super::worktrees::runtime_lease(&identity.root)?;
+        crate::workspace::initialize_workspace_setup(&identity.root.to_string_lossy())?;
         let runtime = WorkspaceRuntime::new(
             identity,
             self.factories.clone(),

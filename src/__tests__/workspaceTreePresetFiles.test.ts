@@ -174,7 +174,7 @@ describe("workspace tree presets and mounted files", () => {
 
   it("keeps knowledge and collaboration views mounted in the workspace", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
-    expect(workbench).toContain('<WorkbenchEditorStack :group="group">');
+    expect(workbench).toContain('<WorkbenchEditorStack :group="group" @pin="pinWorkbenchEditor(paneId, $event)">');
     expect(read("src/components/workbench/WorkbenchEditorStack.vue")).toContain(
       'v-show="presentedEditor?.editorId === editor.editorId || group.activeEditorId === editor.editorId"',
     );
@@ -226,10 +226,10 @@ describe("workspace tree presets and mounted files", () => {
     expect(newSessionTarget).toBeLessThan(layoutMove);
     expect(workbench).toContain('\"is-new-session-drop-zone\": dropAvailable');
     expect(workbench).toContain('hit.closest(".workspace-tree-row-shell.is-new-session-row")');
-    expect(workbench).toContain('return "inline";');
+    expect(workbench).toContain('if (hit.closest(".workspace-tree-row-shell.is-new-session-row")) return "floating";');
     expect(workbench).toContain(".workspace-tree-row-shell.is-new-session-drop-zone .workspace-tree-row");
-    expect(workbench).toMatch(/\.workspace-tree-row-shell\.is-new-session-drop-zone \.workspace-tree-row\)[^{]*\{[\s\S]*border:\s*1px dashed var\(--border-strong\);/);
-    expect(workbench).toMatch(/\.workspace-tree-row-shell\.is-new-session-drop-zone \.workspace-tree-name\)[^{]*\{[\s\S]*text-align:\s*center;/);
+    expect(workbench).toMatch(/\.workspace-tree-row-shell\.is-new-session-drop-zone \.workspace-tree-row\)[^{]*\{[\s\S]*outline:\s*1px dashed var\(--border-strong\);/);
+    expect(workbench).not.toContain('dropAvailable ? t("development.dropToCreateSession")');
     expect(zh).toContain('\"development.dropToCreateSession\": \"拖到此处以创建新会话\"');
   });
 
@@ -239,7 +239,7 @@ describe("workspace tree presets and mounted files", () => {
     expect(row).toContain("nodes.find(isNewSessionNode)");
     expect(row).toContain("dragEnabled: true");
     expect(workbench).toContain("&& !isNewSessionNode(node)");
-    expect(workbench).toMatch(/appendNewSessionRow\(items, project, resourceDepth\);\s+appendLayoutChildren\(/);
+    expect(workbench).toContain("appendNewSessionRow(items, project, resourceDepth);");
     const source = workbench.slice(workbench.indexOf("function onDragPointerDown("), workbench.indexOf("function resolveLayoutDropIntent("));
     expect(source.slice(0, source.indexOf("const items ="))).not.toContain('item.meta.kind === "newSession"');
     const move = workbench.slice(workbench.indexOf("function canMoveExplorerNodeToIntent("), workbench.indexOf("function activateLayoutDropIntent("));

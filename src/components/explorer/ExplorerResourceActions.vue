@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, ref } from "vue";
+import { reactive, ref } from "vue";
 import { confirm, save } from "@tauri-apps/plugin-dialog";
 import { t } from "../../i18n";
 import { useNotificationStore } from "../../stores/notification";
@@ -11,23 +11,19 @@ import { showInFolder } from "../../services/unity";
 import { isSkillPackageRootDocument, skillPackageIdForDocument } from "../../composables/useKnowledgeState";
 import { useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay";
 import { knowledgeResourceManagedHint } from "../knowledge/knowledgeResourceActions";
-import { resourceName, resourceRelativePath, validResourceName, type ExplorerResourceAction, type ExplorerResourceTarget } from "./explorerResourceActions";
-import BaseButton from "../ui/BaseButton.vue";
+import { resourceName, resourceRelativePath, validResourceName, type ExplorerResourceAction, type ExplorerResourceRename, type ExplorerResourceTarget } from "./explorerResourceActions";
+import type { FileHistoryTarget } from "../../services/fileHistory";
 
-const emit = defineEmits<{ changed: [target: ExplorerResourceTarget, newPath: string | null] }>();
+const emit = defineEmits<{
+  changed: [target: ExplorerResourceTarget, newPath: string | null];
+  history: [target: FileHistoryTarget];
+}>();
 const notificationStore = useNotificationStore();
 const explorerStore = useWorkspaceExplorerStore();
 const { movePathPreference } = useExplorerPathDisplay();
-const draft = ref<{ target: ExplorerResourceTarget; name: string; busy: boolean; error: string } | null>(null);
-const input = ref<HTMLInputElement | null>(null);
-const inputId = `resource-rename-${crypto.randomUUID()}`;
-function cancel() { if (!draft.value?.busy) draft.value = null; }
-function containFocus(event: KeyboardEvent) {
-  const controls = (event.currentTarget as HTMLElement).querySelectorAll<HTMLElement>("input:not(:disabled), button:not(:disabled)");
-  const first = controls[0];
-  const last = controls[controls.length - 1];
-  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
-  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+const draft = ref<ExplorerResourceRename | null>(null);
+function cancel(current = draft.value) {
+  if (draft.value === current && !current?.busy) draft.value = null;
 }
 
 async function mutate(target: ExplorerResourceTarget, name: string | null) {
@@ -45,7 +41,11 @@ async function mutate(target: ExplorerResourceTarget, name: string | null) {
       await knowledgeDelete({ kind: "document", type: document.type, path: document.path }, target.workspaceRef);
     }
   } else {
-    nextPath = await explorerFileAction(target.projectId, target.path, name, target.mounted ? null : target.workspaceRef);
+    const workspaceRef = target.mounted ? null : target.workspaceRef;
+    // Scoped file actions require paths relative to the captured checkout root.
+    // Project-authorized mounts keep their absolute paths.
+    const path = workspaceRef ? resourceRelativePath(target) : target.path;
+    nextPath = await explorerFileAction(target.projectId, path, name, workspaceRef);
     if (nextPath) movePathPreference(target.path, nextPath);
   }
   emit("changed", target, nextPath);
@@ -61,29 +61,42 @@ async function mutate(target: ExplorerResourceTarget, name: string | null) {
   } catch (error) { notificationStore.addNotice("warning", normalizeAppError(error).message); }
 }
 
-async function commit() {
-  const current = draft.value;
-  if (!current || current.busy) return;
+async function commit(current: ExplorerResourceRename) {
+  if (draft.value !== current || current.busy) return;
   const name = current.name.trim();
-  if (!validResourceName(name)) { current.error = t("development.invalidFileName"); return; }
+  if (!validResourceName(name)) {
+    current.error = t("development.invalidFileName");
+    notificationStore.addNotice("error", current.error);
+    return;
+  }
   if (name === resourceName(current.target)) { draft.value = null; return; }
   current.busy = true;
   current.error = "";
-  try { await mutate(current.target, name); draft.value = null; }
-  catch (error) { current.error = normalizeAppError(error).message; }
+  try { await mutate(current.target, name); if (draft.value === current) draft.value = null; }
+  catch (error) {
+    current.error = normalizeAppError(error).message;
+    notificationStore.addNotice("error", current.error);
+  }
   finally { current.busy = false; }
 }
 
-async function run(action: ExplorerResourceAction, target: ExplorerResourceTarget) {
+async function run(action: ExplorerResourceAction, target: ExplorerResourceTarget, rowKey = target.path) {
   if ((action === "rename" || action === "delete") && target.document && knowledgeResourceManagedHint(target.document)) return;
   try {
-    if (action === "rename") {
-      if (target.document && isSkillPackageRootDocument(target.document)) return;
-      draft.value = { target, name: resourceName(target), busy: false, error: "" };
-      await nextTick();
-      input.value?.focus();
-      const dot = draft.value.name.lastIndexOf(".");
-      input.value?.setSelectionRange(0, dot > 0 ? dot : draft.value.name.length);
+    if (action === "history") {
+      const workspaceRef = target.mounted ? null : target.workspaceRef ?? null;
+      emit("history", {
+        projectId: target.projectId,
+        path: target.document ? `Locus/knowledge/${resourceRelativePath(target)}` : workspaceRef ? resourceRelativePath(target) : target.path,
+        workspaceRef: workspaceRef ? { ...workspaceRef } : null,
+      });
+    } else if (action === "rename") {
+      if (draft.value?.busy || target.isDirectory || (target.document && isSkillPackageRootDocument(target.document))) return;
+      const current: ExplorerResourceRename = reactive({
+        key: rowKey, target, name: resourceName(target), busy: false, error: "",
+        submit: () => commit(current), cancel: () => cancel(current),
+      });
+      draft.value = current;
     } else if (action === "delete") {
       const packageRoot = target.document && isSkillPackageRootDocument(target.document);
       const approved = await confirm(t(packageRoot ? "knowledge.explorer.deletePackageConfirm" : "knowledge.explorer.deleteDocumentConfirm", resourceName(target)), {
@@ -104,30 +117,7 @@ async function run(action: ExplorerResourceAction, target: ExplorerResourceTarge
     }
   } catch (error) { notificationStore.addNotice("error", normalizeAppError(error).message); }
 }
-defineExpose({ run });
+defineExpose({ run, draft, cancel });
 </script>
 
-<template>
-  <Teleport to="body">
-    <div v-if="draft" class="resource-rename-backdrop" @click.self="cancel" @keydown.esc.prevent.stop="cancel">
-      <form class="resource-rename-dialog" role="dialog" aria-modal="true" :aria-label="t('common.rename')" @submit.prevent="commit" @keydown.tab="containFocus">
-        <label :for="inputId">{{ t('common.rename') }}</label>
-        <input :id="inputId" ref="input" v-model="draft.name" :disabled="draft.busy" :aria-label="t('common.rename')" />
-        <div v-if="draft.error" class="resource-rename-error" role="alert">{{ draft.error }}</div>
-        <div class="resource-rename-actions">
-          <BaseButton :disabled="draft.busy" @click="cancel">{{ t('common.cancel') }}</BaseButton>
-          <BaseButton type="submit" :disabled="draft.busy || !draft.name.trim()">{{ t('common.confirm') }}</BaseButton>
-        </div>
-      </form>
-    </div>
-  </Teleport>
-</template>
-
-<style scoped>
-.resource-rename-backdrop { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; background: color-mix(in srgb, var(--bg-color) 44%, transparent); }
-.resource-rename-dialog { display: flex; flex-direction: column; gap: 12px; width: 360px; max-width: calc(100vw - 32px); padding: 16px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--panel-bg); color: var(--text-color); font-size: 13px; }
-.resource-rename-dialog input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-color); color: var(--text-color); font: inherit; }
-.resource-rename-dialog input:focus { outline: 1px solid var(--accent-color); }
-.resource-rename-actions { display: flex; justify-content: flex-end; gap: 8px; }
-.resource-rename-error { color: var(--status-danger-fg); overflow-wrap: anywhere; }
-</style>
+<template></template>

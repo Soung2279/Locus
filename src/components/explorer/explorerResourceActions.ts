@@ -9,9 +9,22 @@ export interface ExplorerResourceTarget {
   path: string;
   workspaceRef?: WorkspaceRef | null;
   mounted?: boolean;
+  isDirectory?: boolean;
   document?: KnowledgeDocumentSummary;
 }
-export type ExplorerResourceAction = "rename" | "delete" | "copy" | "reveal" | "export";
+export type ExplorerResourceAction = "rename" | "delete" | "copy" | "reveal" | "export" | "history";
+export function supportsFileHistory(target: ExplorerResourceTarget): boolean {
+  return !target.isDirectory && !!target.projectId && (!target.document || !target.document.externalSource);
+}
+export interface ExplorerResourceRename {
+  key: string;
+  target: ExplorerResourceTarget;
+  name: string;
+  busy: boolean;
+  error: string;
+  submit: () => Promise<void>;
+  cancel: () => void;
+}
 export const resourcePathKey = (target: ExplorerResourceTarget) => target.document
   ? explorerKnowledgeKey(target.root, target.document.id) : explorerFileKey(target.path);
 export const resourceName = (target: ExplorerResourceTarget) => (target.document?.path ?? target.path).replace(/\\/g, "/").split("/").pop() ?? "";

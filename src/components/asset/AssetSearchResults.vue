@@ -1,11 +1,15 @@
 <script setup lang="ts">
+import { workspaceFileParent } from "../explorer/workspaceFileMove";
 import { computed } from "vue";
 import { t } from "../../i18n";
 import { explorerFileKey, explorerFilePath, useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay";
 import type { AssetSearchResult } from "../../types";
+import ResourceRenameInput from "../explorer/ResourceRenameInput.vue";
+import type { ExplorerResourceRename } from "../explorer/explorerResourceActions";
 
 const props = defineProps<{
   workingDir?: string;
+  resourceRename?: ExplorerResourceRename | null;
   results: AssetSearchResult[];
   query: string;
   searching: boolean;
@@ -136,19 +140,22 @@ function beginDrag(result: AssetSearchResult, event: PointerEvent) {
     <div v-else-if="!searching && results.length === 0" class="asr-empty">
       {{ t("asset.search.empty") }}
     </div>
-    <button
+    <component
       v-for="(r, i) in results"
       :key="resultKey(r)"
-      type="button"
+      :is="resourceRename?.key === resultKey(r) ? 'div' : 'button'"
+      :type="resourceRename?.key === resultKey(r) ? undefined : 'button'"
       class="asr-row"
+      :data-file-drop-directory="!r.isSubAsset ? r.isDirectory ? r.path : workspaceFileParent(r.path) : undefined"
       :class="{ selected: selectedKey ? selectedKey === resultKey(r) : selectedPath === r.path }"
-      @pointerdown="beginDrag(r, $event)"
-      @click="emit('select', r)"
+      @pointerdown="resourceRename?.key !== resultKey(r) && beginDrag(r, $event)"
+      @click="resourceRename?.key !== resultKey(r) && emit('select', r)"
       @contextmenu="!r.isDirectory && emit('fileContextmenu', r, $event)"
       :title="resultDisplayPath(r)"
     >
       <span class="asr-index">{{ i + 1 }}</span>
-      <span class="asr-name">
+      <ResourceRenameInput v-if="resourceRename?.key === resultKey(r)" :rename="resourceRename" />
+      <span v-else class="asr-name">
         <template v-for="(seg, si) in segments(displayName(r))" :key="si"
           ><mark v-if="seg.hit" class="asr-hit">{{ seg.text }}</mark
           ><template v-else>{{ seg.text }}</template></template>
@@ -177,7 +184,7 @@ function beginDrag(result: AssetSearchResult, event: PointerEvent) {
           ><mark v-if="seg.hit" class="asr-hit">{{ seg.text }}</mark
           ><template v-else>{{ seg.text }}</template></template>
       </span>
-    </button>
+    </component>
   </div>
 </template>
 

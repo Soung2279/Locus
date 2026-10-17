@@ -7,7 +7,7 @@ import {
 } from "../services/sessionAttention";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { normalizeAppError } from "../services/errors";
-import { type RoutedWorkspaceEvent } from "../services/project";
+import { projectKnowledgeEnabled, type RoutedWorkspaceEvent } from "../services/project";
 import { listProjectSessions } from "../services/session";
 import {
   projectCollaborationSnapshot,
@@ -29,6 +29,7 @@ import type {
 } from "../types/workbench";
 import type { KnowledgeChangedEvent } from "../types";
 import { listenWorkspaceEvent } from "../services/workspaceEventHub";
+import { newSessionInsertionIndex, type SessionInsertionRules } from "./workspaceSessionPlacement";
 import { useWorkspaceEventScope } from "../composables/useWorkspaceEventScope";
 import { useWorkspaceContextStore } from "./workspaceContext";
 import { viewList } from "../services/view";
@@ -70,6 +71,10 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
   let knowledgeListenerStarting = false;
   const selectedNodeKey = ref<string | null>(null);
   const expandedNodeKeys = ref<Set<string>>(new Set());
+
+  function knowledgeEnabled(projectId: string): boolean {
+    return projectKnowledgeEnabled(useWorkspaceContextStore().projectsById[projectId]);
+  }
 
   function acceptSnapshot(projectId: string, snapshot: ProjectExplorerSnapshot): ProjectExplorerSnapshot {
     const current = snapshots[projectId];
@@ -168,7 +173,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
       const [snapshotResult, sessionsResult, knowledgeResult, collaborationResult] = await Promise.allSettled([
         projectExplorerSnapshot(projectId),
         listProjectSessions(projectId),
-        projectKnowledgeList(projectId),
+        knowledgeEnabled(projectId) ? projectKnowledgeList(projectId) : Promise.resolve([]),
         projectCollaborationSnapshot(projectId),
       ]);
       if (!isCurrent(projectId, epoch)) return;
@@ -325,7 +330,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     if (!projectId || !previousResources || !snapshots[projectId]) return;
     const hadLoadedCatalog = knowledgeCatalogLoaded.has(projectId);
     const epoch = nextKnowledgeEpoch(projectId);
-    const nextKnowledge = await projectKnowledgeList(projectId);
+    const nextKnowledge = knowledgeEnabled(projectId) ? await projectKnowledgeList(projectId) : [];
     if (!isCurrentKnowledgeRequest(projectId, epoch)) return;
 
     const addedDocuments = hadLoadedCatalog
@@ -363,6 +368,34 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     activeKnowledgeRefreshes.set(projectId, task);
   }
 
+  function isEntryNodeShown(projectId: string, node: { resourceId?: string | null; hidden?: boolean }): boolean {
+    if (node.hidden) return false;
+    const sections = displaySettings.workspaceSectionVisibility;
+    switch (node.resourceId) {
+      case KNOWLEDGE_SYSTEM_RESOURCE_ID: return knowledgeEnabled(projectId) && sections.knowledge;
+      case COLLABORATION_SYSTEM_RESOURCE_ID: return sections.collab;
+      case ASSETS_SYSTEM_RESOURCE_ID: return sections.assets;
+      case VIEWS_SYSTEM_RESOURCE_ID: return sections.views;
+      case AGENTS_SYSTEM_RESOURCE_ID: return displaySettings.showAgentTab;
+      default: return true;
+    }
+  }
+
+  function sessionInsertionRules<Node extends { nodeId: string; resourceKind?: string | null; resourceId?: string | null; hidden?: boolean }>(
+    projectId: string,
+    snapshot: ProjectExplorerSnapshot,
+    sessionIds: { has(sessionId: string): boolean },
+  ): SessionInsertionRules<Node> {
+    const pinned = new Set((snapshot.itemStates ?? [])
+      .filter((state) => state.pinned && !state.relativePath)
+      .map((state) => state.nodeId));
+    return {
+      isSessionAnchor: (node) => node.resourceKind === "session" && !!node.resourceId
+        && sessionIds.has(node.resourceId) && !node.hidden && !pinned.has(node.nodeId),
+      isShownEntry: (node) => isEntryNodeShown(projectId, node),
+    };
+  }
+
   async function placeMissingResources(
     projectId: string,
     epoch: number,
@@ -379,7 +412,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     type PlacementNode = Pick<
       ProjectExplorerSnapshot["nodes"][number],
       "nodeId" | "parentNodeId" | "resourceKind" | "resourceId" | "position"
-    >;
+    > & { hidden?: boolean };
     const siblingsByParent = new Map<string | null, PlacementNode[]>();
     for (const node of snapshot.nodes) {
       const parentNodeId = node.parentNodeId ?? null;
@@ -426,7 +459,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
       };
       insertPlacementNode(null, 0, newSessionNode);
     }
-    if (!placed.has(`${SYSTEM_RESOURCE_KIND}:${KNOWLEDGE_SYSTEM_RESOURCE_ID}`)) {
+    if (knowledgeEnabled(projectId) && !placed.has(`${SYSTEM_RESOURCE_KIND}:${KNOWLEDGE_SYSTEM_RESOURCE_ID}`)) {
       const position = Math.min(1, siblingsByParent.get(null)?.length ?? 0);
       operations.push({
         kind: "placeResource",
@@ -464,29 +497,20 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
         position,
       });
     }
+    const sessionsById = new Map(
+      projectResources.sessions
+        .filter((session) => session.sessionType !== "folder")
+        .map((session) => [session.id, session]),
+    );
     const sessionParentNodeId = newSessionNode?.parentNodeId ?? null;
     const sessionSiblings = siblingsByParent.get(sessionParentNodeId) ?? [];
     const newSessionPosition = newSessionNode
       ? sessionSiblings.findIndex((node) => node.nodeId === newSessionNode?.nodeId)
       : -1;
-    const firstFollowingSessionPosition = sessionSiblings.findIndex((node, position) => (
-      position > newSessionPosition && node.resourceKind === "session"
-    ));
-    let nextSessionPosition = firstFollowingSessionPosition >= 0
-      ? firstFollowingSessionPosition
-      : Math.max(0, newSessionPosition + 1);
-    if (firstFollowingSessionPosition < 0) {
-      // Keep the leading special nodes and knowledge documents together.
-      while (nextSessionPosition < sessionSiblings.length) {
-        const node = sessionSiblings[nextSessionPosition]!;
-        if (node.resourceKind !== SYSTEM_RESOURCE_KIND && node.resourceKind !== "knowledge") break;
-        nextSessionPosition += 1;
-      }
-    }
-    const sessionsById = new Map(
-      projectResources.sessions
-        .filter((session) => session.sessionType !== "folder")
-        .map((session) => [session.id, session]),
+    let nextSessionPosition = newSessionInsertionIndex(
+      sessionSiblings,
+      newSessionPosition,
+      sessionInsertionRules(projectId, snapshot, sessionsById),
     );
     const sessionPlacementById = new Map<string, PlacementNode>(
       snapshot.nodes.flatMap((node) => (

@@ -19,7 +19,7 @@ describe("KnowledgeExplorer row icons", () => {
     expect(explorer).toContain("unityAssetIconClassForPath");
     expect(explorer).toContain("unityAssetIconNodeForPath");
     expect(explorer).toContain('<template #icon="{ item }">');
-    expect(explorer).toContain(':icon="entry.row.expanded ? FolderOpen : Folder"');
+    expect(explorer).toContain(':icon="entry.row.expanded ? ChevronDown : ChevronRight"');
     expect(explorer).toContain(':icon="Package"');
     expect(explorer).toContain(':class="documentIconClass(entry.row.node)"');
     expect(explorer).toContain(':icon="documentIconNode(entry.row.node)"');
@@ -27,13 +27,13 @@ describe("KnowledgeExplorer row icons", () => {
     expect(workspaceTree).toContain('class="workspace-tree-row-shell"');
   });
 
-  it("uses one stateful folder icon without a dedicated chevron column", () => {
+  it("uses one stateful chevron in place of the folder icon", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
     const workspaceTree = read("src/components/explorer/WorkspaceTree.vue");
 
     expect(explorer).toContain("expandable: branch");
     expect(explorer).toContain("hasChildren: isBranchNode(entry.row.node)");
-    expect(workspaceTree).toContain("return row.expanded ? FolderOpen : Folder;");
+    expect(workspaceTree).toContain("return row.expanded ? ChevronDown : ChevronRight;");
     expect(workspaceTree).not.toContain("workspace-tree-branch-spacer");
     expect(workspaceTree).not.toContain("workspace-tree-branch");
     expect(workspaceTree).not.toContain("empty: row.directChildCount === 0");

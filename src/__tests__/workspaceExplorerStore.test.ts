@@ -106,6 +106,23 @@ describe("workspace explorer store", () => {
     }));
   });
 
+  it("skips knowledge reads and default placement when workspace knowledge is disabled", async () => {
+    useWorkspaceContextStore().projectsById["project-a"] = {
+      projectId: "project-a", detectedServices: [], checkouts: [{
+        checkoutId: "checkout-a", projectId: "project-a", root: "G:/story",
+        normalizedRoot: "g:/story", lastOpenedAt: 0, knowledgeEnabled: false,
+      }],
+    };
+    const store = useWorkspaceExplorerStore();
+    await store.loadProject("project-a");
+    await store.refreshProjectKnowledge("project-a");
+    expect(explorerMocks.projectKnowledgeList).not.toHaveBeenCalled();
+    expect(store.resources["project-a"]?.knowledge).toEqual([]);
+    const operations = explorerMocks.projectExplorerApplyOperations.mock.calls.flatMap(call => call[2]);
+    expect(operations.some(operation => operation.resourceId === "knowledge")).toBe(false);
+    expect(operations.some(operation => operation.resourceId === "newSession")).toBe(true);
+  });
+
   it("restores placed view names and icons from their checkout catalog", async () => {
     const checkout = {
       checkoutId: "checkout-a", projectId: "project-a", root: "F:/Project",
@@ -491,6 +508,37 @@ describe("workspace explorer store", () => {
       resourceId: "session-b",
       parentNodeId: "folder:chat",
       position: 2,
+    }]);
+  });
+
+  it("places a new session below the entries even when older sessions sit above them", async () => {
+    const store = useWorkspaceExplorerStore();
+    await store.loadProject("project-a");
+    const resources: Array<[string, string, boolean?]> = [
+      ["system", "newSession"], ["session", "stray-a"], ["session", "stray-b"], ["system", "knowledge"],
+      ["system", "collaboration"], ["system", "assets"], ["system", "views"], ["system", "agents"],
+      ["system", "archived", true], ["session", "pinned"], ["session", "main-a"], ["session", "main-b"],
+    ];
+    store.snapshots["project-a"] = {
+      ...snapshot(1),
+      nodes: resources.map(([resourceKind, resourceId, hidden], position) => ({
+        nodeId: `${resourceKind}:${resourceId}`, projectId: "project-a", nodeKind: "resource",
+        resourceKind, resourceId, hidden: hidden ?? false, position,
+      })),
+      itemStates: [{ nodeId: "session:pinned", pinned: true, highlighted: false }],
+    };
+    explorerMocks.projectExplorerApplyOperations.mockClear();
+    sessionMocks.listProjectSessions.mockResolvedValueOnce(
+      ["new", "stray-a", "stray-b", "pinned", "main-a", "main-b"].map((id) => ({
+        id, title: id, sessionType: "chat", updatedAt: 1, projectId: "project-a", defaultCheckoutId: "checkout-a",
+      })),
+    );
+
+    await store.refreshProjectSessions("project-a");
+
+    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]).toEqual([{
+      kind: "placeResource", nodeId: expect.any(String), resourceKind: "session",
+      resourceId: "new", parentNodeId: undefined, position: 10,
     }]);
   });
 

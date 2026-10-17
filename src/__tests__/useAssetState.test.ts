@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { nextTick, reactive } from "vue";
+import { effectScope, nextTick, reactive } from "vue";
 import { useAssetState } from "../composables/useAssetState";
 import type { AssetPreviewPayload, SemanticTargetInspector, SemanticTreeNode } from "../types";
 
@@ -131,6 +131,47 @@ function dirEntriesPage(
 }
 
 describe("useAssetState preview flow", () => {
+  it("keeps a files-only folder expanded while loading and appending file pages", async () => {
+    projectServiceMocks.listDirEntriesPage.mockImplementation(async (path, _ref, offset, limit) => {
+      if (path === ".") return dirEntriesPage([{ name: "Docs", relPath: "Docs", isDir: true }]);
+      const entries = Array.from({ length: 205 }, (_, i) => ({ name: `${i}.txt`, relPath: `Docs/${i}.txt`, isDir: false }));
+      const page = entries.slice(offset, offset + limit);
+      return dirEntriesPage(page, 205, offset + page.length, offset + page.length < 205);
+    });
+    const scope = effectScope();
+    try {
+      const state = scope.run(() => useAssetState(reactive({ workingDir: "C:/Project", workspaceRef, includeFilesInTree: true })))!;
+      state.initRoots();
+      await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
+      await state.togglePath("Docs");
+      expect(state.isPathExpanded("Docs")).toBe(true);
+      await state.loadMoreFolder("Docs");
+      expect(state.isPathExpanded("Docs")).toBe(true);
+      const root = state.explorerTree.value[0];
+      const docs = root?.kind === "folder" ? root.children.find(node => node.path === "Docs") : null;
+      expect(docs?.kind === "folder" && docs.children.length).toBe(205);
+      expect(docs?.kind === "folder" && docs.hasMore).toBe(false);
+    } finally { scope.stop(); }
+  });
+  it("retains loaded files when a parent passes an equivalent workspace ref", async () => {
+    const props = reactive({ workingDir: "C:/Project", workspaceRef: {
+      checkoutId: "checkout-stable", expectedGeneration: 1, expectedMaterializationEpoch: 0,
+    } });
+    const scope = effectScope();
+    try {
+      const state = scope.run(() => useAssetState(props))!;
+      await state.initializeExplorer();
+      const tree = state.explorerTree.value;
+      projectServiceMocks.listDirEntriesPage.mockClear();
+      props.workspaceRef = { ...props.workspaceRef };
+      await flushPromises();
+      expect(projectServiceMocks.listDirEntriesPage).not.toHaveBeenCalled();
+      expect(state.explorerTree.value).toBe(tree);
+      props.workspaceRef = { ...props.workspaceRef, expectedGeneration: 2 };
+      await flushPromises();
+      expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalled();
+    } finally { scope.stop(); }
+  });
   const workspaceRef = {
     checkoutId: "checkout-a",
     expectedGeneration: 3,
@@ -331,8 +372,8 @@ describe("useAssetState preview flow", () => {
     expect(root?.kind).toBe("folder");
     expect(root?.name).toBe("repo");
     expect(root?.kind === "folder" && root.children.map((child) => child.path)).toEqual([
-      "src",
       "Library",
+      "src",
       "README.md",
     ]);
     expect(state.selectedFolderPath.value).toBe(".");
@@ -395,6 +436,76 @@ describe("useAssetState preview flow", () => {
       false,
       expect.any(Array),
     );
+  });
+
+  it("keeps folders first and names in natural order across pages and file changes", async () => {
+    projectServiceMocks.listDirEntriesPage.mockImplementation(async (path: string, _ref: unknown, offset: number) => {
+      if (path !== ".") return dirEntriesPage([]);
+      return offset === 0
+        ? dirEntriesPage([
+          { name: "README.md", relPath: "README.md", isDir: false },
+          { name: "file10.txt", relPath: "file10.txt", isDir: false },
+          { name: "Assets", relPath: "Assets", isDir: true },
+        ], 5, 3, true)
+        : dirEntriesPage([
+          { name: "file2.txt", relPath: "file2.txt", isDir: false },
+          { name: "Library", relPath: "Library", isDir: true },
+        ], 5, 5, false);
+    });
+    const scope = effectScope();
+    try {
+      const state = scope.run(() => useAssetState(reactive({ workingDir: "F:/repo", workspaceRef, includeFilesInTree: true })))!;
+      state.initRoots();
+      await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
+      const paths = () => {
+        const root = state.explorerTree.value[0]!;
+        if (root.kind !== "folder") throw Error("Expected root folder");
+        return root.children.map(node => node.path);
+      };
+      expect(paths()).toEqual(["Assets", "file10.txt", "README.md"]);
+      await state.loadMoreFolder(".");
+      expect(paths()).toEqual(["Assets", "Library", "file2.txt", "file10.txt", "README.md"]);
+
+      // The screenshot regression: a newly reported folder must precede README.md.
+      projectServiceMocks.statWorkspaceEntries.mockResolvedValueOnce([
+        { path: "Paging", exists: true, entryKind: "folder" },
+      ]);
+      await state.applyExplorerFileChange("Paging", "upsert");
+      expect(paths()).toEqual(["Assets", "Library", "Paging", "file2.txt", "file10.txt", "README.md"]);
+
+      projectServiceMocks.statWorkspaceEntries.mockResolvedValueOnce([
+        { path: "file1.txt", exists: true, entryKind: "file" },
+      ]);
+      await state.applyExplorerFileChange("file1.txt", "upsert");
+      expect(paths()).toEqual(["Assets", "Library", "Paging", "file1.txt", "file2.txt", "file10.txt", "README.md"]);
+
+      // Rename/move notifications remove the old entry and insert its new path.
+      await state.applyExplorerFileChange("Paging", "delete");
+      projectServiceMocks.statWorkspaceEntries.mockResolvedValueOnce([
+        { path: "archive", exists: true, entryKind: "folder" },
+      ]);
+      await state.applyExplorerFileChange("archive", "upsert");
+      expect(paths()).toEqual(["archive", "Assets", "Library", "file1.txt", "file2.txt", "file10.txt", "README.md"]);
+      expect(state.visibleDirectoryEntries.value.map(node => node.path)).toEqual(paths());
+    } finally { scope.stop(); }
+  });
+
+  it("resolves equal natural names consistently regardless of input order", async () => {
+    const entries = ["file2.txt", "file02.txt", "FILE2.txt", "Alpha.txt", "alpha.txt"]
+      .map(name => ({ name, relPath: name, isDir: false }));
+    const scope = effectScope();
+    try {
+      const state = scope.run(() => useAssetState(reactive({ workingDir: "F:/repo", workspaceRef, includeFilesInTree: true })))!;
+      for (const page of [entries, [...entries].reverse()]) {
+        projectServiceMocks.listDirEntriesPage.mockResolvedValue(dirEntriesPage(page));
+        state.initRoots();
+        await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
+        const root = state.explorerTree.value[0]!;
+        expect(root.kind === "folder" && root.children.map(node => node.path)).toEqual([
+          "Alpha.txt", "alpha.txt", "FILE2.txt", "file02.txt", "file2.txt",
+        ]);
+      }
+    } finally { scope.stop(); }
   });
 
   it("applies Unity-only hidden directories after detecting a Unity workspace", async () => {

@@ -32,7 +32,10 @@ describe("KnowledgeExplorer tree UX", () => {
     expect(explorer).toContain(':row-height="30"');
     // Shell, create row, and load row must all be exactly 30px tall, otherwise
     // FileTreeList's fixed-height spacer math drifts on long lists.
-    expect(workspaceTree).toMatch(/\.workspace-tree-row\s*\{[^}]*min-height:\s*30px/s);
+    expect(workspaceTree).toContain(':row-height="rowHeight"');
+    expect(workspaceTree).toContain("'--workspace-tree-row-height': `${rowHeight}px`");
+    expect(workspaceTree).toMatch(/\.workspace-tree-row-shell\s*\{[^}]*height:\s*var\(--workspace-tree-row-height,\s*30px\)/s);
+    expect(workspaceTree).toMatch(/\.workspace-tree-row\s*\{[^}]*height:\s*100%/s);
     expect(explorer).toMatch(/\.kx-create-row\s*\{[^}]*height:\s*30px/s);
     expect(explorer).toMatch(/\.kx-load-row\s*\{[^}]*height:\s*30px/s);
     expect(explorer).not.toContain(".kx-row-shell {");
@@ -57,7 +60,7 @@ describe("KnowledgeExplorer tree UX", () => {
     expect(explorer).toMatch(/if \(row\.node\.kind === "folder"\) \{\s*toggleExpansion\(row\);/);
     expect(explorer).toContain('@click="openSelectedFolderConfig"');
     expect(explorer).toContain('t("knowledge.explorer.folderConfig")');
-    expect(workspaceTree).toContain("return row.expanded ? FolderOpen : Folder;");
+    expect(workspaceTree).toContain("return row.expanded ? ChevronDown : ChevronRight;");
     expect(workspaceTree).not.toContain("toggleBranch");
     // Repeated clicks are deduplicated only after the first row activation was
     // observed, so a rerendered or changed target does not swallow the input.

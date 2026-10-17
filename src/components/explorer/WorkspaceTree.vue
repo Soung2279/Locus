@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from "vue";
-import { Archive, ArchiveRestore, File, Folder, FolderOpen, MessageSquare, Package, Star } from "lucide";
+import { Archive, ArchiveRestore, ChevronDown, ChevronRight, File, MessageSquare, Package, Star } from "lucide";
 import { t } from "../../i18n";
 import FileTreeList from "./FileTreeList.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
+import ResourceRenameInput from "./ResourceRenameInput.vue";
+import type { ExplorerResourceRename } from "./explorerResourceActions";
 
 const listRef = ref<InstanceType<typeof FileTreeList> | null>(null);
 
@@ -14,6 +16,8 @@ export interface WorkspaceTreeRow {
   name: string;
   depth: number;
   kind: WorkspaceTreeRowKind;
+  monospace?: boolean;
+  fileDropDirectory?: string;
   expandable?: boolean;
   expanded?: boolean;
   selected?: boolean;
@@ -55,11 +59,15 @@ const props = withDefaults(defineProps<{
   baseIndent?: number;
   indentSize?: number;
   rowTabIndex?: 0 | -1;
+  navigation?: boolean;
+  searchable?: boolean;
+  resourceRename?: ExplorerResourceRename | null;
 }>(), {
   rowHeight: 30,
   baseIndent: 10,
   indentSize: 14,
   rowTabIndex: -1,
+  searchable: true,
 });
 
 const pinnedSectionEndIndex = computed(() => props.items.findIndex((item) => item.treeRow?.pinnedSectionEnd));
@@ -82,6 +90,10 @@ function rowIndent(row: WorkspaceTreeRow, baseIndent: number, indentSize: number
   return `${baseIndent + Math.max(0, row.depth) * indentSize}px`;
 }
 
+function isEditing(row: WorkspaceTreeRow): boolean {
+  return !!row.editing || props.resourceRename?.key === row.key;
+}
+
 function focusRenameInput(element: unknown) {
   if (element instanceof HTMLInputElement && element.ownerDocument.activeElement !== element) {
     void nextTick(() => { if (element.isConnected) { element.focus(); element.select(); } });
@@ -93,7 +105,7 @@ function rowActivity(row: WorkspaceTreeRow) { return row.session ?? row.activity
 function defaultIcon(row: WorkspaceTreeRow) {
   if (row.session) return MessageSquare;
   if (row.kind === "package") return Package;
-  if (row.kind === "folder") return row.expanded ? FolderOpen : Folder;
+  if (row.kind === "folder") return row.expanded ? ChevronDown : ChevronRight;
   return File;
 }
 
@@ -108,7 +120,10 @@ defineExpose({ scrollToIndex });
   <FileTreeList
     ref="listRef"
     class="workspace-tree"
+    :class="{ 'is-navigation': navigation }"
+    :style="{ '--workspace-tree-row-height': `${rowHeight}px` }"
     :items="items"
+    :search-text="searchable ? (item) => item.treeRow?.name ?? '' : undefined"
     :row-height="rowHeight"
     :gap-after-index="pinnedSectionEndIndex"
     :gap-height="16"
@@ -126,15 +141,17 @@ defineExpose({ scrollToIndex });
       <slot name="empty"></slot>
     </template>
 
-    <template #item="{ item, index }">
+    <template #item="{ item, index, searchMatch }">
       <template v-if="item.treeRow" :key="item.key">
         <div
           :id="item.treeRow.domId"
           class="workspace-tree-row-shell"
           :class="{
             selected: item.treeRow.selected,
+            'is-search-current': searchMatch,
+            'is-monospace': item.treeRow.monospace,
             focused: item.treeRow.focused,
-            editing: item.treeRow.editing,
+            editing: isEditing(item.treeRow),
             'is-starred': item.treeRow.starred,
             'is-pinned': item.treeRow.pinned,
             'is-pinned-section-end': item.treeRow.pinnedSectionEnd,
@@ -142,6 +159,7 @@ defineExpose({ scrollToIndex });
           }"
           :style="{ '--workspace-tree-row-indent': rowIndent(item.treeRow, baseIndent, indentSize) }"
           :data-tree-key="item.treeRow.key"
+          :data-file-drop-directory="item.treeRow.fileDropDirectory"
           role="treeitem"
           :aria-level="item.treeRow.depth + 1"
           :aria-expanded="item.treeRow.expandable ? item.treeRow.expanded : undefined"
@@ -152,31 +170,32 @@ defineExpose({ scrollToIndex });
           @drop="emit('drop', item, $event)"
         >
           <component
-            :is="item.treeRow.editing ? 'div' : 'button'"
-            :type="item.treeRow.editing ? undefined : 'button'"
+            :is="isEditing(item.treeRow) ? 'div' : 'button'"
+            :type="isEditing(item.treeRow) ? undefined : 'button'"
             class="workspace-tree-row"
             :class="{
               disabled: item.treeRow.disabled,
-              'drag-enabled': item.treeRow.dragEnabled && !item.treeRow.editing,
+              'drag-enabled': item.treeRow.dragEnabled && !isEditing(item.treeRow),
             }"
             :style="{
               paddingLeft: rowIndent(item.treeRow, baseIndent, indentSize),
             }"
             :title="item.treeRow.title"
             :aria-label="item.treeRow.ariaLabel"
-            :disabled="item.treeRow.editing ? undefined : item.treeRow.disabled"
+            :disabled="isEditing(item.treeRow) ? undefined : item.treeRow.disabled"
             :tabindex="item.treeRow.disabled ? -1 : rowTabIndex"
-            @pointerdown="item.treeRow.dragEnabled && !item.treeRow.editing && emit('dragPointerDown', item, $event)"
-            @click="!item.treeRow.editing && emit('activate', item, $event)"
+            @pointerdown="item.treeRow.dragEnabled && !isEditing(item.treeRow) && emit('dragPointerDown', item, $event)"
+            @click="!isEditing(item.treeRow) && emit('activate', item, $event)"
           >
             <span class="workspace-tree-icon" :class="`kind-${item.treeRow.kind}`" aria-hidden="true">
-              <slot name="icon" :item="item" :row="item.treeRow" :index="index">
-                <LucideIcon :icon="defaultIcon(item.treeRow)" :size="13" :stroke-width="2" />
+              <slot name="icon" :item="item" :row="item.treeRow" :index="index" :size="14">
+                <LucideIcon :icon="defaultIcon(item.treeRow)" :size="14" :stroke-width="2" />
               </slot>
             </span>
 
-            <span v-if="item.treeRow.editing" class="workspace-tree-editor">
-              <slot name="editor" :item="item" :row="item.treeRow" :index="index">
+            <span v-if="isEditing(item.treeRow)" class="workspace-tree-editor">
+              <ResourceRenameInput v-if="resourceRename && resourceRename.key === item.treeRow.key" :rename="resourceRename" />
+              <slot v-else name="editor" :item="item" :row="item.treeRow" :index="index">
                 <input v-if="item.treeRow.session" :ref="focusRenameInput"
                   :value="item.treeRow.session.renameValue" class="development-session-rename-input"
                   :aria-label="t('chat.session.rename')" autocomplete="off"
@@ -279,12 +298,32 @@ defineExpose({ scrollToIndex });
   padding: 4px 0;
 }
 
+.workspace-tree.is-navigation {
+  padding-top: 12px;
+  background: color-mix(in srgb, var(--panel-bg) 88%, var(--bg-color) 12%);
+}
+
+.is-navigation .workspace-tree-row {
+  gap: 6px;
+  cursor: default;
+}
+
+.is-navigation .workspace-tree-icon.kind-folder {
+  color: color-mix(in srgb, var(--accent-color) 38%, var(--text-secondary) 62%);
+}
+
+.is-navigation .workspace-tree-icon.kind-package {
+  color: color-mix(in srgb, var(--accent-color) 74%, var(--text-color) 26%);
+}
+
 .workspace-tree-row-shell {
   position: relative;
   display: flex;
   align-items: stretch;
   width: 100%;
   min-width: 0;
+  /* Match FileTreeList's fixed stride, including while an editor is mounted. */
+  height: var(--workspace-tree-row-height, 30px);
   background: transparent;
   transition: background 0.1s ease;
 }
@@ -348,7 +387,8 @@ defineExpose({ scrollToIndex });
   gap: 4px;
   width: 100%;
   min-width: 0;
-  min-height: 30px;
+  height: 100%;
+  min-height: 0;
   padding: 2px 8px 2px 10px;
   border: none;
   background: transparent;
@@ -365,7 +405,7 @@ defineExpose({ scrollToIndex });
 }
 
 .workspace-tree-row.drag-enabled {
-  cursor: grab;
+  cursor: default;
   touch-action: none;
 }
 
@@ -404,6 +444,10 @@ defineExpose({ scrollToIndex });
 
 .workspace-tree-editor {
   overflow: visible;
+}
+
+.workspace-tree-row-shell.is-monospace .workspace-tree-name {
+  font-family: var(--font-mono-identifier);
 }
 
 .workspace-tree-name {

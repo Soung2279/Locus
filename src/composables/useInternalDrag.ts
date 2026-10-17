@@ -87,6 +87,41 @@ export interface InternalDragPoint {
   y: number;
 }
 
+export function internalDragFloatingPlacement(
+  point: InternalDragPoint,
+  viewport: { width: number; height: number },
+  previousSide: "above" | "below" = "below",
+  size = { width: 228, height: 34 },
+  insertionLine?: { left: number; right: number; y: number },
+): InternalDragPoint & { side: "above" | "below" } {
+  const margin = 8;
+  const clearance = 6;
+  const x = Math.max(margin, Math.min(point.x + 8, viewport.width - size.width - margin));
+  let belowY = point.y + clearance;
+  let aboveY = point.y - clearance - size.height;
+  // Stay close to the pointer; add only the space needed by the actual drop line.
+  if (insertionLine && x < insertionLine.right && x + size.width > insertionLine.left) {
+    const lineGap = 4;
+    if (insertionLine.y >= belowY - lineGap && insertionLine.y <= belowY + size.height + lineGap) {
+      belowY = insertionLine.y + lineGap;
+    }
+    if (insertionLine.y >= aboveY - lineGap && insertionLine.y <= aboveY + size.height + lineGap) {
+      aboveY = insertionLine.y - lineGap - size.height;
+    }
+  }
+  const belowFits = belowY + size.height <= viewport.height - margin;
+  const aboveFits = aboveY >= margin;
+  // Retain hysteresis so small movements at the window edge do not flip the card.
+  const side = previousSide === "below"
+    ? !belowFits && aboveFits ? "above" : "below"
+    : !aboveFits || belowY + size.height + 12 <= viewport.height - margin ? "below" : "above";
+  return {
+    x,
+    y: side === "above" ? aboveY : belowY,
+    side,
+  };
+}
+
 export function internalDragFloatingTransform(
   point: InternalDragPoint,
   anchor: InternalDragPoint,

@@ -4,10 +4,11 @@ import type { ComponentPublicInstance } from "vue";
 import {
   BookOpen,
   Check,
+  ChevronDown,
+  ChevronRight,
   Copy,
   Download,
   FilePlus,
-  Folder,
   FolderCog,
   FolderInput,
   FolderOpen,
@@ -1754,6 +1755,7 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
         v-else-if="visibleRows.length"
         ref="treeListRef"
         class="kx-tree"
+        :searchable="false"
         :items="visibleRows"
         :row-height="30"
         :base-indent="10"
@@ -1772,7 +1774,7 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
             />
             <LucideIcon
               v-else-if="entry.type === 'row' && entry.row.node.kind === 'folder'"
-              :icon="entry.row.expanded ? FolderOpen : Folder"
+              :icon="entry.row.expanded ? ChevronDown : ChevronRight"
               :size="13"
               :stroke-width="2"
             />

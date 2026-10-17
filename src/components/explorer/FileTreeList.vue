@@ -1,5 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import FindBar from "../ui/FloatingFindBar.vue";
+import { t } from "../../i18n";
+import { useListSearch } from "../../composables/useListSearch";
+
+defineOptions({ inheritAttrs: false });
 
 interface FileTreeListItem {
   key: string;
@@ -12,6 +17,7 @@ const props = withDefaults(defineProps<{
   overscan?: number;
   gapAfterIndex?: number;
   gapHeight?: number;
+  searchText?: (item: FileTreeListItem) => string;
 }>(), {
   rowHeight: 30,
   overscan: 8,
@@ -24,6 +30,16 @@ const emit = defineEmits<{
 }>();
 
 const scrollRef = ref<HTMLElement | null>(null);
+const listSearch = useListSearch({
+  root: scrollRef,
+  items: () => props.items,
+  text: (item) => props.searchText?.(item) ?? "",
+  enabled: () => !!props.searchText,
+  reveal: (index) => scrollToIndex(index, { align: "center" }),
+});
+const { visible: searchVisible, query: searchQuery, matches: searchMatches,
+  currentIndex: searchIndex, current: searchCurrent, close: closeSearch, move: moveSearch } = listSearch;
+const searchBar = listSearch.bar;
 const scrollTop = ref(0);
 const viewportHeight = ref(0);
 
@@ -145,7 +161,9 @@ function scrollToIndex(index: number, options?: { align?: "auto" | "center" }) {
   if (!element || !props.items.length) return;
   const rowHeight = Math.max(1, props.rowHeight);
   const clamped = Math.max(0, Math.min(index, props.items.length - 1));
-  const top = rowTop(clamped);
+  // Spacer offsets are relative to the content box, but scrollTop includes
+  // the list's padding. Include it when revealing a row near either edge.
+  const top = rowTop(clamped) + (Number.parseFloat(getComputedStyle(element).paddingTop) || 0);
   const bottom = top + rowHeight;
   const align = options?.align ?? "auto";
   if (
@@ -190,7 +208,10 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="scrollRef" class="file-tree-list" @scroll="scheduleViewportMetrics">
+  <div ref="scrollRef" v-bind="$attrs" class="file-tree-list" tabindex="-1" @scroll="scheduleViewportMetrics">
+    <!-- Keep caller classes on this scoped root so parent styles reach the rows. -->
+    <FindBar v-if="searchVisible" :anchor="scrollRef" :ref="(value) => { searchBar = value as InstanceType<typeof FindBar> | null; }" v-model:query="searchQuery" :count="searchMatches.length"
+      :current="searchCurrent" :placeholder="t('search.listPlaceholder')" @next="moveSearch(1)" @previous="moveSearch(-1)" @close="closeSearch" />
     <slot v-if="!items.length" name="empty"></slot>
     <template v-else>
       <div
@@ -203,6 +224,7 @@ onUnmounted(() => {
           name="item"
           :item="item"
           :index="virtualWindow.start + localIndex"
+          :search-match="searchVisible && searchIndex === virtualWindow.start + localIndex"
         ></slot>
         <slot v-if="gapHeight > 0 && virtualWindow.start + localIndex === gapAfterIndex" name="gap">
           <div :style="{ height: `${gapHeight}px` }" />
@@ -218,7 +240,9 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.file-tree-list :deep(.is-search-current) { background: var(--accent-soft); outline: 1px solid var(--border-strong); outline-offset: -1px; }
 .file-tree-list {
+  outline: none;
   flex: 1;
   min-height: 0;
   overflow-y: auto;

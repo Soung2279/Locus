@@ -6,6 +6,7 @@ use base64::Engine;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
+use super::text_preview::decode_text_preview;
 use crate::error::AppError;
 use crate::session::models::{
     ProjectExplorerMutationResult, ProjectExplorerOperation, ProjectExplorerPresetSummary,
@@ -27,6 +28,18 @@ pub use csv_document::*;
 #[path = "explorer_file_actions.rs"]
 mod explorer_file_actions;
 pub use explorer_file_actions::*;
+
+#[path = "workspace_file_move.rs"]
+mod workspace_file_move;
+pub use workspace_file_move::*;
+
+#[path = "workspace_file_create.rs"]
+mod workspace_file_create;
+pub use workspace_file_create::*;
+
+#[path = "file_history.rs"]
+mod file_history;
+pub use file_history::*;
 
 fn text_preview_limit(path: &Path) -> u64 {
     if path.extension().and_then(|value| value.to_str()).unwrap_or("").eq_ignore_ascii_case("csv") {
@@ -825,34 +838,32 @@ fn build_file_preview(
     } else {
         Some(blake3::hash(&bytes).to_hex().to_string())
     };
-    let looks_text = is_text_extension(&extension) || !bytes.contains(&0);
-    if looks_text {
-        if let Ok(text) = String::from_utf8(bytes) {
-            let total_lines = text.lines().count().max(1);
-            return Ok(ProjectExplorerFilePreview {
-                path: canonical.to_string_lossy().into_owned(),
-                name,
-                extension,
-                size,
-                kind: "text".to_string(),
-                mime_type: if mime_type == "application/octet-stream" {
-                    "text/plain".to_string()
-                } else {
-                    mime_type
-                },
-                text: Some(text),
-                content_hash,
-                data_url: None,
-                total_lines: Some(total_lines),
-                truncated,
-                editable: !truncated,
-                checkout_id: None,
-                workspace_generation: None,
-                workspace_relative_path: None,
-                materialization_epoch: None,
-                revision: revision.clone(),
-            });
-        }
+    if let Some(decoded) = decode_text_preview(&bytes, truncated) {
+        let text = decoded.text;
+        let total_lines = text.lines().count().max(1);
+        return Ok(ProjectExplorerFilePreview {
+            path: canonical.to_string_lossy().into_owned(),
+            name,
+            extension,
+            size,
+            kind: "text".to_string(),
+            mime_type: if mime_type == "application/octet-stream" {
+                "text/plain".to_string()
+            } else {
+                mime_type
+            },
+            text: Some(text),
+            content_hash,
+            data_url: None,
+            total_lines: Some(total_lines),
+            truncated,
+            editable: !truncated && decoded.utf8,
+            checkout_id: None,
+            workspace_generation: None,
+            workspace_relative_path: None,
+            materialization_epoch: None,
+            revision: revision.clone(),
+        });
     }
     Ok(ProjectExplorerFilePreview {
         path: canonical.to_string_lossy().into_owned(),
@@ -1039,8 +1050,7 @@ fn validate_text_file_write_with_limit(
     current: &[u8], content: &str, expected_content_hash: &str, limit: u64,
 ) -> Result<(), TextFileWriteValidationError> {
     if current.len() as u64 > limit
-        || current.contains(&0)
-        || std::str::from_utf8(current).is_err()
+        || !decode_text_preview(current, false).is_some_and(|decoded| decoded.utf8)
     {
         return Err(TextFileWriteValidationError::CurrentFileNotEditable);
     }
@@ -1063,6 +1073,10 @@ fn write_text_file(
     expected_content_hash: &str,
     operation: &'static str,
 ) -> Result<ProjectExplorerFilePreview, AppError> {
+    let _document_guard = if canonical.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")) {
+        Some(super::view_documents::DOCUMENT_WRITE_LOCK.lock()
+            .map_err(|error| AppError::new("document.write_lock", error.to_string()))?)
+    } else { None };
     let csv_path = canonical.to_string_lossy().to_ascii_lowercase();
     let _csv_guard = if csv_path.ends_with(".csv") || csv_path.ends_with(".csv.view") {
         Some(CSV_FILE_WRITE_LOCK.lock().map_err(|error| AppError::new("csv.write_lock", error.to_string()))?)
@@ -1169,6 +1183,10 @@ pub async fn workspace_file_write(
         "workspaceFileWrite",
     )
 }
+
+#[cfg(test)]
+#[path = "workspace_text_preview_tests.rs"]
+mod text_preview_tests;
 
 #[cfg(test)]
 mod file_write_tests {

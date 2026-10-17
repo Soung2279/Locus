@@ -5,7 +5,7 @@ fn action_error(error: impl ToString) -> AppError {
     AppError::new("workspace.file_action_failed", error.to_string())
 }
 
-fn sibling_file(source: &Path, name: &str) -> Result<PathBuf, AppError> {
+pub(super) fn sibling_file(source: &Path, name: &str) -> Result<PathBuf, AppError> {
     let name = name.trim();
     if name.is_empty()
         || name == "."
@@ -27,7 +27,7 @@ fn sibling_file(source: &Path, name: &str) -> Result<PathBuf, AppError> {
     Ok(source.with_file_name(name))
 }
 
-fn companion_files(path: &Path) -> Result<Vec<PathBuf>, AppError> {
+pub(super) fn companion_files(path: &Path) -> Result<Vec<PathBuf>, AppError> {
     let csv = path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"));
@@ -206,6 +206,8 @@ pub async fn explorer_file_action(
         .await?;
         return Ok(None);
     }
+    // Keep Markdown saves out of the rename/reference-update transaction.
+    let _document_guard = super::super::view_documents::DOCUMENT_WRITE_LOCK.lock().map_err(action_error)?;
     // The common CSV lock also excludes concurrent CSV companion saves.
     let _guard = CSV_FILE_WRITE_LOCK.lock().map_err(action_error)?;
     let target = new_name
@@ -219,7 +221,22 @@ pub async fn explorer_file_action(
     let staged = target.clone().unwrap_or_else(|| {
         source.with_file_name(format!(".locus-delete-{}", uuid::Uuid::new_v4()))
     });
+    let image_rename = target.is_some() && source.extension().is_some_and(|ext| {
+        matches!(ext.to_string_lossy().to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg")
+    });
+    let mut reference_updates = if image_rename {
+        crate::markdown_attachments::image_reference_updates(action_root, &source, target.as_deref().unwrap()).map_err(action_error)?
+    } else { Vec::new() };
+    if image_rename {
+        reference_updates.extend(super::super::markdown_documents::recovery_image_updates(
+            &app_handle, action_root, workspace_ref.as_ref().map(|r| r.checkout_id.as_str()), &source, target.as_deref().unwrap(),
+        )?);
+    }
     let moved = relocate_files(&source, &staged)?;
+    if let Err(error) = crate::markdown_attachments::apply_updates(&reference_updates) {
+        rollback_files(&moved)?;
+        return Err(action_error(error));
+    }
     let updated = match crate::workspace_tree::relocate_file_references(
         &root,
         project_id.as_str(),
@@ -228,6 +245,7 @@ pub async fn explorer_file_action(
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
+            crate::markdown_attachments::rollback_updates(&reference_updates).map_err(action_error)?;
             rollback_files(&moved)?;
             return Err(action_error(error));
         }
@@ -237,6 +255,7 @@ pub async fn explorer_file_action(
             std::fs::remove_file(path).map_err(action_error)?;
         }
     }
+    crate::workspace_file_order::relocate(action_root, &source, target.as_deref()).map_err(action_error)?;
     emit_file_action(
         &app_handle,
         project_id.as_str(),
@@ -244,6 +263,14 @@ pub async fn explorer_file_action(
         &source,
         target.as_deref(),
     )?;
+    if image_rename {
+        app_handle.emit("markdown-image-renamed", serde_json::json!({
+            "root": action_root, "oldPath": source, "newPath": target,
+            "checkoutId": workspace_ref.as_ref().map(|r| &r.checkout_id),
+            "workspaceGeneration": workspace_ref.as_ref().and_then(|r| r.expected_generation),
+            "materializationEpoch": workspace_ref.as_ref().and_then(|r| r.expected_materialization_epoch),
+        })).map_err(action_error)?;
+    }
     drop(scope);
     emit_changed(
         &app_handle,
@@ -282,6 +309,7 @@ pub(crate) fn reconcile_knowledge_file_action(
     let snapshot =
         crate::workspace_tree::relocate_file_references(&root, project_id.as_str(), source, target)
             .map_err(action_error)?;
+    crate::workspace_file_order::relocate(Path::new(working_dir), source, target).map_err(action_error)?;
     emit_file_action(
         app,
         project_id.as_str(),

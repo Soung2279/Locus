@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, type ComponentPublicInstance } from "vue";
+import { computed, onBeforeUnmount, watch, type ComponentPublicInstance } from "vue";
 import { File, Folder, GripVertical, Package } from "lucide";
 import LucideIcon from "../icons/LucideIcon.vue";
 import {
+  internalDragFloatingPlacement,
   internalDragFloatingTransform,
   useInternalDragController,
 } from "../../composables/useInternalDrag";
 
 const drag = useInternalDragController();
 let overlayElement: HTMLElement | null = null;
+let visualPoint = drag.point.value;
+let previewSide: "above" | "below" = "below";
 
 const overlayTarget = computed(() => drag.ownerDocument.value.body);
 const preview = computed(() => drag.source.value?.preview ?? null);
@@ -31,20 +34,49 @@ const label = computed(() => {
   const count = Math.max(1, value.count ?? 1);
   return count > 1 ? `${value.label} +${count - 1}` : value.label;
 });
+
+function insertionLineAt(point: { x: number; y: number }) {
+  if (!drag.activeTarget.value) return undefined;
+  let nearest: { left: number; right: number; y: number } | undefined;
+  // Read the rendered marker so scrolling, pinned groups and layout gaps share
+  // the same avoidance geometry without changing their drop decisions.
+  for (const row of drag.ownerDocument.value.querySelectorAll<HTMLElement>(
+    ".is-pin-drop-before, .is-pin-drop-after, .is-drop-preview",
+  )) {
+    const rect = row.getBoundingClientRect();
+    if (!rect.width || !rect.height) continue;
+    const y = row.classList.contains("is-pin-drop-after") ? rect.bottom - 1 : rect.top;
+    if (!nearest || Math.abs(y - point.y) < Math.abs(nearest.y - point.y)) {
+      nearest = { left: rect.left, right: rect.right, y };
+    }
+  }
+  return nearest;
+}
+
 function applyVisualPoint(point: { x: number; y: number }) {
+  visualPoint = point;
   if (!overlayElement) return;
+  const viewport = drag.ownerDocument.value.documentElement;
+  const placement = internalDragFloatingPlacement(point, {
+    width: viewport.clientWidth,
+    height: viewport.clientHeight,
+  }, previewSide, undefined, insertionLineAt(point));
+  previewSide = placement.side;
   overlayElement.style.transform = internalDragFloatingTransform(
-    point,
-    drag.previewAnchor.value,
+    placement,
+    { x: 0, y: 0 },
   );
 }
 
 function bindOverlayElement(value: Element | ComponentPublicInstance | null) {
   overlayElement = value instanceof HTMLElement ? value : null;
-  if (overlayElement) applyVisualPoint(drag.point.value);
+  if (overlayElement) applyVisualPoint(visualPoint);
+  else previewSide = "below";
 }
 
 const unsubscribeVisualPoint = drag.subscribeVisualPoint(applyVisualPoint);
+// Vue may render the insertion marker after the pointer callback has run.
+watch(() => drag.activeTarget.value, () => applyVisualPoint(visualPoint), { flush: "post" });
 onBeforeUnmount(unsubscribeVisualPoint);
 </script>
 

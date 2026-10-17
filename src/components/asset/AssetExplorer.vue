@@ -33,7 +33,6 @@ type VisibleEntry =
       node: AssetFolderNode;
       canToggle: boolean;
       expanded: boolean;
-      folderOpen: boolean;
       treeRow: WorkspaceTreeRow;
     }
   | {
@@ -59,12 +58,12 @@ const visibleRows = computed<VisibleEntry[]>(() => {
         node,
         canToggle,
         expanded,
-        folderOpen: expanded && canToggle,
         treeRow: {
           key: node.path,
           name: node.name,
           depth: node.depth,
           kind: "folder",
+          fileDropDirectory: node.path,
           expandable: canToggle,
           expanded,
           selected: props.selectedPath === node.path,
@@ -176,25 +175,6 @@ function beginDrag(item: WorkspaceTreeItem, event: PointerEvent) {
       @drag-pointer-down="beginDrag"
       @visible-range-change="handleVisibleRangeChange"
     >
-      <template #icon="{ item }">
-        <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
-          <span
-            v-if="entry.kind === 'row'"
-            class="ax-kind-icon folder"
-            :class="[
-              { open: entry.folderOpen },
-              unityFolderIconClass(entry.folderOpen),
-            ]"
-            aria-hidden="true"
-          >
-            <LucideIcon
-              :icon="unityFolderIconNode(entry.folderOpen)"
-              :size="13"
-            />
-          </span>
-        </template>
-      </template>
-
       <template #name="{ item }">
         <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
           <span

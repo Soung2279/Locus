@@ -46,6 +46,7 @@ export function assetWorkspaceReferenceDragData(
   if (!normalizedProjectId || !normalizedRoot || !reference) return null;
   return {
     version: 1,
+    fileSystemMove: !("isSubAsset" in entry && entry.isSubAsset),
     origin: {
       projectId: normalizedProjectId,
       workspaceRef: context.workspaceRef,

@@ -18,9 +18,12 @@ import {
 import type { RoutedWorkspaceEvent, WorkspaceRef } from "../services/project";
 import {
   subscribeWorkspaceFileChanges,
+  subscribeExplorerFileActions,
   type WorkspaceFileChangedPayload,
 } from "../services/workspaceExplorer";
+import { workspaceRelativeEntryPath } from "../components/explorer/workspaceFileMove";
 import type { RuntimeUnsubscribe } from "../services/locusRuntime";
+import { startWorkspaceFileWatch } from "../services/workspaceFileWatch";
 import { t } from "../i18n";
 import { isUnityConnectionError, normalizeAppError } from "../services/errors";
 import { getWarmup } from "./warmupCache";
@@ -41,6 +44,10 @@ interface AssetProps {
   workingDir: string;
   workspaceRef?: WorkspaceRef | null;
   active?: boolean;
+  /** File trees keep folders containing only files expanded; directory-only panes do not. */
+  includeFilesInTree?: boolean;
+  /** Acquire a general watcher only while the file-mode explorer is mounted. */
+  watchWorkspaceFiles?: boolean;
 }
 
 // ── Explorer node ──────────────────────────────────────────
@@ -75,6 +82,7 @@ const WORKSPACE_ROOT_PATH = ".";
 const ASSET_EXPLORER_PAGE_SIZE = 200;
 const ASSET_EXPLORER_BRANCH_PROBE_PAGE_SIZE = 1;
 const ASSET_EXPLORER_BRANCH_PROBE_CONCURRENCY = 8;
+const explorerNameCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 type ViewMode = "stats" | "preview";
 type AssetSearchScope = "folder" | "global";
 type FolderRevealMode = "none" | "ancestors" | "self";
@@ -174,6 +182,10 @@ export function useAssetState(props: AssetProps) {
   let explorerInitializing = false;
   const pendingExplorerFileChanges = new Map<string, WorkspaceFileChangedPayload["kind"]>();
   let explorerFileChangeTimer: ReturnType<typeof setTimeout> | null = null;
+  let explorerFileChangeFlushing = false;
+  let releaseFileWatch: (() => Promise<void>) | null = null;
+  let fileWatchScope = "";
+  const watchesGeneralFiles = computed(() => props.watchWorkspaceFiles && !isUnityWorkspace.value);
   const hasWorkspace = computed(() => !!props.workingDir.trim() && !!props.workspaceRef);
   const hiddenDirectories = computed(() => {
     const names = [
@@ -216,6 +228,10 @@ export function useAssetState(props: AssetProps) {
     kind: WorkspaceFileChangedPayload["kind"],
   ): Promise<void> {
     if (!hasWorkspace.value || explorerPathHidden(path)) return;
+    if (watchesGeneralFiles.value || path === WORKSPACE_ROOT_PATH) {
+      await reconcileFileTree([path]);
+      return;
+    }
     const parent = findNodeByPath(explorerParentPath(path));
     if (!parent || parent.kind !== "folder" || !parent.loaded) return;
     const normalizedPath = path.replace(/\\/g, "/");
@@ -249,6 +265,7 @@ export function useAssetState(props: AssetProps) {
     parent.children.push(entry.entryKind === "folder"
       ? createFolderNode(name, normalizedPath, parent.depth + 1, false)
       : createFileNode(name, normalizedPath, parent.depth + 1));
+    parent.children.sort(compareExplorerNodes);
     parent.totalCount += 1;
     parent.nextOffset += 1;
     parent.hasChildFoldersKnown = true;
@@ -257,17 +274,22 @@ export function useAssetState(props: AssetProps) {
   }
 
   function armExplorerFileChangeFlush(): void {
-    if (props.active === false || pendingExplorerFileChanges.size === 0) return;
-    if (explorerFileChangeTimer) clearTimeout(explorerFileChangeTimer);
+    if (props.active === false || explorerInitializing || explorerFileChangeFlushing
+      || pendingExplorerFileChanges.size === 0 || explorerFileChangeTimer) return;
     explorerFileChangeTimer = setTimeout(() => {
       explorerFileChangeTimer = null;
       const changes = [...pendingExplorerFileChanges.entries()];
       pendingExplorerFileChanges.clear();
+      explorerFileChangeFlushing = true;
       void (async () => {
-        for (const [changedPath, changedKind] of changes) {
-          await applyExplorerFileChange(changedPath, changedKind);
+        if (watchesGeneralFiles.value || changes.some(([path]) => path === WORKSPACE_ROOT_PATH)) {
+          await reconcileFileTree(changes.map(([path]) => path));
         }
-      })();
+        else for (const [changedPath, changedKind] of changes) await applyExplorerFileChange(changedPath, changedKind);
+      })().catch(e => { error.value = normalizeAppError(e).message; }).finally(() => {
+        explorerFileChangeFlushing = false;
+        armExplorerFileChangeFlush();
+      });
     }, 120);
   }
 
@@ -275,11 +297,19 @@ export function useAssetState(props: AssetProps) {
     path: string,
     kind: WorkspaceFileChangedPayload["kind"],
   ): void {
-    pendingExplorerFileChanges.set(path.replace(/\\/g, "/"), kind);
+    if (explorerPathHidden(path)) return;
+    if (watchesGeneralFiles.value && pendingExplorerFileChanges.size >= 4096) {
+      pendingExplorerFileChanges.clear();
+      pendingExplorerFileChanges.set(WORKSPACE_ROOT_PATH, "upsert");
+    }
+    if (!pendingExplorerFileChanges.has(WORKSPACE_ROOT_PATH)) {
+      pendingExplorerFileChanges.set(path.replace(/\\/g, "/"), kind);
+    }
     armExplorerFileChangeFlush();
   }
 
   function resetWorkspaceState() {
+    stopFileWatch();
     explorerInitialization += 1;
     explorerInitializing = false;
     if (explorerFileChangeTimer) clearTimeout(explorerFileChangeTimer);
@@ -311,6 +341,92 @@ export function useAssetState(props: AssetProps) {
   function workspaceRootName(): string {
     const normalized = props.workingDir.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
     return normalized.split("/").filter(Boolean).pop() || t("asset.explorer.workspaceRoot");
+  }
+
+  function stopFileWatch() {
+    const release = releaseFileWatch;
+    releaseFileWatch = null;
+    fileWatchScope = "";
+    if (release) void release().catch(e => console.warn("[file-tree] watcher release failed", e));
+  }
+
+  async function ensureFileWatch(initialization: number) {
+    if (!watchesGeneralFiles.value) { stopFileWatch(); return; }
+    await ensureFileChangeListener();
+    if (assetStateUnmounted || initialization !== explorerInitialization) return;
+    const reference = requireAssetWorkspaceRef();
+    const scope = JSON.stringify([props.workingDir, reference.checkoutId, reference.expectedGeneration, reference.expectedMaterializationEpoch]);
+    if (fileWatchScope === scope) return;
+    stopFileWatch();
+    const release = await startWorkspaceFileWatch(reference);
+    if (assetStateUnmounted || initialization !== explorerInitialization) { await release(); return; }
+    releaseFileWatch = release;
+    fileWatchScope = scope;
+  }
+
+  /** Re-read only affected loaded directories. Keep folder objects so expansion,
+   * nested caches and drag/reorder references survive a structural change. */
+  async function reconcileFileTree(paths: string[]) {
+    const initialization = explorerInitialization;
+    const reference = props.workspaceRef;
+    if (!reference) return;
+    const directories = new Set<AssetFolderNode>();
+    const all = paths.includes(WORKSPACE_ROOT_PATH);
+    function collect(nodes: AssetExplorerNode[]) {
+      for (const node of nodes) if (node.kind === "folder") {
+        if (node.loaded || node.loading) directories.add(node);
+        collect(node.children);
+      }
+    }
+    if (all) collect(explorerTree.value);
+    else for (const path of paths) {
+      if (explorerPathHidden(path)) continue;
+      const changed = findNodeByPath(path);
+      if (changed?.kind === "folder" && changed.loaded) directories.add(changed);
+      let parentPath = explorerParentPath(path);
+      while (true) {
+        const parent = findNodeByPath(parentPath);
+        if (parent?.kind === "folder" && (parent.loaded || parent.loading)) { directories.add(parent); break; }
+        if (parentPath === WORKSPACE_ROOT_PATH) break;
+        parentPath = explorerParentPath(parentPath);
+      }
+    }
+    for (const folder of [...directories].sort((a, b) => a.depth - b.depth)) {
+      if (initialization !== explorerInitialization || assetStateUnmounted) return;
+      if (findNodeByPath(folder.path) !== folder) continue;
+      if (folder.loading) { pendingExplorerFileChanges.set(folder.path, "upsert"); continue; }
+      folder.loading = true;
+      try {
+        const count = Math.max(ASSET_EXPLORER_PAGE_SIZE, folder.nextOffset);
+        const entries: Awaited<ReturnType<typeof listDirEntriesPage>>["entries"] = [];
+        let offset = 0;
+        let page: Awaited<ReturnType<typeof listDirEntriesPage>>;
+        do {
+          page = await listDirEntriesPage(folder.path, reference, offset, Math.min(2000, count - offset),
+            isUnityWorkspace.value, hiddenDirectories.value);
+          entries.push(...page.entries);
+          if (!page.hasMore || page.nextOffset <= offset) break;
+          offset = page.nextOffset;
+        } while (offset < count);
+        if (initialization !== explorerInitialization || assetStateUnmounted) return;
+        const existing = new Map(folder.children.map(node => [node.path, node]));
+        folder.children = entries.map(entry => {
+          const previous = existing.get(entry.relPath);
+          if (previous && (previous.kind === "folder") === entry.isDir) return previous;
+          return entry.isDir ? createFolderNode(entry.name, entry.relPath, folder.depth + 1, false)
+            : createFileNode(entry.name, entry.relPath, folder.depth + 1);
+        }).sort(compareExplorerNodes);
+        folder.loaded = true;
+        folder.totalCount = page.totalCount;
+        folder.nextOffset = page.nextOffset;
+        folder.hasMore = page.hasMore;
+        folder.hasChildFoldersKnown = true;
+        folder.hasChildFolders = folder.children.some(node => node.kind === "folder");
+        const selected = selectedNode.value;
+        if (selected && !findNodeByPath(selected.path)) { closePreview(); selectedNode.value = null; }
+        explorerTree.value = [...explorerTree.value];
+      } finally { folder.loading = false; }
+    }
   }
 
   function initRoots() {
@@ -412,14 +528,14 @@ export function useAssetState(props: AssetProps) {
         : createFileNode(entry.name, entry.relPath, folder.depth + 1),
     );
 
-    folder.children = append ? [...folder.children, ...children] : children;
+    folder.children = (append ? [...folder.children, ...children] : children).sort(compareExplorerNodes);
     folder.loaded = true;
     folder.hasMore = page.hasMore;
     folder.nextOffset = page.nextOffset;
     folder.totalCount = page.totalCount;
     folder.hasChildFoldersKnown = true;
     folder.hasChildFolders = folder.children.some((child) => child.kind === "folder");
-    if (!folder.hasChildFolders) {
+    if (!folder.hasChildFolders && !props.includeFilesInTree) {
       collapseExpandedBranch(folder.path);
     }
   }
@@ -450,6 +566,7 @@ export function useAssetState(props: AssetProps) {
       error.value = err.message;
     } finally {
       folder.loading = false;
+      armExplorerFileChangeFlush();
     }
   }
 
@@ -476,7 +593,7 @@ export function useAssetState(props: AssetProps) {
       );
       folder.hasChildFoldersKnown = true;
       folder.hasChildFolders = page.entries[0]?.isDir === true;
-      if (!folder.hasChildFolders) {
+      if (!folder.hasChildFolders && !props.includeFilesInTree) {
         collapseExpandedBranch(folder.path);
       }
     } catch (e) {
@@ -1047,6 +1164,9 @@ export function useAssetState(props: AssetProps) {
         if (initialization !== explorerInitialization) return false;
         isUnityWorkspace.value = detected;
       }
+      try { await ensureFileWatch(initialization); }
+      catch (e) { error.value = normalizeAppError(e).message; }
+      if (assetStateUnmounted || initialization !== explorerInitialization) return false;
       initRoots();
       closePreview();
       await selectFolder(WORKSPACE_ROOT_PATH, {
@@ -1062,6 +1182,7 @@ export function useAssetState(props: AssetProps) {
     } finally {
       if (initialization === explorerInitialization) {
         explorerInitializing = false;
+        armExplorerFileChangeFlush();
       }
     }
   }
@@ -1096,6 +1217,8 @@ export function useAssetState(props: AssetProps) {
   // ── Lifecycle ────────────────────────────────────────────
   let unlistenScoped: UnlistenFn | null = null;
   let releaseWorkspaceFileChanges: RuntimeUnsubscribe | null = null;
+  let fileChangeListenerStarting: Promise<void> | null = null;
+  let releaseExplorerFileActions: RuntimeUnsubscribe | null = null;
   let assetStateUnmounted = false;
   let watcherPollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -1120,24 +1243,64 @@ export function useAssetState(props: AssetProps) {
     }
   }
 
-  onMounted(async () => {
-    if (hasWorkspace.value) {
-      const initialized = await initializeExplorer();
-      if (initialized) await initializeUnityAssetState();
-    } else {
-      resetWorkspaceState();
-    }
-    const releaseFileChanges = await subscribeWorkspaceFileChanges((event) => {
+  function ensureFileChangeListener(): Promise<void> {
+    if (fileChangeListenerStarting) return fileChangeListenerStarting;
+    fileChangeListenerStarting = subscribeWorkspaceFileChanges((event) => {
       const workspaceRef = props.workspaceRef;
       if (!workspaceRef || event.checkoutId !== workspaceRef.checkoutId) return;
       if (
         workspaceRef.expectedGeneration != null
         && event.workspaceGeneration !== workspaceRef.expectedGeneration
       ) return;
-      scheduleExplorerFileChange(event.payload.path, event.payload.kind);
+      if (workspaceRef.expectedMaterializationEpoch != null && event.materializationEpoch != null
+        && workspaceRef.expectedMaterializationEpoch !== event.materializationEpoch) return;
+      scheduleExplorerFileChange(event.payload.rescan ? WORKSPACE_ROOT_PATH : event.payload.path, event.payload.kind);
+    }).then(release => {
+      if (assetStateUnmounted) release();
+      else releaseWorkspaceFileChanges = release;
+    }).catch(error => { fileChangeListenerStarting = null; throw error; });
+    return fileChangeListenerStarting;
+  }
+
+  onMounted(async () => {
+    try { await ensureFileChangeListener(); }
+    catch (e) { error.value = normalizeAppError(e).message; }
+    if (assetStateUnmounted) return;
+    if (hasWorkspace.value) {
+      const initialized = await initializeExplorer();
+      if (initialized) await initializeUnityAssetState();
+    } else {
+      resetWorkspaceState();
+    }
+    const releaseActions = await subscribeExplorerFileActions(event => {
+      const reference = props.workspaceRef;
+      if (!reference || (event.workspaceRef && (event.workspaceRef.checkoutId !== reference.checkoutId
+        || event.workspaceRef.expectedGeneration !== reference.expectedGeneration
+        || event.workspaceRef.expectedMaterializationEpoch !== reference.expectedMaterializationEpoch))) return;
+      const fold = (path: string) => path.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+      if (fold(event.root) !== fold(props.workingDir)) return;
+      const oldPath = workspaceRelativeEntryPath(event.root, event.path);
+      const newPath = event.newPath ? workspaceRelativeEntryPath(event.root, event.newPath) : null;
+      if (!oldPath) return;
+      const remap = (path: string | null): string | null => path && newPath
+        && (fold(path) === fold(oldPath) || (event.isDirectory && fold(path).startsWith(`${fold(oldPath)}/`)))
+        ? newPath + path.slice(oldPath.length) : null;
+      const nextFolder = remap(selectedFolderPath.value);
+      const nextPreview = remap(selectedNode.value?.path ?? null);
+      if (event.isDirectory) expandedPaths.value = new Set([...expandedPaths.value].map(path => remap(path) ?? path));
+      void (async () => {
+        await applyExplorerFileChange(oldPath, "delete");
+        if (props.workspaceRef?.checkoutId !== reference.checkoutId
+          || props.workspaceRef?.expectedGeneration !== reference.expectedGeneration
+          || props.workspaceRef?.expectedMaterializationEpoch !== reference.expectedMaterializationEpoch) return;
+        if (newPath) await applyExplorerFileChange(newPath, "upsert");
+        if (nextFolder) await selectFolder(nextFolder, { preservePreview: true, revealInTree: "self" });
+        if (nextPreview) await openAssetPath(nextPreview);
+        if (searchQuery.value.trim()) await runFilenameSearch(searchQuery.value);
+      })().catch(e => { error.value = normalizeAppError(e).message; });
     });
-    if (assetStateUnmounted) releaseFileChanges();
-    else releaseWorkspaceFileChanges = releaseFileChanges;
+    if (assetStateUnmounted) releaseActions();
+    else releaseExplorerFileActions = releaseActions;
     try {
       const applyScanPhase = async (phase: AssetDbScanEvent) => {
         if (!hasWorkspace.value) return;
@@ -1193,10 +1356,14 @@ export function useAssetState(props: AssetProps) {
 
   onUnmounted(() => {
     assetStateUnmounted = true;
+    explorerInitialization += 1;
+    stopFileWatch();
     unlistenScoped?.();
     unlistenScoped = null;
     releaseWorkspaceFileChanges?.();
     releaseWorkspaceFileChanges = null;
+    releaseExplorerFileActions?.();
+    releaseExplorerFileActions = null;
     if (explorerFileChangeTimer) clearTimeout(explorerFileChangeTimer);
     explorerFileChangeTimer = null;
     pendingExplorerFileChanges.clear();
@@ -1208,11 +1375,11 @@ export function useAssetState(props: AssetProps) {
 
   // Re-init when workingDir changes (workspace switch).
   watch(
-    () => [
-      props.workingDir,
-      props.workspaceRef?.checkoutId ?? "",
-      props.workspaceRef?.expectedGeneration ?? null,
-      props.workspaceRef?.expectedMaterializationEpoch ?? null,
+    [
+      () => props.workingDir,
+      () => props.workspaceRef?.checkoutId ?? "",
+      () => props.workspaceRef?.expectedGeneration ?? null,
+      () => props.workspaceRef?.expectedMaterializationEpoch ?? null,
     ] as const,
     async ([workingDir]) => {
       stopWatcherPoll();
@@ -1293,10 +1460,8 @@ export function useAssetState(props: AssetProps) {
     if (a.kind !== b.kind) {
       return a.kind === "folder" ? -1 : 1;
     }
-    return a.name.localeCompare(b.name, undefined, {
-      numeric: true,
-      sensitivity: "base",
-    });
+    return explorerNameCollator.compare(a.name, b.name)
+      || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
   }
 
   const currentFolder = computed<AssetFolderNode | null>(() => {

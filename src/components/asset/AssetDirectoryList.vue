@@ -1,9 +1,12 @@
 <script setup lang="ts">
+import { workspaceFileParent } from "../explorer/workspaceFileMove";
 import { computed } from "vue";
 import { t } from "../../i18n";
 import { explorerFileKey, explorerFilePath, useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay";
 import type { AssetExplorerNode } from "../../composables/useAssetState";
 import FileTreeList from "../explorer/FileTreeList.vue";
+import ResourceRenameInput from "../explorer/ResourceRenameInput.vue";
+import type { ExplorerResourceRename } from "../explorer/explorerResourceActions";
 import LucideIcon from "../icons/LucideIcon.vue";
 import {
   unityAssetIconClassForPath,
@@ -16,6 +19,7 @@ type AssetFolderNode = Extract<AssetExplorerNode, { kind: "folder" }>;
 
 const props = defineProps<{
   workingDir?: string;
+  resourceRename?: ExplorerResourceRename | null;
   items: AssetExplorerNode[];
   selectedPath: string | null;
   loading: boolean;
@@ -100,22 +104,25 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
       v-if="visibleRows.length"
       class="adl-list"
       :items="visibleRows"
+      :search-text="(item) => item.node?.name ?? ''"
       :row-height="32"
       @visible-range-change="handleVisibleRangeChange"
     >
-      <template #item="{ item }">
+      <template #item="{ item, searchMatch }">
         <template
           v-for="entry in [asVisibleEntry(item)]"
           :key="entry.key"
         >
-          <button
+          <component
             v-if="entry.kind === 'row'"
-            type="button"
+            :is="resourceRename?.key === entry.key ? 'div' : 'button'"
+            :type="resourceRename?.key === entry.key ? undefined : 'button'"
             class="adl-row"
-            :class="{ selected: selectedPath === entry.node.path }"
+            :data-file-drop-directory="entry.node.kind === 'folder' ? entry.node.path : workspaceFileParent(entry.node.path)"
+            :class="{ selected: selectedPath === entry.node.path, 'is-search-current': searchMatch }"
             :title="entry.node.path"
-            @pointerdown="beginDrag(entry.node, $event)"
-            @click="emit('select', entry.node)"
+            @pointerdown="resourceRename?.key !== entry.key && beginDrag(entry.node, $event)"
+            @click="resourceRename?.key !== entry.key && emit('select', entry.node)"
             @contextmenu="entry.node.kind === 'file' && emit('fileContextmenu', entry.node, $event)"
           >
             <span
@@ -141,10 +148,11 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
               />
             </span>
 
-            <span class="adl-name">
+            <ResourceRenameInput v-if="resourceRename?.key === entry.key" :rename="resourceRename" />
+            <span v-else class="adl-name">
               {{ displayName(entry.node) }}<span v-if="isFolder(entry.node)" class="adl-folder-suffix">/</span>
             </span>
-          </button>
+          </component>
 
           <div v-else class="adl-load-row">
             <span class="adl-load-icon" :class="unityFolderIconClass(false)" aria-hidden="true">

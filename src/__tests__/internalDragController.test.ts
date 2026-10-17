@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createInternalDragController,
+  internalDragFloatingPlacement,
   internalDragFloatingTransform,
   internalDragPointReachedViewportEdge,
 } from "../composables/useInternalDrag";
@@ -43,6 +44,40 @@ afterEach(() => {
 });
 
 describe("internal drag controller", () => {
+  it("keeps the preview close to the pointer and visible at viewport edges", () => {
+    const viewport = { width: 1400, height: 900 };
+    const placement = internalDragFloatingPlacement({ x: 90, y: 383 }, viewport);
+    expect(placement).toEqual({ x: 98, y: 389, side: "below" });
+    const edge = internalDragFloatingPlacement({ x: 1399, y: 890 }, viewport);
+    expect(edge).toEqual({ x: 1164, y: 850, side: "above" });
+    expect(edge.x + 228).toBeLessThan(viewport.width);
+    expect(edge.y + 34).toBe(890 - 6);
+  });
+
+  it("adds clearance only when the preview would cover the actual insertion line", () => {
+    const viewport = { width: 1400, height: 900 };
+    const line = { left: 12, right: 237, y: 419 };
+    expect(internalDragFloatingPlacement({ x: 90, y: 410 }, viewport, "below", undefined, line))
+      .toEqual({ x: 98, y: 423, side: "below" });
+    expect(internalDragFloatingPlacement({ x: 90, y: 421 }, viewport, "below", undefined, line))
+      .toEqual({ x: 98, y: 427, side: "below" });
+    expect(internalDragFloatingPlacement({ x: 300, y: 410 }, viewport, "below", undefined, line))
+      .toEqual({ x: 308, y: 416, side: "below" });
+    const upper = internalDragFloatingPlacement({ x: 90, y: 880 }, viewport, "above", undefined,
+      { ...line, y: 870 });
+    expect(upper.y + 34).toBe(866);
+  });
+
+  it("does not flip the preview repeatedly when the pointer jitters near the bottom threshold", () => {
+    const viewport = { width: 1400, height: 900 };
+    let side: "above" | "below" = "below";
+    const sides = [851, 853, 851, 854, 849, 840].map(y => {
+      side = internalDragFloatingPlacement({ x: 90, y }, viewport, side).side;
+      return side;
+    });
+    expect(sides).toEqual(["below", "above", "above", "above", "above", "below"]);
+  });
+
   it("keeps the floating hotspot invariant at viewport edges and fractional coordinates", () => {
     expect(internalDragFloatingTransform(
       { x: 10.25, y: 899.75 },

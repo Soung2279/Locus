@@ -25,22 +25,50 @@ export function explorerFileAction(projectId: string, path: string, newName: str
   return ipcInvoke("explorer_file_action", { projectId, path, newName, workspaceRef: workspaceRef ?? null });
 }
 
+export interface WorkspaceFileMoveResult {
+  projectId: string;
+  root: string;
+  path: string;
+  newPath: string;
+  isDirectory: boolean;
+  workspaceRef: WorkspaceRef;
+}
+
+export type ExplorerFileActionEvent = Omit<WorkspaceFileMoveResult, "newPath" | "isDirectory" | "workspaceRef"> & {
+  newPath: string | null;
+  isDirectory?: boolean;
+  workspaceRef?: WorkspaceRef;
+};
+
+export function subscribeExplorerFileActions(listener: (event: ExplorerFileActionEvent) => void): Promise<RuntimeUnsubscribe> {
+  return getLocusRuntime().subscribe<ExplorerFileActionEvent>("explorer-file-action", listener,
+    { owner: "workspaceExplorer.subscribeExplorerFileActions" });
+}
+
+export function moveWorkspaceFile(workspaceRef: WorkspaceRef, sourcePath: string, targetDirectory: string): Promise<WorkspaceFileMoveResult> {
+  return ipcInvoke("workspace_move_entry", { workspaceRef, sourcePath, targetDirectory });
+}
+
+export function workspaceCreateDocument(workspaceRef: WorkspaceRef, directory: string, name: string): Promise<string> {
+  return ipcInvoke("workspace_create_document", { workspaceRef, directory, name });
+}
+
 export interface WorkspaceFileChangedPayload {
   seq: number;
   generation: number;
   path: string;
   kind: "upsert" | "delete";
   source: "os_watcher" | "locus_write" | "plugin_install" | "reconcile";
+  rescan?: boolean;
 }
 
 type WorkspaceFileChangedEvent = RoutedWorkspaceEvent<WorkspaceFileChangedPayload>;
 const workspaceFileChangeListeners = new Set<(event: WorkspaceFileChangedEvent) => void>();
-let workspaceFileChangeSubscriptionStarted = false;
+let workspaceFileChangeSubscription: Promise<void> | null = null;
 
-function ensureWorkspaceFileChangeSubscription(): void {
-  if (workspaceFileChangeSubscriptionStarted) return;
-  workspaceFileChangeSubscriptionStarted = true;
-  void getLocusRuntime().subscribe<WorkspaceFileChangedEvent>(
+function ensureWorkspaceFileChangeSubscription(): Promise<void> {
+  if (workspaceFileChangeSubscription) return workspaceFileChangeSubscription;
+  workspaceFileChangeSubscription = getLocusRuntime().subscribe<WorkspaceFileChangedEvent>(
     WORKSPACE_EVENT_NAME,
     (event) => {
       if (event.eventName !== WORKSPACE_FILE_CHANGED_EVENT) return;
@@ -53,9 +81,11 @@ function ensureWorkspaceFileChangeSubscription(): void {
       }
     },
     { owner: "workspaceExplorer.ensureWorkspaceFileChangeSubscription" },
-  ).catch(() => {
-    workspaceFileChangeSubscriptionStarted = false;
+  ).then(() => {}).catch(error => {
+    workspaceFileChangeSubscription = null;
+    throw error;
   });
+  return workspaceFileChangeSubscription;
 }
 
 export function projectExplorerSnapshot(projectId: string): Promise<ProjectExplorerSnapshot> {
@@ -190,14 +220,15 @@ export function workspaceFileRevision(
   });
 }
 
-export function subscribeWorkspaceFileChanges(
+export async function subscribeWorkspaceFileChanges(
   handler: (event: WorkspaceFileChangedEvent) => void,
 ): Promise<RuntimeUnsubscribe> {
   workspaceFileChangeListeners.add(handler);
-  ensureWorkspaceFileChangeSubscription();
-  return Promise.resolve(() => {
+  try { await ensureWorkspaceFileChangeSubscription(); }
+  catch (error) { workspaceFileChangeListeners.delete(handler); throw error; }
+  return () => {
     workspaceFileChangeListeners.delete(handler);
-  });
+  };
 }
 
 export function workspaceFileWrite(

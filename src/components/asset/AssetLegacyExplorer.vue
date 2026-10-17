@@ -1,11 +1,16 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { ChevronRight } from "lucide";
+import { ChevronDown, ChevronRight } from "lucide";
 import { t } from "../../i18n";
 import { explorerFileKey, explorerFilePath, useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay";
 import { isMetaFile } from "../../composables/useHideMeta";
 import type { AssetExplorerNode } from "../../composables/useAssetState";
 import FileTreeList from "../explorer/FileTreeList.vue";
+import WorkspaceTree from "../explorer/WorkspaceTree.vue";
+import ResourceRenameInput from "../explorer/ResourceRenameInput.vue";
+import type { ExplorerResourceRename } from "../explorer/explorerResourceActions";
+import { WORKSPACE_FILE_ROW_HEIGHT, workspaceFileEntries, type WorkspaceFileEntry } from "../explorer/workspaceFileTree";
+import { workspaceFileParent } from "../explorer/workspaceFileMove";
 import LucideIcon from "../icons/LucideIcon.vue";
 import {
   unityAssetIconClassForPath,
@@ -18,11 +23,13 @@ type AssetFolderNode = Extract<AssetExplorerNode, { kind: "folder" }>;
 
 const props = defineProps<{
   workingDir?: string;
+  resourceRename?: ExplorerResourceRename | null;
   tree: AssetExplorerNode[];
   selectedPath: string | null;
   isPathExpanded: (path: string) => boolean;
   dragEnabled?: boolean;
   workspaceStyle?: boolean;
+  searchable?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -36,7 +43,7 @@ const emit = defineEmits<{
 const { showsFullPath } = useExplorerPathDisplay();
 function displayName(node: AssetExplorerNode): string {
   const path = explorerFilePath(props.workingDir ?? "", node.path);
-  return node.kind === "file" && showsFullPath(explorerFileKey(path)) ? path : node.name;
+  return showsFullPath(explorerFileKey(path)) ? path : node.name;
 }
 
 type VisibleEntry =
@@ -90,6 +97,29 @@ const visibleRows = computed<VisibleEntry[]>(() => {
   return out;
 });
 
+const workspaceRows = computed(() => workspaceFileEntries(props.tree, props.isPathExpanded, t("asset.explorer.loadMore"))
+  .map(entry => ({ ...entry, treeRow: { ...entry.treeRow!,
+    name: entry.loadMore ? entry.treeRow!.name : displayName(entry.node),
+    title: explorerFilePath(props.workingDir ?? "", entry.node.path),
+    selected: !entry.loadMore && props.selectedPath === entry.node.path,
+    dragEnabled: !entry.loadMore && props.dragEnabled,
+    classes: { "is-open": !entry.loadMore && props.selectedPath === entry.node.path },
+  } })));
+
+function activateWorkspaceEntry(entry: WorkspaceFileEntry) {
+  if (entry.loadMore) emit("loadMore", entry.node.path);
+  else if (entry.node.kind === "folder") emit("toggle", entry.node.path);
+  else emit("select", entry.node);
+}
+
+function workspaceVisibleRange({ start, end }: { start: number; end: number }) {
+  for (const entry of workspaceRows.value.slice(start, end + 1)) {
+    if (entry.loadMore && entry.node.kind === "folder" && !entry.node.loading && entry.node.hasMore) {
+      emit("loadMore", entry.node.path);
+    }
+  }
+}
+
 function rowClick(entry: Extract<VisibleEntry, { kind: "row" }>) {
   if (entry.isFolder) {
     emit("toggle", entry.node.path);
@@ -138,27 +168,52 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
 
 <template>
   <div class="alx-root" :class="{ 'is-workspace-tree': props.workspaceStyle }">
+    <WorkspaceTree
+      v-if="props.workspaceStyle"
+      :resource-rename="resourceRename"
+      navigation
+      :searchable="props.searchable"
+      :row-height="WORKSPACE_FILE_ROW_HEIGHT"
+      :items="workspaceRows"
+      :base-indent="12"
+      :row-tab-index="0"
+      @activate="activateWorkspaceEntry($event as WorkspaceFileEntry)"
+      @contextmenu="(item, event) => !((item as WorkspaceFileEntry).loadMore) && emit('fileContextmenu', (item as WorkspaceFileEntry).node, event)"
+      @drag-pointer-down="(item, event) => !((item as WorkspaceFileEntry).loadMore) && beginDrag((item as WorkspaceFileEntry).node, event)"
+      @visible-range-change="workspaceVisibleRange"
+    >
+      <template #icon="{ item, size }">
+        <LucideIcon :class="(item as WorkspaceFileEntry).node.kind === 'file' ? fileIconClass((item as WorkspaceFileEntry).node) : undefined"
+          :icon="(item as WorkspaceFileEntry).node.kind === 'folder'
+          ? item.treeRow?.expanded ? ChevronDown : ChevronRight
+          : unityAssetIconNodeForPath((item as WorkspaceFileEntry).node.path, { isFolder: false })" :size="size" />
+      </template>
+    </WorkspaceTree>
     <FileTreeList
+      v-else
       class="alx-tree"
       :items="visibleRows"
+      :search-text="props.searchable !== false ? (item) => item.node?.name ?? '' : undefined"
       :row-height="props.workspaceStyle ? 30 : 28"
       @visible-range-change="handleVisibleRangeChange"
     >
-      <template #item="{ item }">
+      <template #item="{ item, searchMatch }">
         <template
           v-for="entry in [asVisibleEntry(item)]"
           :key="entry.key"
         >
-          <button
+          <component
             v-if="entry.kind === 'row'"
-            type="button"
+            :is="resourceRename?.key === entry.key ? 'div' : 'button'"
+            :type="resourceRename?.key === entry.key ? undefined : 'button'"
             class="alx-row"
-            :class="{ selected: selectedPath === entry.node.path }"
+            :data-file-drop-directory="entry.node.kind === 'folder' ? entry.node.path : workspaceFileParent(entry.node.path)"
+            :class="{ selected: selectedPath === entry.node.path, 'is-search-current': searchMatch }"
             :style="{ paddingLeft: `${indentPx(entry.node)}px` }"
-            @pointerdown="beginDrag(entry.node, $event)"
-            @click="rowClick(entry)"
+            @pointerdown="resourceRename?.key !== entry.key && beginDrag(entry.node, $event)"
+            @click="resourceRename?.key !== entry.key && rowClick(entry)"
             :title="explorerFilePath(workingDir ?? '', entry.node.path)"
-            @contextmenu="entry.node.kind === 'file' && emit('fileContextmenu', entry.node, $event)"
+            @contextmenu="emit('fileContextmenu', entry.node, $event)"
           >
             <span
               v-if="entry.isFolder && !props.workspaceStyle"
@@ -188,10 +243,11 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
               />
             </span>
 
-            <span class="alx-name" :class="{ 'alx-name-root': entry.node.kind === 'folder' && entry.node.isRoot }">
+            <ResourceRenameInput v-if="resourceRename?.key === entry.key" :rename="resourceRename" />
+            <span v-else class="alx-name" :class="{ 'alx-name-root': entry.node.kind === 'folder' && entry.node.isRoot }">
               {{ displayName(entry.node) }}
             </span>
-          </button>
+          </component>
 
           <div
             v-else
@@ -222,36 +278,6 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
   background: var(--sidebar-bg);
 }
 
-.is-workspace-tree .alx-row,
-.is-workspace-tree .alx-load-row {
-  min-height: 30px;
-  padding-right: 8px;
-}
-
-.is-workspace-tree .alx-name {
-  font-family: var(--font-mono-identifier);
-  font-size: 12px;
-  line-height: 18px;
-}
-
-.is-workspace-tree .alx-kind-icon {
-  height: 18px;
-}
-
-.is-workspace-tree .alx-kind-icon :deep(svg) {
-  display: block;
-  width: 14px;
-  height: 14px;
-}
-
-.is-workspace-tree .alx-row.selected {
-  box-shadow: inset 2px 0 0 var(--accent-color);
-}
-
-.is-workspace-tree .alx-load-row .alx-branch-spacer {
-  display: none;
-}
-
 .alx-root {
   display: flex;
   flex-direction: column;
@@ -276,7 +302,7 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
   background: transparent;
   color: var(--text-color);
   font: inherit;
-  font-size: 13px;
+  font-size: 12px;
   text-align: left;
   cursor: pointer;
   overflow: hidden;

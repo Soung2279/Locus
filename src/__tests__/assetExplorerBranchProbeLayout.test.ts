@@ -20,7 +20,7 @@ describe("AssetExplorer branch probe layout", () => {
     expect(source).toContain("expandable: canToggle");
     expect(source).toContain('emit("select", entry.node.path);');
     expect(source).toContain('emit("toggle", entry.node.path);');
-    expect(workspaceTree).toContain("return row.expanded ? FolderOpen : Folder;");
+    expect(workspaceTree).toContain("return row.expanded ? ChevronDown : ChevronRight;");
     expect(workspaceTree).not.toContain("workspace-tree-branch");
   });
 });

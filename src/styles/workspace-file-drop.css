@@ -1,0 +1,4 @@
+:is(.workspace-tree-row-shell, .alx-row, .adl-row, .asr-row, .file-tree-list, .development-explorer-header).is-workspace-file-drop-target {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent-color);
+}

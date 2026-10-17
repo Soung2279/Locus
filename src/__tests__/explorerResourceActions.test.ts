@@ -1,13 +1,16 @@
 // @vitest-environment jsdom
-import { createApp, nextTick, type App, type Component } from "vue";
+import { createApp, defineComponent, h, nextTick, reactive, ref, type App, type Component } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { t } from "../i18n";
 import ResourceFileMenuItems from "../components/explorer/ResourceFileMenuItems.vue";
 import ExplorerResourceActions from "../components/explorer/ExplorerResourceActions.vue";
+import WorkspaceTree from "../components/explorer/WorkspaceTree.vue";
 import AssetDirectoryList from "../components/asset/AssetDirectoryList.vue";
+import AssetLegacyExplorer from "../components/asset/AssetLegacyExplorer.vue";
+import AssetSearchResults from "../components/asset/AssetSearchResults.vue";
 import KnowledgeExplorer from "../components/knowledge/KnowledgeExplorer.vue";
 import { explorerFileKey, explorerKnowledgeKey, useExplorerPathDisplay } from "../composables/useExplorerPathDisplay";
-import { resourceRelativePath, type ExplorerResourceTarget } from "../components/explorer/explorerResourceActions";
+import { resourceRelativePath, type ExplorerResourceRename, type ExplorerResourceTarget } from "../components/explorer/explorerResourceActions";
 import type { KnowledgeDocumentSummary } from "../types";
 
 const mocks = vi.hoisted(() => ({
@@ -40,7 +43,24 @@ const apps: App[] = [];
 function mount(component: Component, props: Record<string, unknown> = {}) {
   const host = window.document.createElement("div");
   window.document.body.appendChild(host);
-  const app = createApp(component, props);
+  // Exercise the same renderless controller + inline tree editor used by the workbench.
+  const root = component === ExplorerResourceActions ? defineComponent({
+    setup(_, { expose }) {
+      const actions = ref<InstanceType<typeof ExplorerResourceActions> | null>(null);
+      expose({ run: async (...args: Parameters<InstanceType<typeof ExplorerResourceActions>["run"]>) => {
+        await actions.value!.run(...args);
+        await nextTick();
+      } });
+      return () => h("div", [
+        h(WorkspaceTree, { resourceRename: actions.value?.draft, rowTabIndex: 0,
+          items: [{ key: actions.value?.draft?.key ?? file.path,
+            treeRow: { key: actions.value?.draft?.key ?? file.path, name: "design.md", kind: "file", depth: 0, dragEnabled: true } }],
+        }),
+        h(ExplorerResourceActions, { ...props, ref: actions }),
+      ]);
+    },
+  }) : component;
+  const app = createApp(root, component === ExplorerResourceActions ? {} : props);
   const instance = app.mount(host);
   apps.push(app);
   return { host, instance: instance as unknown as InstanceType<typeof ExplorerResourceActions> };
@@ -52,10 +72,10 @@ function button(host: Element, label: string) {
   return found!;
 }
 function submit(name: string) {
-  const input = window.document.querySelector<HTMLInputElement>(".resource-rename-dialog input")!;
+  const input = window.document.querySelector<HTMLInputElement>(".resource-rename-input")!;
   input.value = name;
   input.dispatchEvent(new Event("input", { bubbles: true }));
-  input.form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
 }
 beforeEach(() => {
   vi.clearAllMocks();
@@ -69,6 +89,42 @@ beforeEach(() => {
 afterEach(() => { apps.splice(0).forEach((app) => app.unmount()); window.document.body.innerHTML = ""; });
 
 describe("explorer resource menus", () => {
+  const node = { kind: "file", path: "docs/design.md", name: "design.md", depth: 0 };
+  it.each([
+    ["directory", AssetDirectoryList, { items: [node], loaded: true, loading: false, hasMore: false, emptyLabel: "" }],
+    ["legacy tree", AssetLegacyExplorer, { tree: [node], isPathExpanded: (): boolean => true }],
+    ["workspace tree", AssetLegacyExplorer, { tree: [node], isPathExpanded: (): boolean => true, workspaceStyle: true }],
+    ["search", AssetSearchResults, { results: [{ ...node, kind: "md", root: "workspace", isDirectory: false }], query: "design", searching: false, hasFallback: false, truncated: false }],
+  ] as const)("edits in the %s row without opening or dragging the file", async (_, component, props) => {
+    const selected = vi.fn(), dragged = vi.fn(), submitRename = vi.fn();
+    const rename = reactive<ExplorerResourceRename>({ key: node.path, target: file, name: node.name,
+      busy: false, error: "", submit: submitRename, cancel: vi.fn() });
+    const list = mount(component, { ...props, workingDir: file.root, selectedPath: node.path,
+      resourceRename: rename, dragEnabled: true, onSelect: selected, onDragPointerDown: dragged });
+    await flush();
+    const input = list.host.querySelector<HTMLInputElement>(".resource-rename-input")!;
+    expect(input.value).toBe(node.name);
+    expect(input.closest("button")).toBeNull();
+    input.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+    input.click();
+    submit("renamed.md");
+    await flush();
+    expect(rename.name).toBe("renamed.md");
+    expect(submitRename).toHaveBeenCalledTimes(1);
+    expect(selected).not.toHaveBeenCalled();
+    expect(dragged).not.toHaveBeenCalled();
+  });
+
+  it("offers directory path actions without passing directories to file-only mutations", () => {
+    const action = vi.fn();
+    const menu = mount(ResourceFileMenuItems, { target: { ...file, path: "F:/Project/docs", isDirectory: true }, onAction: action });
+    button(menu.host, t("knowledge.explorer.openInFileSystem")).click();
+    expect(action).toHaveBeenLastCalledWith("reveal");
+    button(menu.host, t("knowledge.explorer.copyRelativePath")).click();
+    expect(action).toHaveBeenLastCalledWith("copy");
+    expect([...menu.host.querySelectorAll("button")].some(item => item.textContent?.trim() === t("knowledge.explorer.rename"))).toBe(false);
+    expect(menu.host.querySelector("button.danger")).toBeNull();
+  });
   it("changes only the rendered file label, preserving the file used by list actions", async () => {
     const selected = vi.fn();
     const nodes = ["design.md", "other.md"].map((name) => ({ kind: "file", path: `docs/${name}`, name, depth: 1 }));
@@ -146,12 +202,15 @@ describe("explorer resource menus", () => {
     useExplorerPathDisplay().togglePath(explorerFileKey(file.path));
     const actions = mount(ExplorerResourceActions, { onChanged: changed });
     await actions.instance.run("rename", file);
-    const input = window.document.querySelector<HTMLInputElement>(".resource-rename-dialog input")!;
+    const input = actions.host.querySelector<HTMLInputElement>(".workspace-tree-row .resource-rename-input")!;
     expect(input.value).toBe("design.md");
+    expect(window.document.activeElement).toBe(input);
+    expect(input.closest("button")).toBeNull();
+    expect(window.document.querySelector("[role=dialog], .resource-rename-backdrop")).toBeNull();
     expect(input.selectionEnd).toBe("design".length);
     submit("renamed.md");
     await flush();
-    expect(mocks.fileAction).toHaveBeenCalledWith("project-a", file.path, "renamed.md", workspaceRef);
+    expect(mocks.fileAction).toHaveBeenCalledWith("project-a", "docs/design.md", "renamed.md", workspaceRef);
     expect(changed).toHaveBeenCalledWith(file, "F:/Project/docs/renamed.md");
     expect(useExplorerPathDisplay().showsFullPath(explorerFileKey("F:/Project/docs/renamed.md"))).toBe(true);
     expect(useExplorerPathDisplay().showsFullPath(explorerFileKey(file.path))).toBe(false);
@@ -166,6 +225,55 @@ describe("explorer resource menus", () => {
     expect(mocks.knowledgeMove).toHaveBeenCalledWith({ kind: "document", type: "design", path: "combat/design.md", newPath: "combat/renamed.md" }, workspaceRef);
     expect(mocks.fileAction).not.toHaveBeenCalled();
     expect(mocks.refresh).toHaveBeenCalledWith(file.projectId);
+  });
+
+  it("cancels with Escape without submitting on blur and restores row focus", async () => {
+    const actions = mount(ExplorerResourceActions);
+    await actions.instance.run("rename", file);
+    const input = actions.host.querySelector<HTMLInputElement>("input")!;
+    input.value = "cancelled.md";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    input.dispatchEvent(new Event("blur"));
+    await flush();
+    expect(mocks.fileAction).not.toHaveBeenCalled();
+    expect(actions.host.querySelector("input")).toBeNull();
+    expect(window.document.activeElement).toBe(actions.host.querySelector(".workspace-tree-row"));
+  });
+
+  it("submits on blur and ignores duplicate submissions while saving", async () => {
+    let resolve!: (path: string) => void;
+    mocks.fileAction.mockReturnValueOnce(new Promise<string>(done => { resolve = done; }));
+    const actions = mount(ExplorerResourceActions);
+    await actions.instance.run("rename", file);
+    const input = actions.host.querySelector<HTMLInputElement>("input")!;
+    input.value = "renamed.md";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.blur();
+    await flush();
+    expect(input.readOnly).toBe(true);
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    input.dispatchEvent(new Event("blur"));
+    expect(mocks.fileAction).toHaveBeenCalledTimes(1);
+    resolve("F:/Project/docs/renamed.md");
+    await flush();
+    expect(actions.host.querySelector("input")).toBeNull();
+  });
+
+  it("keeps IME confirmation inside the editor and accepts the subsequent Enter", async () => {
+    const actions = mount(ExplorerResourceActions);
+    await actions.instance.run("rename", file);
+    const input = actions.host.querySelector<HTMLInputElement>("input")!;
+    input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    submit("事件大纲.md");
+    await flush();
+    expect(mocks.fileAction).not.toHaveBeenCalled();
+    input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true }));
+    expect(mocks.fileAction).not.toHaveBeenCalled();
+    submit("事件大纲.md");
+    await flush();
+    expect(mocks.fileAction).toHaveBeenCalledWith(file.projectId, "docs/design.md", "事件大纲.md", workspaceRef);
   });
 
   it("forces mounted lists to refresh and closes a successful rename even if refresh fails", async () => {
@@ -192,7 +300,7 @@ describe("explorer resource menus", () => {
     submit("duplicate.md");
     await flush();
     expect(window.document.querySelector("[role=alert]")?.textContent).toContain("Target already exists");
-    expect(window.document.querySelector<HTMLInputElement>(".resource-rename-dialog input")?.value).toBe("duplicate.md");
+    expect(window.document.querySelector<HTMLInputElement>(".resource-rename-input")?.value).toBe("duplicate.md");
   });
 
   it("does not delete when confirmation is cancelled", async () => {
@@ -203,11 +311,59 @@ describe("explorer resource menus", () => {
     expect(mocks.knowledgeDelete).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["G:/story-notes", "G:/story-notes/.png.md", ".png.md"],
+    ["G:\\story-notes\\", "g:/story-notes/人物/主角.md", "人物/主角.md"],
+    ["F:/worktrees/story", "F:/worktrees/story/docs/design.md", "docs/design.md"],
+    ["F:/Project", "docs/design.md", "docs/design.md"],
+  ])("deletes workspace documents relative to %s", async (root, path, relativePath) => {
+    mocks.confirm.mockResolvedValue(true);
+    mocks.fileAction.mockResolvedValueOnce(null);
+    const changed = vi.fn();
+    const target = { ...file, root, path };
+    const actions = mount(ExplorerResourceActions, { onChanged: changed });
+
+    await actions.instance.run("delete", target);
+
+    expect(mocks.fileAction).toHaveBeenCalledExactlyOnceWith(file.projectId, relativePath, null, workspaceRef);
+    expect(changed).toHaveBeenCalledWith(target, null);
+    expect(target.path).toBe(path);
+    expect(mocks.load).toHaveBeenCalledWith(file.projectId, true);
+    expect(mocks.knowledgeDelete).not.toHaveBeenCalled();
+    expect(mocks.notice).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { ...file, path: "G:/shared/design.md", mounted: true },
+    { ...file, mounted: true },
+    { ...file, workspaceRef: null },
+  ])("preserves absolute paths for project-authorized deletion: $path", async (target) => {
+    mocks.confirm.mockResolvedValue(true);
+    mocks.fileAction.mockResolvedValueOnce(null);
+    const actions = mount(ExplorerResourceActions);
+
+    await actions.instance.run("delete", target);
+
+    expect(mocks.fileAction).toHaveBeenCalledExactlyOnceWith(file.projectId, target.path, null, null);
+    expect(mocks.notice).not.toHaveBeenCalled();
+  });
+
   it("copies scoped paths and preserves external mount paths", async () => {
     const actions = mount(ExplorerResourceActions);
     await actions.instance.run("copy", knowledge);
     expect(mocks.copy).toHaveBeenCalledWith("design/combat/design.md");
     expect(resourceRelativePath(file)).toBe("docs/design.md");
     expect(resourceRelativePath({ ...file, path: "F:/Project-other/design.md" })).toBe("F:/Project-other/design.md");
+  });
+
+  it("requests workbench history without mounting a floating dialog", async () => {
+    const history = vi.fn();
+    const actions = mount(ExplorerResourceActions, { onHistory: history });
+    await actions.instance.run("history", file);
+    expect(history).toHaveBeenLastCalledWith({ projectId: file.projectId, path: "docs/design.md", workspaceRef });
+    await actions.instance.run("history", { ...file, mounted: true, path: "G:/Shared/note.md" });
+    expect(history).toHaveBeenLastCalledWith({ projectId: file.projectId, path: "G:/Shared/note.md", workspaceRef: null });
+    expect(window.document.querySelector("dialog")).toBeNull();
+    expect(mocks.fileAction).not.toHaveBeenCalled();
   });
 });

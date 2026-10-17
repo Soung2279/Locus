@@ -80,13 +80,20 @@ pub(super) type Candidates = (Vec<(String, Vec<u8>, core::EditOutput)>, BTreeMap
 pub(super) fn execute_candidates(root: &Path, request: &Value, candidates: Option<Candidates>) -> Result<Value, String> {
     let action = request["action"].as_str().unwrap_or("");
     if matches!(action, "read" | "discover") {
+        let started = std::time::Instant::now();
         let path = asset_path(root, request["path"].as_str().unwrap_or(""), false)?;
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        let hints = super::schema::ProjectSchema::load(root)?.scalar_hints(&bytes)?;
-        return serde_json::to_value(
+        let mut schema = super::schema::ProjectSchema::load(root)?;
+        let hints = schema.scalar_hints(&bytes)?;
+        let mut result = serde_json::to_value(
             core::inspect_with_hints(&bytes, &hints).map_err(|e| format!("assets.{}", e))?,
-        )
-        .map_err(|e| e.to_string());
+        ).map_err(|e| e.to_string())?;
+        if request["profile"] == true {
+            result["profile"] = json!({"totalMs":started.elapsed().as_secs_f64()*1000.0,
+                "indexSource":schema.index_source,"indexLoadMs":schema.index_load_ms,
+                "fullProjectScans":if schema.index_source == "scan" {1} else {0}});
+        }
+        return Ok(result);
     }
     let base = directory(root)?;
     let lock_path = io::safe_path(root, "Library/Locus/AssetApi/transaction.lock")?;
@@ -175,7 +182,17 @@ pub(super) fn execute_candidates(root: &Path, request: &Value, candidates: Optio
     let mut transaction_id = None;
     let preparing_editor = request["_prepare_editor"].as_bool() == Some(true);
     let mut editor_entries = Vec::new();
-    if apply {
+    let no_change = prepared.iter().all(|(_, before, output)| before == &output.bytes);
+    if apply && no_change && !preparing_editor {
+        // No bytes need journaling/replacement. Retain the same conflict and
+        // dependency admission checks (including pending recovery) as a write.
+        check_dependencies()?;
+        for (path, before, _) in &prepared {
+            if fs::read(asset_path(root, path, true)?).map_err(|e| e.to_string())? != *before {
+                return Err(format!("assets.stale_revision: {path}"));
+            }
+        }
+    } else if apply {
         let id = uuid::Uuid::new_v4().to_string();
         let dir = base.join(&id);
         fs::create_dir(&dir).map_err(|e| e.to_string())?;
@@ -337,34 +354,11 @@ fn validate_external_with_candidates(root:&Path,before:&[u8],after:&[u8],final_f
     if wanted.is_empty() {
         return Ok(());
     }
+    let mut schema = super::schema::ProjectSchema::load(root)?;
     let mut owners: BTreeMap<String, Vec<std::path::PathBuf>> = BTreeMap::new();
-    for scope in ["Assets", "Packages"] {
-        for entry in walkdir::WalkDir::new(root.join(scope))
-            .follow_links(false)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file()
-                || entry.path().extension().and_then(|e| e.to_str()) != Some("meta")
-            {
-                continue;
-            }
-            let Ok(text) = fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            if let Some(guid) = text
-                .lines()
-                .find_map(|l| l.strip_prefix("guid:").map(str::trim))
-            {
-                let guid = guid.to_ascii_lowercase();
-                if wanted.contains(&guid) {
-                    owners
-                        .entry(guid)
-                        .or_default()
-                        .push(entry.path().with_extension(""));
-                }
-            }
-        }
+    for guid in &wanted {
+        let paths = schema.resolve_guid_paths(guid)?;
+        if !paths.is_empty() { owners.insert(guid.clone(), paths); }
     }
     for guid in wanted {
         let candidates = owners.get(&guid).ok_or_else(|| {

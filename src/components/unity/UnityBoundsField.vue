@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, watch } from "vue";
+import InputUnit from "../ui/InputUnit.vue";
 import {
   buildUnityBoundsValue,
   unityBoundsKeysForType,
@@ -14,12 +15,14 @@ const props = withDefaults(defineProps<{
   readonly?: boolean;
   title?: string;
   ariaLabel?: string;
+  unit?: string;
 }>(), {
   propertyType: "Bounds",
   disabled: false,
   readonly: false,
   title: "",
   ariaLabel: "",
+  unit: "",
 });
 
 const emit = defineEmits<{
@@ -113,18 +116,22 @@ function rowLabel(row: string): string {
     <div v-for="row in rowKeys" :key="row" class="unity-bounds-row">
       <span class="unity-bounds-row-label">{{ rowLabel(row) }}</span>
       <label v-for="axis in AXES" :key="axis" class="unity-bounds-part">
-        <span>{{ axis }}</span>
+        <span class="unity-bounds-axis">{{ axis }}</span>
+        <InputUnit :unit="unit" :disabled="disabled" :readonly="readonly" v-slot="{ unitId }">
         <input
           type="text"
           inputmode="decimal"
           :value="parts[partKey(row, axis)]"
           :disabled="disabled"
           :readonly="readonly"
+          :aria-label="[ariaLabel, rowLabel(row), axis.toUpperCase()].filter(Boolean).join(' ')"
+          :aria-describedby="unitId"
           @input="updatePart(row, axis, $event)"
           @change="commitBounds"
           @keydown.enter.prevent="blurOnEnter"
           @keydown.esc.prevent="restorePartOnEscape(row, axis, $event)"
         />
+        </InputUnit>
       </label>
     </div>
   </div>
@@ -132,6 +139,7 @@ function rowLabel(row: string): string {
 
 <style scoped>
 .unity-bounds-field {
+  --input-unit-end-padding: 4px;
   width: 100%;
   min-width: 0;
   display: grid;
@@ -159,7 +167,7 @@ function rowLabel(row: string): string {
   gap: 4px;
 }
 
-.unity-bounds-part span {
+.unity-bounds-axis {
   color: var(--text-secondary);
   font-size: 11px;
   text-transform: uppercase;

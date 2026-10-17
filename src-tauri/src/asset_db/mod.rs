@@ -1,4 +1,5 @@
 mod db;
+pub(crate) mod authoring_index;
 pub(crate) mod meta_parser;
 pub(crate) mod object_index;
 mod scanner;

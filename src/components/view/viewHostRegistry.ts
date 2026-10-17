@@ -8,7 +8,7 @@ export interface NativeViewHost {
   active(): boolean;
   root(): HTMLElement | null;
   ready(): Promise<void>;
-  reload(): Promise<void>;
+  reload(options?: { force?: boolean }): Promise<void>;
   activate(): Promise<void>;
   execute(kind: string, payload: Record<string, unknown>): Promise<unknown>;
 }

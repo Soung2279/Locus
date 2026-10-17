@@ -172,6 +172,29 @@ fn semantic_batch_reassignment_changes_later_logical_write_addresses() {
 }
 
 #[test]
+fn semantic_list_duplicate_copies_authoritative_values_and_checks_bounds() {
+    let bytes = fixture();
+    let model = SemanticAsset::new(super::super::inspect(&bytes).unwrap()).unwrap();
+    let operation = model.lower_write("11400000", "values", &json!({"action":"duplicate","index":1})).unwrap();
+    let edited = super::super::edit(&bytes, &[operation]).unwrap();
+    let result = SemanticAsset::new(edited.snapshot).unwrap();
+    assert_eq!(result.resolve("11400000", "values", false).unwrap().value, Some(&json!([10,20,20])));
+    for index in [json!(-1), json!(2), json!(1.5)] {
+        assert!(model.lower_write("11400000", "values", &json!({"action":"duplicate","index":index})).is_err());
+    }
+}
+
+#[test]
+fn semantic_list_duplicate_does_not_accidentally_alias_managed_graphs() {
+    let text = String::from_utf8(fixture()).unwrap().replace("values: [10, 20]", "values: [{rid: 9007199254740993}]");
+    let model = SemanticAsset::new(super::super::inspect(text.as_bytes()).unwrap()).unwrap();
+    assert!(model.lower_write("11400000", "values", &json!({"action":"duplicate","index":0})).unwrap_err().contains("explicit_graph_required"));
+    let ordinary = text.replace("values: [{rid: 9007199254740993}]", "values: [{rid: 7, name: ordinary}]");
+    let model = SemanticAsset::new(super::super::inspect(ordinary.as_bytes()).unwrap()).unwrap();
+    assert!(model.lower_write("11400000", "values", &json!({"action":"duplicate","index":0})).is_ok());
+}
+
+#[test]
 fn semantic_batch_insert_then_child_write_uses_the_staged_array() {
     let model = SemanticAsset::new(super::super::inspect(&fixture()).unwrap()).unwrap();
     let operations = model

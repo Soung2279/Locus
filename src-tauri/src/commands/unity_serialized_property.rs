@@ -14,6 +14,18 @@ use crate::view::{
 use crate::workspace_service::{ProjectRegistry, WorkspaceRef};
 
 #[tauri::command]
+pub async fn unity_property_objects(
+    request: crate::unity_serialized_property::objects::Request,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<serde_json::Value, AppError> {
+    let ready = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(), &workspace_ref, "unity_property_objects",
+    ).await?;
+    crate::unity_serialized_property::objects::execute(&ready.root_text(), request).await.map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn unity_serialized_property_read(
     request: UnitySerializedPropertyReadRequest,
     workspace_ref: WorkspaceRef,
@@ -29,6 +41,18 @@ pub async fn unity_serialized_property_read(
     crate::unity_serialized_property::read(&working_dir, request)
         .await
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn unity_serialized_property_read_many(
+    request: crate::unity_serialized_property::UnitySerializedPropertyReadManyRequest,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<Vec<UnitySerializedPropertyReadResult>, AppError> {
+    let ready = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(), &workspace_ref, "unity_serialized_property_read_many",
+    ).await?;
+    crate::unity_serialized_property::read_many(&ready.root_text(), request).await.map_err(Into::into)
 }
 
 #[tauri::command]

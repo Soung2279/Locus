@@ -214,6 +214,35 @@ namespace Locus
                 delegate { return request.arrayOffset > 0 ? ReadPropertyTreeArrayPage(request, IsDynamicSchemaMode(request.schemaMode)) : ReadPropertyTree(request.bindingId, request.target, request.maxDepth, request.maxArrayItems, request.autoExpandCharLimit, request.hierarchyFields, IsDynamicSchemaMode(request.schemaMode)); });
         }
 
+        [Serializable]
+        private sealed class PropertyTreeReadManyRequest { public PropertyTreeReadRequest[] reads; }
+
+        private static string ReadPropertyTrees(PropertyTreeReadManyRequest request)
+        {
+            if (request?.reads == null || request.reads.Length == 0 || request.reads.Length > 32)
+                throw new Exception("Property read batch requires 1 to 32 requests.");
+            var results = new List<string>(request.reads.Length);
+            foreach (var read in request.reads)
+            {
+                try {
+                    ValidatePropertyTreeObjectTarget(read?.target);
+                    results.Add(read.arrayOffset > 0
+                        ? ReadPropertyTreeArrayPage(read, IsDynamicSchemaMode(read.schemaMode))
+                        : ReadPropertyTree(read.bindingId, read.target, read.maxDepth, read.maxArrayItems,
+                            read.autoExpandCharLimit, read.hierarchyFields, IsDynamicSchemaMode(read.schemaMode)));
+                } catch (Exception error) { results.Add(BuildBindingErrorJson(read?.bindingId, read?.target, error.Message)); }
+            }
+            return "{\"results\":[" + string.Join(",", results) + "]}";
+        }
+
+        private static async Task<PipeEnvelope> HandlePropertyTreeReadMany(string requestId, string message)
+        {
+            PropertyTreeReadManyRequest request;
+            try { request = JsonUtility.FromJson<PropertyTreeReadManyRequest>(message ?? "{}"); }
+            catch (Exception error) { return ErrorResponse(requestId, error.Message); }
+            return await RunPropertyTreeOnMainThread(requestId, "property_tree_read_many", () => ReadPropertyTrees(request));
+        }
+
         private static async Task<PipeEnvelope> HandlePropertyTreeWrite(string requestId, string message)
         {
             PropertyTreeWriteRequest request;
@@ -5470,7 +5499,33 @@ namespace Locus
             if (obj != null)
                 target = PropertyTreeTargetWithLocalFileIds(target, obj);
             ApplyPropertyTreeTargetToSnapshotTree(snapshot, ToSerializedPropertyBindingTarget(target));
-            return BuildBindingReadJson(bindingId, target, snapshot, saved);
+            string result = BuildBindingReadJson(bindingId, target, snapshot, saved);
+            // Most scalar edits can update the bound leaf directly. Types with
+            // OnValidate may mutate siblings; conditional presentation may depend
+            // on them too. Preserve conservative refresh for either, without
+            // forcing ordinary static property forms to reread.
+            if (saved && obj != null && (target.propertyPath == "m_Name" || PropertyTreeHasValidation(obj.GetType()) ||
+                PropertyTreeDynamicPresentationTypes.Contains(obj.GetType())))
+                result = result.Substring(0, result.Length - 1) + ",\"refreshObject\":true}";
+            return result;
+        }
+
+        private static readonly Dictionary<Type, bool> PropertyTreeValidationTypes = new Dictionary<Type, bool>();
+        private static bool PropertyTreeHasValidation(Type type)
+        {
+            bool result;
+            if (PropertyTreeValidationTypes.TryGetValue(type, out result)) return result;
+            var current = type;
+            while (current != null && current != typeof(UnityEngine.Object))
+            {
+                if (current.GetMethod("OnValidate", System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.DeclaredOnly, null, Type.EmptyTypes, null) != null)
+                { result = true; break; }
+                current = current.BaseType;
+            }
+            PropertyTreeValidationTypes[type] = result;
+            return result;
         }
 
         private static string BuildBindingReadJson(

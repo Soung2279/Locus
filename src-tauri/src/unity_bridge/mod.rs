@@ -4,6 +4,7 @@ pub(crate) mod dialog;
 mod editor_log;
 mod flavor;
 mod focus;
+pub(crate) mod hang_diagnosis;
 pub(crate) mod managed_editor;
 mod native_selftest;
 mod plugin;
@@ -44,6 +45,7 @@ pub use plugin::{
 };
 pub(crate) use process::UnityProcessIdentityLiveness;
 pub(crate) use process::query_current_project_editor_process_uncached;
+pub(crate) use process::force_close_editor_identity;
 pub use process::{
     close_current_project_unity_processes, force_close_current_project_unity_processes,
     query_current_project_editor_process, UnityEditorProcessInfo, UnityEditorProcessState,
@@ -144,6 +146,8 @@ pub fn stop_unity_semantic_state_observers() {
 /// Fuse pipe + process + native signals into one semantic editor state.
 pub async fn unity_semantic_state(project_path: &str) -> SemanticState {
     let mut state = state_probe::semantic_state_for_project(project_path).await;
+    // The cached observer state may predate the capture finishing.
+    hang_diagnosis::attach(project_path, &mut state);
     // A native Unity dialog can keep the status/ping channel responsive while
     // the managed editor main thread is unavailable for normal API work. Fold
     // that independent window signal into the semantic surface so callers do
@@ -357,6 +361,16 @@ pub struct NativeBrokerStatus {
     pub editor_status: String,
     #[serde(default)]
     pub last_managed_heartbeat_ms: i64,
+    #[serde(default)]
+    pub main_thread_heartbeat_age_ms: Option<u64>,
+    #[serde(default)]
+    pub main_thread_heartbeat_seq: u64,
+    #[serde(default)]
+    pub main_thread_id: Option<u32>,
+    #[serde(default)]
+    pub process_id: Option<u32>,
+    #[serde(default)]
+    pub active_executions: u32,
     #[serde(default)]
     pub pending_requests: u32,
     #[serde(default)]
@@ -2758,6 +2772,15 @@ pub async fn asset_preview_render(
         .map_err(|e| format!("Failed to parse asset_preview_render response: {}", e))
 }
 
+/// Small lifecycle messages only. Frames and input use the GPU transport and
+/// never acquire the project-wide compilation/execution operation lock.
+pub(crate) async fn render_output_control(project_path: &str, operation: &str, id: &str) -> Result<serde_json::Value, String> {
+    let payload = serde_json::json!({"operation": operation, "id": id}).to_string();
+    let response = send_message(project_path, "render_output", &payload).await?;
+    if !response.ok { return Err(response.error.unwrap_or_else(|| "GPU output request failed".into())); }
+    serde_json::from_str(&response.message.ok_or("Missing GPU output response")?).map_err(|e| e.to_string())
+}
+
 pub async fn select_scene_object(
     project_path: &str,
     scene_path: &str,
@@ -3711,6 +3734,33 @@ pub async fn property_tree_read(
     .await
 }
 
+pub async fn property_objects(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    if request["action"] == "read" {
+        return send_property_tree_message(project_path, "property_objects", request).await;
+    }
+    let lock = project_unity_op_lock(project_path).await;
+    let _guard = lock.lock().await;
+    let mut payload = request.clone();
+    exact_property_tree_ids(&mut payload)?;
+    let payload = serde_json::to_string(&payload).map_err(|e|e.to_string())?;
+    // A reload after apply can lose the acknowledgement. Do not replay writes,
+    // even when the native broker reports a transient managed-executor state.
+    let response = send_message_with_timeout(project_path, "property_objects", &payload, Duration::from_secs(120)).await
+        .map_err(|e|format!("property.outcome_unknown: {e}; read before retrying"))?;
+    if response.ok { Ok(response.message.unwrap_or_default()) }
+    else { Err(response.error.unwrap_or_else(|| "property object write failed".into())) }
+}
+
+pub async fn property_tree_read_many(
+    project_path: &str,
+    request: &serde_json::Value,
+) -> Result<String, String> {
+    send_property_tree_message(project_path, "property_tree_read_many", request).await
+}
+
 pub async fn view_binding_discover(
     project_path: &str,
     request: &serde_json::Value,
@@ -3797,6 +3847,21 @@ async fn send_property_tree_message_with_legacy_alias(
     }
 }
 
+fn exact_property_tree_ids(value:&mut serde_json::Value)->Result<(),String> {
+    match value {
+        serde_json::Value::Object(map)=>{
+            for (key,value) in map {
+                if matches!(key.as_str(),"objectFileId"|"targetFileId"|"managedReferenceId") {
+                    if let Some(id)=value.as_str() {*value=serde_json::json!(id.parse::<i64>().map_err(|_|"Invalid exact Unity identifier")?);}
+                } else {exact_property_tree_ids(value)?;}
+            }
+        },
+        serde_json::Value::Array(items)=>{for value in items {exact_property_tree_ids(value)?;}},
+        _=>{},
+    }
+    Ok(())
+}
+
 async fn send_property_tree_message(
     project_path: &str,
     message_type: &str,
@@ -3805,21 +3870,7 @@ async fn send_property_tree_message(
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
     let mut internal_request=request.clone();
-    fn exact_internal_ids(value:&mut serde_json::Value)->Result<(),String> {
-        match value {
-            serde_json::Value::Object(map)=>{
-                for (key,value) in map {
-                    if matches!(key.as_str(),"objectFileId"|"targetFileId"|"managedReferenceId") {
-                        if let Some(id)=value.as_str() {*value=serde_json::json!(id.parse::<i64>().map_err(|_|"Invalid exact Unity identifier")?);}
-                    } else {exact_internal_ids(value)?;}
-                }
-            },
-            serde_json::Value::Array(items)=>{for value in items {exact_internal_ids(value)?;}},
-            _=>{},
-        }
-        Ok(())
-    }
-    exact_internal_ids(&mut internal_request)?;
+    exact_property_tree_ids(&mut internal_request)?;
     let payload = serde_json::to_string(&internal_request)
         .map_err(|error| format!("Failed to serialize {} request: {}", message_type, error))?;
     let resp =
@@ -4223,6 +4274,82 @@ async fn unity_test_abort_error(
     }
 }
 
+/// Forwards Unity Test progress steps, skipping repeats of the previous step so
+/// the 250ms status poll only produces events when the run actually advances.
+struct UnityTestProgress {
+    report: Option<crate::tool::ToolProgressReporter>,
+    last: Option<crate::tool::ToolProgressUpdate>,
+}
+
+impl UnityTestProgress {
+    fn new(report: Option<crate::tool::ToolProgressReporter>) -> Self {
+        Self { report, last: None }
+    }
+
+    fn stage(&mut self, title: &str, info: impl Into<String>) {
+        self.send(crate::tool::ToolProgressUpdate {
+            title: title.to_string(),
+            info: info.into(),
+            progress: None,
+        });
+    }
+
+    fn snapshot(&mut self, snapshot: &UnityTestRunSnapshot) {
+        self.send(unity_test_progress_update(snapshot));
+    }
+
+    fn send(&mut self, update: crate::tool::ToolProgressUpdate) {
+        let Some(report) = self.report.as_ref() else {
+            return;
+        };
+        if self.last.as_ref() == Some(&update) {
+            return;
+        }
+        report(update.clone());
+        self.last = Some(update);
+    }
+}
+
+/// `Namespace.Fixture.Method(args)` -> `Fixture.Method(args)`; dots inside the
+/// argument list belong to parameter values, not to the type path.
+fn unity_test_short_name(full_name: &str) -> &str {
+    let full_name = full_name.trim();
+    let path_end = full_name.find('(').unwrap_or(full_name.len());
+    let path = &full_name[..path_end];
+    let start = path
+        .rfind('.')
+        .and_then(|method_dot| path[..method_dot].rfind('.'))
+        .map_or(0, |fixture_dot| fixture_dot + 1);
+    &full_name[start..]
+}
+
+fn unity_test_progress_update(snapshot: &UnityTestRunSnapshot) -> crate::tool::ToolProgressUpdate {
+    let title = match snapshot.status.as_str() {
+        "starting" => "Starting Unity tests",
+        "cancelling" => "Cancelling Unity tests",
+        _ => "Running Unity tests",
+    };
+    let completed = snapshot.passed + snapshot.failed + snapshot.skipped + snapshot.inconclusive;
+    let mut parts = Vec::new();
+    if snapshot.total > 0 {
+        parts.push(format!("{}/{}", completed.min(snapshot.total), snapshot.total));
+    }
+    if snapshot.failed > 0 {
+        parts.push(format!("{} failed", snapshot.failed));
+    }
+    let current = unity_test_short_name(&snapshot.current_test);
+    if !current.is_empty() {
+        parts.push(current.to_string());
+    }
+    let progress = (snapshot.total > 0 && snapshot.status != "starting")
+        .then(|| (completed as f32 / snapshot.total as f32).clamp(0.0, 1.0));
+    crate::tool::ToolProgressUpdate {
+        title: title.to_string(),
+        info: parts.join(" · "),
+        progress,
+    }
+}
+
 async fn wait_for_unity_test_poll_wake(
     dialog_events: &mut tokio::sync::watch::Receiver<u64>,
     cancel_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
@@ -4265,9 +4392,10 @@ pub async fn unity_test_run_controlled(
     request: &serde_json::Value,
     timeout: Option<Duration>,
     mut cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
-    progress: Option<crate::async_tasks::TaskProgressReporter>,
+    progress: Option<crate::tool::ToolProgressReporter>,
 ) -> Result<UnityTestRunSnapshot, String> {
     let started = Instant::now();
+    let mut progress = UnityTestProgress::new(progress);
     require_unity_test_tools_available(project_path)?;
     if cancel_rx
         .as_ref()
@@ -4276,6 +4404,7 @@ pub async fn unity_test_run_controlled(
         return Err("Unity Test run cancelled before start".to_string());
     }
 
+    progress.stage("Waiting for Unity Editor", "");
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = tokio::select! {
         biased;
@@ -4302,8 +4431,16 @@ pub async fn unity_test_run_controlled(
 
     // Recheck the source/state after queueing, before changing Play Mode or
     // starting a run; an earlier check can become stale while another tool runs.
+    progress.stage("Preparing Unity tests", "Checking Editor state");
     require_unity_test_sources_converged(project_path).await?;
     ensure_unity_test_start_status(project_path).await?;
+    progress.stage(
+        "Starting Unity tests",
+        request
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    );
     let requested_run_id = uuid::Uuid::new_v4().simple().to_string();
     let start_request = unity_test_start_request(request, &requested_run_id)?;
     let payload = serde_json::to_string(&start_request)
@@ -4383,24 +4520,13 @@ pub async fn unity_test_run_controlled(
             .as_ref()
             .is_some_and(|receiver| *receiver.borrow())
         {
+            progress.stage("Cancelling Unity tests", "");
             return match cancel_unity_test_run(project_path, &snapshot).await {
                 Ok(report) => Err(report),
                 Err(error) => Err(format!("Unity Test cancellation {error}")),
             };
         }
-        if let Some(report) = progress.as_ref() {
-            report(format!(
-                "Unity tests: status={}, completed={}/{}, current={}",
-                snapshot.status,
-                snapshot.passed + snapshot.failed + snapshot.skipped + snapshot.inconclusive,
-                snapshot.total,
-                if snapshot.current_test.is_empty() {
-                    "waiting"
-                } else {
-                    snapshot.current_test.as_str()
-                }
-            ));
-        }
+        progress.snapshot(&snapshot);
         if dialog_events.has_changed().unwrap_or(false) {
             let _ = dialog_events.borrow_and_update();
             if dialog::current_dialog(project_path).is_some() {
@@ -4439,6 +4565,7 @@ pub async fn unity_test_run_controlled(
                 }
             }
             UnityTestPollWake::Cancelled => {
+                progress.stage("Cancelling Unity tests", "");
                 return match cancel_unity_test_run(project_path, &snapshot).await {
                     Ok(report) => Err(report),
                     Err(error) => Err(format!("Unity Test cancellation {error}")),
@@ -5613,6 +5740,9 @@ where
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            if error.contains("native_main_thread_unresponsive") {
+                                break Err(format!("native_main_thread_unresponsive; execution_id={execution_id}; request_state=detached; execution has not been confirmed stopped"));
+                            }
                             last_progress_poll_error = Some(error);
                             if saw_unity_progress {
                                 let unavailable_since = progress_unavailable_since
@@ -5674,6 +5804,12 @@ where
         };
 
         match attempt_result {
+            // The user restarted the hung Editor: the execution is gone with
+            // it, so never reattach to the replacement process.
+            Err(error) if hang_diagnosis::is_user_restart_interrupt(&error) => return Err(error),
+            Err(error) if error.contains("native_main_thread_unresponsive") => {
+                return Err(hang_diagnosis::append_to_unresponsive_error(project_path, error).await)
+            }
             Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
                 let request_state = if broker_accepted || saw_unity_progress {
                     "detached"
@@ -5784,10 +5920,11 @@ where
     if resp.ok {
         Ok(resp.message.unwrap_or_default())
     } else {
-        Err(crate::unity_type_index::append_auto_using_notes(
-            resp.error.unwrap_or_else(|| "unknown error".to_string()),
-            &prepared,
-        ))
+        let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
+        if error.contains("native_main_thread_unresponsive") {
+            return Err(hang_diagnosis::append_to_unresponsive_error(project_path, error).await);
+        }
+        Err(crate::unity_type_index::append_auto_using_notes(error, &prepared))
     }
 }
 
@@ -6059,6 +6196,9 @@ where
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            if error.contains("native_main_thread_unresponsive") {
+                                break Err(format!("native_main_thread_unresponsive; execution_id={execution_id}; request_state=detached; execution has not been confirmed stopped"));
+                            }
                             last_progress_poll_error = Some(error);
                             if saw_unity_progress {
                                 let unavailable_since = progress_unavailable_since
@@ -6120,6 +6260,12 @@ where
         };
 
         match attempt_result {
+            // The user restarted the hung Editor: the execution is gone with
+            // it, so never reattach to the replacement process.
+            Err(error) if hang_diagnosis::is_user_restart_interrupt(&error) => return Err(error),
+            Err(error) if error.contains("native_main_thread_unresponsive") => {
+                return Err(hang_diagnosis::append_to_unresponsive_error(project_path, error).await)
+            }
             Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
                 let request_state = if broker_accepted || saw_unity_progress {
                     "detached"
@@ -6277,10 +6423,11 @@ where
     if resp.ok {
         Ok(resp.message.unwrap_or_default())
     } else {
-        Err(crate::unity_type_index::append_auto_using_notes(
-            resp.error.unwrap_or_else(|| "unknown error".to_string()),
-            &prepared,
-        ))
+        let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
+        if error.contains("native_main_thread_unresponsive") {
+            return Err(hang_diagnosis::append_to_unresponsive_error(project_path, error).await);
+        }
+        Err(crate::unity_type_index::append_auto_using_notes(error, &prepared))
     }
 }
 
@@ -7536,8 +7683,10 @@ mod tests {
         parse_unity_status_message, pipe_response_transient_broker_error, play_mode_target_status,
         read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
         rewrite_run_states_output_for_size, unity_test_cancel_dispatch_response,
-        unity_test_cancel_snapshot, unity_test_run_is_terminal, unity_test_start_request,
-        wait_for_unity_test_poll_wake, PipeResponse, RecompilePollState, RecompileStartAck,
+        unity_test_cancel_snapshot, unity_test_progress_update, unity_test_run_is_terminal,
+        unity_test_short_name, unity_test_start_request, wait_for_unity_test_poll_wake,
+        PipeResponse, RecompilePollState, RecompileStartAck, UnityTestProgress,
+        UnityTestRunSnapshot,
         RecompileStartDiagnostics, UnityBackgroundHookState, UnityBackgroundHookStatus,
         UnityConnectionStatus, UnityEditorProcessState, UnityLaunchMode, UnityTestPollWake,
         RECOMPILE_START_STATE_HISTORY_LIMIT, UNITY_EDITOR_STATUS_EDITING,
@@ -8073,6 +8222,87 @@ mod tests {
         }
         assert!(!unity_test_run_is_terminal("running"));
         assert!(!unity_test_run_is_terminal("cancelling"));
+    }
+
+    #[test]
+    fn unity_test_short_name_keeps_fixture_and_parameter_dots() {
+        assert_eq!(
+            unity_test_short_name("Game.Tests.PlayerTests.Moves"),
+            "PlayerTests.Moves"
+        );
+        assert_eq!(
+            unity_test_short_name("Game.Tests.MathTests.Scale(1.5f,\"a.b\")"),
+            "MathTests.Scale(1.5f,\"a.b\")"
+        );
+        assert_eq!(unity_test_short_name("Fixture.Case"), "Fixture.Case");
+        assert_eq!(unity_test_short_name("Case"), "Case");
+        assert_eq!(unity_test_short_name(""), "");
+    }
+
+    #[test]
+    fn unity_test_progress_reports_completed_ratio_failures_and_current_test() {
+        let snapshot = UnityTestRunSnapshot {
+            status: "running".to_string(),
+            current_test: "Game.Tests.PlayerTests.Jumps".to_string(),
+            total: 8,
+            passed: 2,
+            failed: 1,
+            skipped: 1,
+            ..Default::default()
+        };
+        let update = unity_test_progress_update(&snapshot);
+        assert_eq!(update.title, "Running Unity tests");
+        assert_eq!(update.info, "4/8 · 1 failed · PlayerTests.Jumps");
+        assert_eq!(update.progress, Some(0.5));
+
+        let starting = unity_test_progress_update(&UnityTestRunSnapshot {
+            status: "starting".to_string(),
+            total: 8,
+            ..Default::default()
+        });
+        assert_eq!(starting.title, "Starting Unity tests");
+        assert_eq!(starting.progress, None);
+
+        let undiscovered = unity_test_progress_update(&UnityTestRunSnapshot {
+            status: "running".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(undiscovered.info, "");
+        assert_eq!(undiscovered.progress, None);
+    }
+
+    #[test]
+    fn unity_test_progress_skips_repeated_poll_snapshots() {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        let mut progress = UnityTestProgress::new(Some(std::sync::Arc::new(move |update| {
+            sink.lock().unwrap().push(update);
+        })));
+        let mut snapshot = UnityTestRunSnapshot {
+            status: "running".to_string(),
+            total: 2,
+            ..Default::default()
+        };
+        progress.snapshot(&snapshot);
+        progress.snapshot(&snapshot);
+        snapshot.passed = 1;
+        progress.snapshot(&snapshot);
+        progress.stage("Cancelling Unity tests", "");
+        progress.stage("Cancelling Unity tests", "");
+
+        let sent = sent.lock().unwrap();
+        let infos = sent
+            .iter()
+            .map(|update| (update.title.as_str(), update.info.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            infos,
+            vec![
+                ("Running Unity tests", "0/2"),
+                ("Running Unity tests", "1/2"),
+                ("Cancelling Unity tests", ""),
+            ]
+        );
     }
 
     #[tokio::test]

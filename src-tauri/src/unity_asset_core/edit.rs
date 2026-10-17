@@ -207,7 +207,8 @@ pub fn inspect(bytes: &[u8]) -> Result<AssetSnapshot, CoreError> {
 }
 
 pub fn inspect_with_hints(bytes: &[u8], hints: &ScalarHints) -> Result<AssetSnapshot, CoreError> {
-    snapshot(&parse(bytes)?, hints)
+    let asset = super::parse_shared(bytes)?;
+    snapshot(asset.as_ref(), hints)
 }
 
 fn snapshot(asset: &Asset, hints: &ScalarHints) -> Result<AssetSnapshot, CoreError> {

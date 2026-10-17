@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import { getCurrentWindow, type Window as TauriWindow } from "@tauri-apps/api/window";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 import type {
   AssetRefAttachment,
@@ -92,6 +93,16 @@ export function launchUnityProject(workspaceRef: WorkspaceRef): Promise<UnityLau
 
 export function closeHeadlessUnityProject(workspaceRef: WorkspaceRef): Promise<void> {
   return ipcInvoke<void>("close_headless_unity_project", { workspaceRef });
+}
+
+export function restartUnresponsiveUnityProject(
+  workspaceRef: WorkspaceRef,
+  expectedProcessId: number,
+  expectedCreatedAtMs: number,
+): Promise<void> {
+  return ipcInvoke<void>("restart_unresponsive_unity_project", {
+    workspaceRef, expectedProcessId, expectedCreatedAtMs,
+  }, { operation: "restartUnresponsiveUnityProject", notify: false, throwOnError: true });
 }
 
 export interface WorkspaceUnityStatusHandlers {
@@ -469,6 +480,9 @@ export function stopLocusDragPreview(): Promise<void> {
 export interface UnityEmbedAssetDropPayload {
   refs: AssetRefAttachment[];
   workspaceRef?: WorkspaceRef;
+  /** Drop position in the receiving document's CSS pixels. */
+  x?: number;
+  y?: number;
 }
 
 export interface UnityEmbedTextDropEntry {
@@ -569,10 +583,11 @@ export function subscribeUnitySendToLocus(
 
 export function subscribeUnityEmbedAssetDrop(
   handler: (payload: UnityEmbedAssetDropPayload) => void,
+  owner?: Pick<TauriWindow, "listen">,
 ): Promise<() => void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(() => {});
-  return runtime.subscribe<UnityEmbedAssetDropPayload>("unity-embed-asset-drop", handler);
+  return (owner ?? getCurrentWindow()).listen<UnityEmbedAssetDropPayload>("unity-embed-asset-drop", event => handler(event.payload));
 }
 
 export function subscribeUnityEmbedTextDrop(
@@ -591,26 +606,29 @@ export function getUnityConsoleText(
 
 export function subscribeLocusFileDrop(
   handler: (payload: LocusFileDropPayload) => void,
+  owner?: Pick<TauriWindow, "listen">,
 ): Promise<() => void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(() => {});
-  return runtime.subscribe<LocusFileDropPayload>("locus-file-drop", handler);
+  return (owner ?? getCurrentWindow()).listen<LocusFileDropPayload>("locus-file-drop", event => handler(event.payload));
 }
 
 export function subscribeLocusFileDragState(
   handler: (payload: LocusFileDragStatePayload) => void,
+  owner?: Pick<TauriWindow, "listen">,
 ): Promise<() => void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(() => {});
-  return runtime.subscribe<LocusFileDragStatePayload>("locus-file-drag-state", handler);
+  return (owner ?? getCurrentWindow()).listen<LocusFileDragStatePayload>("locus-file-drag-state", event => handler(event.payload));
 }
 
 export function subscribeUnityEmbedAssetDragState(
   handler: (payload: UnityEmbedAssetDragStatePayload) => void,
+  owner?: Pick<TauriWindow, "listen">,
 ): Promise<() => void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(() => {});
-  return runtime.subscribe<UnityEmbedAssetDragStatePayload>("unity-embed-asset-drag-state", handler);
+  return (owner ?? getCurrentWindow()).listen<UnityEmbedAssetDragStatePayload>("unity-embed-asset-drag-state", event => handler(event.payload));
 }
 
 export interface UnityEmbedFocusDebugSnapshot {

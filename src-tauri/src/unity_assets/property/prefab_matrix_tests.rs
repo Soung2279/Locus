@@ -150,7 +150,7 @@ fn launch(editor: &str, root: &Path, method: &str) -> bool {
 async fn complex_prefab_unity_roundtrip() {
     let editor =
         std::env::var("LOCUS_PROPERTY_UNITY_EDITOR").expect("set LOCUS_PROPERTY_UNITY_EDITOR");
-    let root = std::path::PathBuf::from("E:/LocusTemp")
+    let root = crate::runtime_paths::isolated_test_root()
         .join(format!("property-prefab-{}", uuid::Uuid::new_v4().simple()));
     for dir in ["Assets/Editor", "Packages", "ProjectSettings"] {
         fs::create_dir_all(root.join(dir)).unwrap();

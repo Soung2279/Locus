@@ -361,9 +361,9 @@ describe("unityObjectReferencePicker", () => {
     expect(field).toContain("unity-object-reference-display-name");
     expect(field).not.toContain("unity-object-reference-display-path");
     expect(field).toContain("ref=\"searchInputEl\"");
-    expect(field).toContain("<Teleport to=\"body\">");
+    expect(field).toContain("<Teleport v-if=\"dropdownTarget\" :to=\"dropdownTarget\">");
     expect(field).toContain("ref=\"dropdownEl\"");
-    expect(field).toContain("document.addEventListener(\"scroll\", scheduleDropdownPositionUpdate, true)");
+    expect(field).toContain("ownerDocument.addEventListener(\"scroll\", scheduleDropdownPositionUpdate, true)");
     expect(field).toContain("@input=\"updateSearchText\"");
     expect(field).toContain("position: fixed;");
     expect(field).toContain("z-index: 1000;");

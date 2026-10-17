@@ -78,7 +78,7 @@ namespace Locus
 
         private static string WithPropertyBeforeSnapshot(string response, SerializedPropertySnapshot before)
         {
-            return response.Substring(0, response.Length - 1) + ",\"beforeSnapshot\":" + SerializedPropertySnapshotToJson(before) + "}";
+            return response.Substring(0, response.Length - 1) + ",\"applied\":true,\"persisted\":false,\"beforeSnapshot\":" + SerializedPropertySnapshotToJson(before) + "}";
         }
 
         private static UnityEngine.Object ResolvePropertyReferenceValue(SerializedProperty prop, string json)

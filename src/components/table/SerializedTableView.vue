@@ -487,6 +487,7 @@ onBeforeUnmount(() => {
                 :model-value="cell.value"
                 :property-type="cell.valueType || cell.type"
                 :display-value="cell.displayValue"
+                :unit="cell.unit"
                 :editable="cell.editable"
                 :disabled="!!savingCellKey"
                 :enum-options="cell.enumOptions"

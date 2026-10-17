@@ -40,8 +40,8 @@ static PARSED: LazyLock<Mutex<HashMap<String, Vec<Declaration>>>> =
 /// Load once per transaction and reuse across its assets. Source bytes are
 /// captured lazily and remain immutable for this instance's validation run.
 pub struct ProjectSchema {
-    guid_paths: BTreeMap<String, Vec<PathBuf>>,
-    source_names: BTreeMap<String, Vec<PathBuf>>,
+    guid_paths: Arc<BTreeMap<String, Vec<PathBuf>>>,
+    source_names: Arc<BTreeMap<String, Vec<PathBuf>>>,
     loaded: BTreeSet<PathBuf>,
     declarations: BTreeMap<String, Vec<Declaration>>,
     frozen: Option<BTreeMap<PathBuf, Vec<u8>>>,
@@ -51,6 +51,10 @@ pub struct ProjectSchema {
     // Preserve the metadata bytes used to resolve GUID -> source. Reading them
     // again after indexing could otherwise certify a different script identity.
     indexed_source_metas: BTreeMap<PathBuf, Vec<u8>>,
+    indexed_meta_guids: Arc<BTreeMap<PathBuf, String>>,
+    index_error: Option<String>,
+    pub index_source: &'static str,
+    pub index_load_ms: f64,
 }
 
 impl ProjectSchema {
@@ -92,8 +96,18 @@ impl ProjectSchema {
             })
             .collect()
     }
-    pub fn indexed_meta(&self, root: &Path, relative: &str) -> Option<&[u8]> {
+    pub fn resolve_guid_paths(&mut self, guid: &str) -> Result<Vec<PathBuf>, String> {
+        let paths = self.guid_paths.get(&guid.to_ascii_lowercase()).cloned().unwrap_or_default();
+        for path in &paths {
+            self.ensure_meta(&PathBuf::from(format!("{}.meta", path.display())));
+        }
+        self.check_index()?;
+        Ok(paths)
+    }
+
+    pub fn indexed_meta(&mut self, root: &Path, relative: &str) -> Option<&[u8]> {
         let path = root.join(format!("{relative}.meta"));
+        self.ensure_meta(&path);
         self.indexed_source_metas
             .get(&path)
             .or_else(|| {
@@ -113,7 +127,7 @@ impl ProjectSchema {
             .map(Vec::as_slice)
     }
     pub fn validate_created_objects(&mut self, bytes: &[u8], ids: &[String]) -> Result<(), String> {
-        let asset = core::parse(bytes).map_err(|e| e.to_string())?;
+        let asset = core::parse_shared(bytes).map_err(|e| e.to_string())?;
         let model =
             core::semantic::SemanticAsset::new(core::inspect(bytes).map_err(|e| e.to_string())?)?;
         native::validate_templates(&model, ids)?;
@@ -194,7 +208,7 @@ impl ProjectSchema {
         for path in sources {
             self.load_source(&path);
         }
-        let asset = core::parse(bytes).map_err(|e| e.to_string())?;
+        let asset = core::parse_shared(bytes).map_err(|e| e.to_string())?;
         let model =
             core::semantic::SemanticAsset::new(core::inspect(bytes).map_err(|e| e.to_string())?)?;
         let resolved = model.resolve(host, slot, false)?;
@@ -283,10 +297,13 @@ impl ProjectSchema {
         }
         Ok(())
     }
-    pub fn load(root: &Path) -> Result<Self, String> {
+    pub fn load(root: &Path) -> Result<Self, String> { Self::load_indexed(root, true) }
+
+    pub(super) fn load_indexed(root: &Path, use_database: bool) -> Result<Self, String> {
+        let started = std::time::Instant::now();
         let mut schema = Self {
-            guid_paths: BTreeMap::new(),
-            source_names: BTreeMap::new(),
+            guid_paths: Arc::default(),
+            source_names: Arc::default(),
             loaded: BTreeSet::new(),
             declarations: BTreeMap::new(),
             frozen: None,
@@ -294,7 +311,22 @@ impl ProjectSchema {
             indexed_sources: BTreeMap::new(),
             script_types: HashMap::new(),
             indexed_source_metas: BTreeMap::new(),
+            indexed_meta_guids: Arc::default(),
+            index_error: None,
+            index_source: "scan",
+            index_load_ms: 0.0,
         };
+        // Reuse the checkout's asset database. Current source bytes and every
+        // consumed meta are still read/verified; database metadata is not proof
+        // that a script or a dependency is unchanged.
+        if let Some(index) = use_database.then(|| crate::asset_db::authoring_index::read(root).ok().flatten()).flatten() {
+            schema.guid_paths = index.guids;
+            schema.source_names = index.scripts;
+            schema.indexed_meta_guids = index.meta_guids;
+            schema.index_source = "asset_database";
+            schema.index_load_ms = started.elapsed().as_secs_f64() * 1000.0;
+            return Ok(schema);
+        }
         for folder in ["Assets", "Packages"] {
             for entry in walkdir::WalkDir::new(root.join(folder))
                 .follow_links(false)
@@ -307,8 +339,7 @@ impl ProjectSchema {
                 let path = entry.path();
                 if path.extension().and_then(|v| v.to_str()) == Some("cs") {
                     if let Some(name) = path.file_stem().and_then(|v| v.to_str()) {
-                        schema
-                            .source_names
+                        Arc::make_mut(&mut schema.source_names)
                             .entry(name.into())
                             .or_default()
                             .push(path.to_path_buf());
@@ -327,8 +358,7 @@ impl ProjectSchema {
                             guid.len() == 32 && guid.bytes().all(|byte| byte.is_ascii_hexdigit())
                         })
                     {
-                        schema
-                            .guid_paths
+                        Arc::make_mut(&mut schema.guid_paths)
                             .entry(guid.to_ascii_lowercase())
                             .or_default()
                             .push(path.with_extension(""));
@@ -336,6 +366,7 @@ impl ProjectSchema {
                 }
             }
         }
+        schema.index_load_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(schema)
     }
 
@@ -347,8 +378,8 @@ impl ProjectSchema {
             .map(|(path, bytes)| (PathBuf::from(path), bytes))
             .collect();
         let mut schema = Self {
-            guid_paths: BTreeMap::new(),
-            source_names: BTreeMap::new(),
+            guid_paths: Arc::default(),
+            source_names: Arc::default(),
             loaded: BTreeSet::new(),
             declarations: BTreeMap::new(),
             frozen: None,
@@ -356,12 +387,15 @@ impl ProjectSchema {
             indexed_sources: BTreeMap::new(),
             script_types: HashMap::new(),
             indexed_source_metas: BTreeMap::new(),
+            indexed_meta_guids: Arc::default(),
+            index_error: None,
+            index_source: "frozen",
+            index_load_ms: 0.0,
         };
         for (path, bytes) in &frozen {
             if path.extension().and_then(|extension| extension.to_str()) == Some("cs") {
                 if let Some(name) = path.file_stem().and_then(|name| name.to_str()) {
-                    schema
-                        .source_names
+                    Arc::make_mut(&mut schema.source_names)
                         .entry(name.into())
                         .or_default()
                         .push(path.clone());
@@ -375,8 +409,7 @@ impl ProjectSchema {
                             guid.len() == 32 && guid.bytes().all(|byte| byte.is_ascii_hexdigit())
                         })
                     {
-                        schema
-                            .guid_paths
+                        Arc::make_mut(&mut schema.guid_paths)
                             .entry(guid.to_ascii_lowercase())
                             .or_default()
                             .push(path.with_extension(""));
@@ -386,6 +419,25 @@ impl ProjectSchema {
         }
         schema.frozen = Some(frozen);
         schema
+    }
+
+    pub fn check_index(&self) -> Result<(), String> {
+        self.index_error.as_ref().map_or(Ok(()), |error| Err(error.clone()))
+    }
+
+    fn ensure_meta(&mut self, meta: &Path) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.indexed_source_metas.get(meta) { return Some(bytes.clone()); }
+        let bytes = self.source_bytes(meta);
+        if let Some(expected) = self.indexed_meta_guids.get(meta) {
+            let actual = bytes.as_deref().and_then(crate::asset_db::meta_parser::extract_guid)
+                .map(|guid| guid.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            if actual.as_ref() != Some(expected) {
+                self.index_error = Some(format!("property.stale_asset_index: {} changed; refresh the asset database", meta.display()));
+                return None;
+            }
+        }
+        if let Some(bytes) = &bytes { self.indexed_source_metas.insert(meta.to_path_buf(), bytes.clone()); }
+        bytes
     }
 
     fn source_bytes(&self, path: &Path) -> Option<Vec<u8>> {
@@ -447,12 +499,7 @@ impl ProjectSchema {
             self.captured.insert(path.clone(), bytes.clone());
         }
         let meta = PathBuf::from(format!("{}.meta", path.display()));
-        if let Some(bytes) = self
-            .indexed_source_metas
-            .get(&meta)
-            .cloned()
-            .or_else(|| self.source_bytes(&meta))
-        {
+        if let Some(bytes) = self.ensure_meta(&meta) {
             self.captured.insert(meta, bytes);
         }
         declaration
@@ -468,6 +515,8 @@ impl ProjectSchema {
             return None;
         }
         let path = paths[0].clone();
+        self.ensure_meta(&PathBuf::from(format!("{}.meta", path.display())))?;
+        if self.index_error.is_some() { return None; }
         self.load_source(&path);
         let name = path.file_stem()?.to_str()?;
         let matches: Vec<_> = self
@@ -672,7 +721,7 @@ impl ProjectSchema {
         bytes: &[u8],
         operations: &[AssetOperation],
     ) -> Result<Vec<Diagnostic>, String> {
-        let asset = core::parse(bytes).map_err(|error| format!("assets.{error}"))?;
+        let asset = core::parse_shared(bytes).map_err(|error| format!("assets.{error}"))?;
         let mut diagnostics = Vec::new();
         for (index, operation) in operations.iter().enumerate() {
             let Some(mut ty) = self.type_at(&asset, operation) else {
@@ -723,13 +772,14 @@ impl ProjectSchema {
                     .map_err(|message| mismatch(index, operation, &message))?;
             }
         }
+        self.check_index()?;
         Ok(diagnostics)
     }
 
     /// Prove scalar interpretations separately from validation so reads and
     /// array rewrites preserve numeric-looking strings without broad coercion.
     pub fn scalar_hints(&mut self, bytes: &[u8]) -> Result<core::ScalarHints, String> {
-        let asset = core::parse(bytes).map_err(|error| format!("assets.{error}"))?;
+        let asset = core::parse_shared(bytes).map_err(|error| format!("assets.{error}"))?;
         let snapshot = core::inspect(bytes).map_err(|error| format!("assets.{error}"))?;
         let mut hints = core::ScalarHints::new();
         for object in snapshot.objects {
@@ -783,6 +833,7 @@ impl ProjectSchema {
                 }
             }
         }
+        self.check_index()?;
         Ok(hints)
     }
 
@@ -895,7 +946,7 @@ impl ProjectSchema {
         if empty.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let asset = core::parse(bytes).map_err(|e| e.to_string())?;
+        let asset = core::parse_shared(bytes).map_err(|e| e.to_string())?;
         let mut result = BTreeMap::new();
         for (id, path) in empty {
             let op = AssetOperation::Set {
@@ -1172,13 +1223,15 @@ impl ProjectSchema {
             return None;
         }
         let path = paths[0].clone();
+        self.ensure_meta(&PathBuf::from(format!("{}.meta", path.display())))?;
+        if self.index_error.is_some() { return None; }
         match path.extension().and_then(|value| value.to_str())? {
             "cs" => return Some("MonoScript".into()),
             "png" | "jpg" | "jpeg" | "tga" | "psd" | "exr" => return None, // Sprite subassets share texture GUIDs.
             _ => {}
         }
         let bytes = self.source_bytes(&path)?;
-        let asset = core::parse(&bytes).ok()?;
+        let asset = core::parse_shared(&bytes).ok()?;
         self.object_type(&asset, id)
     }
 

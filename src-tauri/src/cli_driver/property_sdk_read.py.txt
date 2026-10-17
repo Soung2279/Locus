@@ -1,0 +1,30 @@
+import asyncio, hashlib, json, locus, math, statistics, sys, time
+
+async def main():
+    reference = locus.WorkspaceRef.from_payload(json.loads(sys.argv[2]))
+    paths, repeats = json.loads(sys.argv[3]), int(sys.argv[4])
+    timings, fingerprints, requests = {}, {}, 0
+    for iteration in range(repeats + 1):
+        for path in paths:
+            for depth in (1, 4):
+                started = time.perf_counter_ns()
+                result = await locus.call_tool("unity_yaml_read", {
+                    "path": path, "depth": depth, "max_array_items": 4,
+                }, workspace_ref=reference, timeout=120)
+                elapsed = (time.perf_counter_ns() - started) / 1_000_000
+                result.raise_for_error()
+                assert "[source: live Editor" in result.output, result.output[:500]
+                key = f"{path}|depth={depth}"
+                digest = hashlib.sha256(result.output.encode()).hexdigest()
+                if key in fingerprints:
+                    assert fingerprints[key] == digest, f"Output changed for {key}"
+                fingerprints[key] = digest
+                if iteration:
+                    timings.setdefault(key, []).append(elapsed)
+                requests += 1
+    summary = {key: {"p50_ms": statistics.median(values),
+        "p95_ms": sorted(values)[math.ceil(.95 * len(values)) - 1],
+        "output_sha256": fingerprints[key]} for key, values in timings.items()}
+    print("PROPERTY_SDK_RESULT " + json.dumps({"requests": requests, "cases": summary}))
+
+asyncio.run(main())

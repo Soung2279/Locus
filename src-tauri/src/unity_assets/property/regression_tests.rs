@@ -426,7 +426,7 @@ async fn review_service_performance_matrix() {
 async fn review_unity_service_roundtrip() {
     let editor =
         std::env::var("LOCUS_PROPERTY_UNITY_EDITOR").expect("set LOCUS_PROPERTY_UNITY_EDITOR");
-    let root = std::path::PathBuf::from("E:/LocusTemp").join(format!(
+    let root = crate::runtime_paths::isolated_test_root().join(format!(
         "property-service-{}",
         uuid::Uuid::new_v4().simple()
     ));

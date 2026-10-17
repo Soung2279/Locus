@@ -71,6 +71,8 @@ export interface SerializedTableCell {
   referenceTypeAssembly: string;
   value: unknown;
   displayValue: string;
+  /** Optional display-only suffix for numeric or single-line text editors. */
+  unit?: string;
   editable: boolean;
   hasChildren: boolean;
   isArray: boolean;

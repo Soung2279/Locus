@@ -1,8 +1,9 @@
 import { inject, type InjectionKey } from "vue";
 import type { WorkspaceRef } from "../../services/project";
-import type { UnityBoundPropertyRuntimeAdapter } from "./unityPropertyBinding";
+import type { UnityBoundPropertyRuntimeAdapter, UnityPropertyRuntime } from "./unityPropertyBinding";
 
 export interface UnityPropertyEditingContext {
+  runtime?: UnityPropertyRuntime;
   workspaceRef: WorkspaceRef;
   historyOwner: string;
   adapter: UnityBoundPropertyRuntimeAdapter;

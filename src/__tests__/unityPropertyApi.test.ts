@@ -20,6 +20,90 @@ const applied = (values = [9]) => ({ ok: true, message: "", results: values.map(
 beforeEach(() => { invoke.mockReset(); });
 
 describe("Property API transport and backend ownership", () => {
+  it("shares identical in-flight reads but never reuses them after a write or across backends", async () => {
+    let release!: (value: any) => void;
+    invoke.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const api = createUnityPropertyApi(workspace);
+    const a = api.read({ target, bindingId: "a" });
+    const b = api.read({ target, bindingId: "b" });
+    await Promise.resolve(); // same-turn demand collection flushes once
+    expect(invoke).toHaveBeenCalledTimes(1);
+    invoke.mockResolvedValue(result(8));
+    await api.write({ target, value: 8 });
+    const newer = await api.read({ target });
+    release(result(7));
+    expect((await a).bindingId).toBe("a"); expect((await b).bindingId).toBe("b");
+    expect(newer.value).toBe(8); expect(invoke).toHaveBeenCalledTimes(3);
+    await api.backend("yaml").read({ target }); expect(invoke).toHaveBeenCalledTimes(4);
+  });
+
+  it("sends distinct same-turn live fields through one native batch", async () => {
+    invoke.mockResolvedValue([result(7), result(8, "r1", "other")]);
+    const api = createUnityPropertyApi(workspace);
+    const values = await Promise.all([api.read({ target }), api.read({ target: { ...target, propertyPath: "other" } })]);
+    expect(values.map(value => value.value)).toEqual([7, 8]);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke.mock.calls[0][0]).toBe("unity_serialized_property_read_many");
+    expect(invoke.mock.calls[0][1]).toMatchObject({ workspaceRef: workspace, request: { reads: [{ target }, { target: { ...target, propertyPath: "other" } }] } });
+  });
+
+  it("serializes a YAML tree's edits against the acknowledged revision without rereading", async () => {
+    invoke.mockResolvedValue(root());
+    const tree = await createUnityPropertyApi(workspace).backend("yaml").readTree({ ...target, propertyPath: "" });
+    let release!: (value: any) => void;
+    invoke.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const first = tree.require("amount").write(8);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    const next = tree.require("amount").write(9);
+    const last = tree.require("amount").write(10);
+    invoke.mockResolvedValue({ ok: true, message: "", results: [result(10, "r3")] });
+    release({ ok: true, message: "", results: [result(8, "r2")] });
+    await Promise.all([first, next, last]);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect((invoke.mock.calls[2]![1] as any).request.writes[0]).toMatchObject({ value: 10, expectedRevision: "r2" });
+    expect(tree.require("amount").value).toBe(10);
+  });
+
+  it("blocks queued YAML edits after an uncertain failure until an explicit refresh", async () => {
+    invoke.mockResolvedValue(root());
+    const tree = await createUnityPropertyApi(workspace).backend("yaml").readTree({ ...target, propertyPath: "" });
+    invoke.mockRejectedValueOnce(new Error("property.outcome_unknown"));
+    await expect(tree.require("amount").write(8)).rejects.toThrow(/outcome_unknown/);
+    await expect(tree.require("amount").write(9)).rejects.toThrow(/refresh/);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    invoke.mockResolvedValueOnce(root("r2", 8)); await tree.refresh();
+    invoke.mockResolvedValueOnce({ ok: true, message: "", results: [result(9, "r3")] });
+    await tree.require("amount").write(9);
+    expect((invoke.mock.calls[3]![1] as any).request.writes[0].expectedRevision).toBe("r2");
+  });
+
+  it("does not let a late root read roll back the value or the YAML write revision", async () => {
+    invoke.mockResolvedValue(root());
+    const tree = await createUnityPropertyApi(workspace).backend("yaml").readTree({ ...target, propertyPath: "" });
+    let release!: (value: any) => void;
+    invoke.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const oldRead = tree.refresh();
+    invoke.mockResolvedValueOnce({ ok: true, message: "", results: [result(8, "r2")] });
+    await tree.require("amount").write(8);
+    release(root("r1", 7)); await oldRead;
+    expect(tree.require("amount").value).toBe(8);
+    invoke.mockResolvedValueOnce({ ok: true, message: "", results: [result(9, "r3")] });
+    await tree.require("amount").write(9);
+    expect((invoke.mock.calls[3]![1] as any).request.writes[0].expectedRevision).toBe("r2");
+  });
+
+  it("refreshes a single-leaf YAML tree after a failed write without widening its root", async () => {
+    invoke.mockResolvedValue(result(7, "r1"));
+    const tree = await createUnityPropertyApi(workspace).backend("yaml").readTree(target);
+    invoke.mockRejectedValueOnce(new Error("property.outcome_unknown"));
+    await expect(tree.require("amount").write(8)).rejects.toThrow();
+    invoke.mockResolvedValueOnce(result(8, "r2")); await tree.refresh();
+    expect((invoke.mock.calls[2]![1] as any).request.target.propertyPath).toBe("amount");
+    invoke.mockResolvedValueOnce({ ok: true, message: "", results: [result(9, "r3")] });
+    await tree.require("amount").write(9);
+    expect((invoke.mock.calls[3]![1] as any).request.writes[0].expectedRevision).toBe("r2");
+  });
+
   it("supports compact YAML commit receipts without weakening exact IDs or revisions", async () => {
     const summary = { ok: true, message: "", writesApplied: 1, transactionId: "tx", assets: [{ path: "Assets/Data.asset", revision: "r2", dependencies: { "Assets/Data.asset": "r2" } }] };
     invoke.mockResolvedValue(summary);

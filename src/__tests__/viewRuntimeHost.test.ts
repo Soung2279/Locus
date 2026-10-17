@@ -20,16 +20,57 @@ function pkg(source: string): ViewPackageDetail {
   };
 }
 const source = (text: string, color = "red") => `<script setup lang="ts">import { useViewState } from "@locus/view-runtime"; const state = useViewState({ count: 0 }, "state");</script><template><button @click="state.count++">${text}:{{state.count}}</button></template><style scoped>button {color:${color}}</style>`;
-async function mount() {
+async function mount(onIconChange?: (icon: string | null) => void, active = true, onTitleChange?: (title: string) => void) {
   const root = document.createElement("div"); document.body.append(root);
   const host = ref<InstanceType<typeof ViewRuntimeHost> | null>(null);
-  app = createApp({ setup: () => () => h(ViewRuntimeHost, { ref: host, viewId: "host", instanceId: "instance", workspaceRef: { checkoutId: "a", expectedGeneration: 1 } }) });
+  app = createApp({ setup: () => () => h(ViewRuntimeHost, { ref: host, viewId: "host", instanceId: "instance", workspaceRef: { checkoutId: "a", expectedGeneration: 1 }, active, "onIcon-change": onIconChange, "onTitle-change": onTitleChange }) });
   app.use(createPinia()); app.mount(root);
-  await nextTick(); await host.value!.ensureMounted();
+  await nextTick(); if (active) await host.value!.ensureMounted();
   return { root, host: host.value! };
 }
 
 describe("native View host hot updates", () => {
+  it("updates tab titles when only the configured name changes", async () => {
+    const first = pkg(source("unchanged"));
+    transport.read.mockResolvedValue(first);
+    const changed = vi.fn();
+    const { root, host } = await mount(undefined, true, changed);
+    expect(changed).toHaveBeenLastCalledWith("Host");
+    root.querySelector("button")!.click();
+    await nextTick();
+    transport.read.mockResolvedValue({ ...first, manifest: { ...first.manifest, name: "Renamed" } });
+    await host.reload();
+    expect(changed).toHaveBeenLastCalledWith("Renamed");
+    expect(root.querySelector("button")?.textContent).toBe("unchanged:1");
+  });
+  it("loads a restored inactive tab's icon without compiling its component", async () => {
+    const detail = pkg('<script setup>const invalid = ;</script>');
+    detail.manifest.icon = "Swords";
+    transport.read.mockResolvedValue(detail);
+    const changed = vi.fn();
+    const { root } = await mount(changed, false);
+    await vi.waitFor(() => expect(changed).toHaveBeenCalledWith("Swords"));
+    expect(root.querySelector('[role="alert"]')).toBeNull();
+    expect(root.querySelector("button")).toBeNull();
+  });
+
+  it("publishes configured icons on initial load and metadata-only reloads", async () => {
+    const first = pkg(source("same"));
+    first.manifest.icon = "Swords";
+    transport.read.mockResolvedValue(first);
+    const changed = vi.fn();
+    const { root, host } = await mount(changed);
+    expect(changed).toHaveBeenLastCalledWith("Swords");
+    const svg = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg>';
+    transport.read.mockResolvedValue({ ...first, manifest: { ...first.manifest, icon: svg } });
+    await host.reload();
+    expect(changed).toHaveBeenLastCalledWith(svg);
+    expect(root.querySelector("button")?.textContent).toBe("same:0");
+    transport.read.mockResolvedValue({ ...first, manifest: { ...first.manifest, icon: null } });
+    await host.reload();
+    expect(changed).toHaveBeenLastCalledWith(null);
+  });
+
   it("retains the actual DOM on CSS-only updates, restores View state on script/template updates and keeps the last valid View on compile errors", async () => {
     transport.read.mockResolvedValue(pkg(source("first")));
     const { root, host } = await mount();
@@ -57,5 +98,19 @@ describe("native View host hot updates", () => {
     transport.read.mockResolvedValue(pkg(source("latest"))); await host.reload();
     slow(pkg(source("outdated"))); await old;
     expect(root.querySelector("button")!.textContent).toBe("latest:0");
+  });
+
+  it("restarts unchanged View code on explicit refresh while preserving editor state", async () => {
+    transport.read.mockResolvedValue(pkg(source("refresh")));
+    const { root } = await mount();
+    const button = root.querySelector("button")!;
+    button.click(); await nextTick();
+    const host = nativeViewHosts()[0]!;
+    await host.reload({ force: true });
+    expect(root.querySelector("button")).not.toBe(button);
+    expect(root.querySelector("button")!.textContent).toBe("refresh:1");
+    root.querySelector("button")!.click(); await nextTick();
+    expect(root.querySelector("button")!.textContent).toBe("refresh:2");
+    expect(nativeViewHosts()).toHaveLength(1);
   });
 });

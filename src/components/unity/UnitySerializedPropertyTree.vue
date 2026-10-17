@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { ChevronRight, Plus, Trash2 } from "lucide";
+import { ChevronRight } from "lucide";
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import {
   createInspectorPropertyTreeBinding,
   createPropertyTree,
+  resolveInspectorFieldPresentation,
+  type InspectorFieldPresentationResolver,
+  type InspectorPropertyFieldAction,
   type InspectorPropertyCommit,
   type InspectorPropertyDrawerInput,
   type InspectorManagedReferenceTypeOption,
@@ -12,8 +15,12 @@ import {
   type InspectorPropertyTreeBinding,
   type InspectorPropertyTreeBindingInput,
 } from "../../services/propertyTree";
+import PropertyField from "../property-field/PropertyField.vue";
+import { propertyFieldAccess, type PropertyFieldAction } from "../property-field/propertyField";
 import UnityPropertyDraw from "./UnityPropertyDraw.vue";
 import UnityPropertyEditor from "./UnityPropertyEditor.vue";
+import UnityPropertyList from "./UnityPropertyList.vue";
+import { propertyFoldoutGroup, propertyIsVisible } from "./unityPropertyList";
 import type {
   UnitySerializedPropertyCommitEvent,
   UnitySerializedPropertySnapshot,
@@ -31,34 +38,6 @@ import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import { t } from "../../i18n";
 
-type ArrayDragEdge = "before" | "after";
-
-interface ArrayDragState {
-  sourceIndex: number;
-  targetIndex: number;
-  edge: ArrayDragEdge;
-}
-
-interface ArrayPointerDragState extends ArrayDragState {
-  pointerId: number;
-  startX: number;
-  startY: number;
-  dragging: boolean;
-  listElement: HTMLElement;
-}
-
-interface ArrayRenderItem {
-  child: InspectorProperty;
-  sourceIndex: number;
-  displayIndex: number;
-}
-
-const ARRAY_POINTER_DRAG_THRESHOLD_PX = 4;
-const ARRAY_OPTIMISTIC_MOVE_TIMEOUT_MS = 2400;
-// Mirrors the propertyTree default; larger arrays start collapsed so a
-// 128-item array does not render 128 nested subtrees up front.
-const ARRAY_AUTO_COLLAPSE_COUNT = 24;
-
 const props = withDefaults(defineProps<{
   property?: UnitySerializedPropertySnapshot | null;
   source?: InspectorPropertyTreeBindingInput | null;
@@ -72,6 +51,7 @@ const props = withDefaults(defineProps<{
   compact?: boolean;
   hideRootObjectHeader?: boolean;
   propertyDrawers?: InspectorPropertyDrawerInput;
+  fieldPresentation?: InspectorFieldPresentationResolver;
 }>(), {
   property: null,
   source: null,
@@ -84,6 +64,7 @@ const props = withDefaults(defineProps<{
 });
 
 const emit = defineEmits<{
+  fieldAction: [event: InspectorPropertyFieldAction];
   commit: [event: UnitySerializedPropertyCommitEvent];
   preview: [event: UnitySerializedPropertyCommitEvent];
 }>();
@@ -114,19 +95,36 @@ const tree = computed(() => {
 const inspectorProperty = computed(() => props.node ?? tree.value?.rootProperty ?? null);
 const children = computed(() => inspectorProperty.value?.children ?? []);
 const propertyType = computed(() => inspectorProperty.value?.valueType || "String");
-const canEdit = computed(() => inspectorProperty.value?.canEdit === true);
-const editorDisabled = computed(() => propertyTreeBinding.value.disabled);
-const editorReadonly = computed(() => propertyTreeBinding.value.readonly || !propertyTreeBinding.value.editable);
+const field = computed(() => inspectorProperty.value ? resolveInspectorFieldPresentation(inspectorProperty.value, props.fieldPresentation) : {});
+const fieldAccess = computed(() => propertyFieldAccess(field.value));
+const canEdit = computed(() => inspectorProperty.value?.canEdit === true && fieldAccess.value.visible && !editorDisabled.value && !editorReadonly.value);
+const editorDisabled = computed(() => propertyTreeBinding.value.disabled || fieldAccess.value.disabled);
+const editorReadonly = computed(() => propertyTreeBinding.value.readonly || !propertyTreeBinding.value.editable || fieldAccess.value.readonly);
+const fieldProps = computed(() => ({
+  ...field.value, label: inspectorProperty.value?.label ?? "", showLabel: false,
+  fieldKey: field.value.fieldKey || `${propertyTreeBinding.value.targetId}:${inspectorProperty.value?.propertyPath ?? ''}`,
+  tooltip: inspectorProperty.value?.tooltip ?? "", disabled: editorDisabled.value, readonly: editorReadonly.value || inspectorProperty.value?.editable === false,
+}));
+function fieldAction(action: PropertyFieldAction) {
+  const property = inspectorProperty.value;
+  if (property) emit("fieldAction", { action, property, propertyPath: property.propertyPath, snapshot: property.snapshot });
+}
 const hasCustomDraw = computed(() => inspectorProperty.value?.hasPropertyDrawer() === true);
-const arrayItemCount = computed(() => {
-  const property = inspectorProperty.value;
-  if (!property) return children.value.length;
-  return Math.max(0, property.arraySize >= 0 ? property.arraySize : children.value.length);
+const listStateKey = computed(() => {
+  const snapshot = inspectorProperty.value?.root.snapshot;
+  const target = snapshot?.bindingTarget ?? snapshot?.target;
+  return target || props.source?.targetId || props.source?.id
+    ? `${props.source?.targetId || props.source?.id || ""}:${JSON.stringify(target ?? {})}:${inspectorProperty.value?.propertyPath}` : "";
 });
-const arraySizeDisplay = computed(() => {
-  const property = inspectorProperty.value;
-  if (!property) return children.value.length;
-  return property.arraySize >= 0 ? property.arraySize : children.value.length;
+const groupedChildren = computed(() => {
+  const groups: { key: string; label: string; children: InspectorProperty[] }[] = [];
+  for (const child of children.value.filter(propertyIsVisible)) {
+    const label = propertyFoldoutGroup(child);
+    const previous = groups[groups.length - 1];
+    if (previous?.label === label) previous.children.push(child);
+    else groups.push({ key: child.propertyPath, label, children: [child] });
+  }
+  return groups;
 });
 // hideRootObjectHeader always refers to this component instance's local root
 // (inspectorProperty), so no depth check: with node-based recursion the local
@@ -134,6 +132,9 @@ const arraySizeDisplay = computed(() => {
 const hideObjectHeader = computed(() => {
   const property = inspectorProperty.value;
   return props.hideRootObjectHeader &&
+    !field.value.actions?.length &&
+    field.value.provenance?.state !== "overridden" &&
+    !field.value.provenance?.hasOverriddenChildren &&
     !!property &&
     children.value.length > 0 &&
     !property.isArray &&
@@ -143,7 +144,6 @@ const hideLeafLabel = computed(() => props.hideRootObjectHeader && !!inspectorPr
 const managedTypeQuery = ref("");
 const selectedManagedType = computed(() => inspectorProperty.value?.managedReferenceFullTypename || "");
 const selectedManagedTypeOption = computed(() => inspectorProperty.value?.selectedManagedReferenceType ?? null);
-const arrayCollapsed = ref(false);
 const loadingChildren = ref(false);
 const childrenError = ref("");
 async function loadChildren() {
@@ -154,26 +154,6 @@ async function loadChildren() {
   catch (error) { childrenError.value = error instanceof Error ? error.message : String(error); }
   finally { loadingChildren.value = false; }
 }
-const arrayDrag = ref<ArrayDragState | null>(null);
-const arrayPointerDrag = shallowRef<ArrayPointerDragState | null>(null);
-const arrayOptimisticMove = ref<ArrayDragState | null>(null);
-const arrayRenderItems = computed<ArrayRenderItem[]>(() => {
-  const items = children.value.map((child, sourceIndex) => ({ child, sourceIndex }));
-  const pointerDrag = arrayPointerDrag.value;
-  const drag = pointerDrag?.dragging ? pointerDrag : arrayOptimisticMove.value;
-  if (
-    drag &&
-    drag.sourceIndex >= 0 &&
-    drag.sourceIndex < items.length &&
-    drag.targetIndex >= 0 &&
-    drag.targetIndex < items.length &&
-    drag.sourceIndex !== drag.targetIndex
-  ) {
-    const [moved] = items.splice(drag.sourceIndex, 1);
-    if (moved) items.splice(drag.targetIndex, 0, moved);
-  }
-  return items.map((item, displayIndex) => ({ ...item, displayIndex }));
-});
 const numberLabelDrag = shallowRef<{
   property: InspectorProperty;
   propertyPath: string;
@@ -186,7 +166,6 @@ const numberLabelDrag = shallowRef<{
 const numberLabelDragPreview = ref<{ propertyPath: string; value: number } | null>(null);
 let numberLabelCommitFrame = 0;
 let pendingNumberLabelCommit: { property: InspectorProperty; value: number } | null = null;
-let arrayOptimisticMoveTimer = 0;
 const managedTypeOptions = computed<InspectorManagedReferenceTypeOption[]>(() => {
   const property = inspectorProperty.value;
   if (!property) return [];
@@ -209,23 +188,6 @@ watch(selectedManagedType, () => {
 });
 
 watch(
-  () => inspectorProperty.value?.propertyPath,
-  () => {
-    arrayCollapsed.value = defaultArrayCollapsed();
-    clearArrayOptimisticMove();
-    stopArrayItemDrag();
-  },
-  { immediate: true },
-);
-
-watch(
-  () => children.value.map(arrayChildChangeKey).join("\u0000"),
-  () => {
-    if (arrayOptimisticMove.value) clearArrayOptimisticMove();
-  },
-);
-
-watch(
   () => [inspectorProperty.value?.propertyPath, inspectorProperty.value?.value] as const,
   () => {
     if (!numberLabelDrag.value) numberLabelDragPreview.value = null;
@@ -233,8 +195,6 @@ watch(
 );
 
 onBeforeUnmount(() => {
-  stopArrayItemDragListeners();
-  clearArrayOptimisticMove();
   stopNumberLabelDragListeners();
   if (numberLabelCommitFrame) {
     cancelAnimationFrame(numberLabelCommitFrame);
@@ -248,16 +208,6 @@ function propertyLabel(property: InspectorProperty): string {
 
 function childSnapshot(property: InspectorProperty): UnitySerializedPropertySnapshot {
   return property.snapshot as UnitySerializedPropertySnapshot;
-}
-
-function arrayChildChangeKey(property: InspectorProperty): string {
-  const snapshot = childSnapshot(property);
-  return [
-    property.propertyPath,
-    property.displayValue,
-    String(snapshot.displayValue ?? ""),
-    String(snapshot.value ?? ""),
-  ].join("\u001f");
 }
 
 function childSource(property: InspectorProperty): InspectorPropertyTreeBindingInput {
@@ -302,7 +252,13 @@ function toUnityCommitEvent(
   };
 }
 
+function canEditProperty(property: InspectorProperty): boolean {
+  const access = propertyFieldAccess(resolveInspectorFieldPresentation(property, props.fieldPresentation));
+  return property.canEdit && !editorDisabled.value && !editorReadonly.value && access.visible && !access.readonly && !access.disabled;
+}
+
 function commitProperty(property: InspectorProperty, value: unknown) {
+  if (!canEditProperty(property)) return;
   const commit = property.createCommit(value);
   void Promise.resolve(propertyTreeBinding.value.commit(commit)).catch((error) => {
     console.warn("[UnitySerializedPropertyTree] commit handler failed:", error);
@@ -336,6 +292,7 @@ function emitCommit(property: InspectorProperty, value: unknown) {
 }
 
 function emitPreview(property: InspectorProperty, value: unknown) {
+  if (!canEditProperty(property)) return;
   const commit = property.createCommit(value);
   emit("preview", toUnityCommitEvent(commit, "preview"));
 }
@@ -358,7 +315,7 @@ function leafModelValue(property: InspectorProperty): unknown {
 }
 
 function canDragNumberLabel(property: InspectorProperty): boolean {
-  return property.drawer.kind === "number" && property.canEdit;
+  return property.drawer.kind === "number" && canEditProperty(property);
 }
 
 function numberConstraints(property: InspectorProperty) {
@@ -516,223 +473,6 @@ function numberLabelTitle(property: InspectorProperty): string {
   return `${label} (${min}..${max})`;
 }
 
-function commitArraySize(event: Event) {
-  const property = inspectorProperty.value;
-  const target = event.target as HTMLInputElement | null;
-  if (!target) return;
-  const currentSize = arraySizeDisplay.value;
-  // A cleared or invalid size input must not commit as 0 and silently drop
-  // every element; restore the current size instead.
-  const raw = target.value.trim();
-  const size = /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
-  if (!canEdit.value || !property || !Number.isFinite(size) || size === currentSize) {
-    target.value = String(currentSize);
-    return;
-  }
-  emitCommit(property, { action: "resize", size });
-}
-
-function restoreArraySizeOnEscape(event: KeyboardEvent) {
-  const target = event.target as HTMLInputElement | null;
-  if (!target) return;
-  // Sync the DOM value before blurring so the change event does not fire.
-  target.value = String(arraySizeDisplay.value);
-  target.blur();
-}
-
-function addArrayElement() {
-  const property = inspectorProperty.value;
-  if (!canEdit.value) return;
-  if (!property) return;
-  emitCommit(property, {
-    action: "insert",
-    index: arrayItemCount.value,
-  });
-  // Reveal the appended element when a large array starts collapsed.
-  arrayCollapsed.value = false;
-}
-
-function removeArrayElement(index: number) {
-  const property = inspectorProperty.value;
-  if (!canEdit.value) return;
-  if (property) emitCommit(property, { action: "delete", index });
-}
-
-function moveArrayElement(index: number, toIndex: number) {
-  const property = inspectorProperty.value;
-  if (!canEdit.value || !property || toIndex < 0 || toIndex >= arrayItemCount.value || index === toIndex) return;
-  emitCommit(property, { action: "move", index, toIndex });
-}
-
-function keepArrayOptimisticMove(sourceIndex: number, targetIndex: number) {
-  clearArrayOptimisticMove();
-  if (sourceIndex === targetIndex) return;
-  arrayOptimisticMove.value = { sourceIndex, targetIndex, edge: "before" };
-  arrayOptimisticMoveTimer = window.setTimeout(() => {
-    arrayOptimisticMoveTimer = 0;
-    arrayOptimisticMove.value = null;
-  }, ARRAY_OPTIMISTIC_MOVE_TIMEOUT_MS);
-}
-
-function clearArrayOptimisticMove() {
-  if (arrayOptimisticMoveTimer) {
-    window.clearTimeout(arrayOptimisticMoveTimer);
-    arrayOptimisticMoveTimer = 0;
-  }
-  arrayOptimisticMove.value = null;
-}
-
-function defaultArrayCollapsed(): boolean {
-  return inspectorProperty.value?.isArray === true && arrayItemCount.value > ARRAY_AUTO_COLLAPSE_COUNT;
-}
-
-function toggleArrayCollapsed() {
-  arrayCollapsed.value = !arrayCollapsed.value;
-  if (arrayCollapsed.value) stopArrayItemDrag();
-}
-
-function canDragArrayItem(index: number): boolean {
-  return canEdit.value && arrayItemCount.value > 1 && index >= 0 && index < arrayItemCount.value;
-}
-
-function canMoveArrayItem(index: number, direction: 1 | -1): boolean {
-  const toIndex = index + direction;
-  return canEdit.value && toIndex >= 0 && toIndex < arrayItemCount.value;
-}
-
-function arrayDropSlotFromPoint(
-  listElement: HTMLElement,
-  sourceIndex: number,
-  clientY: number,
-): { edge: ArrayDragEdge; slotIndex: number; rowIndex: number; targetIndex: number } {
-  const rows = Array.from(listElement.querySelectorAll<HTMLElement>(":scope > .array-item"))
-    .filter((row) => Number(row.dataset.arraySourceIndex) !== sourceIndex);
-  if (!rows.length) {
-    return { edge: "after", slotIndex: sourceIndex + 1, rowIndex: sourceIndex, targetIndex: sourceIndex };
-  }
-
-  for (let index = 0; index < rows.length; index += 1) {
-    const rect = rows[index].getBoundingClientRect();
-    if (clientY <= rect.top + rect.height / 2) {
-      return {
-        edge: "before",
-        slotIndex: index,
-        rowIndex: index,
-        targetIndex: Math.max(0, Math.min(arrayItemCount.value - 1, index)),
-      };
-    }
-  }
-
-  const lastIndex = rows.length - 1;
-  const slotIndex = arrayItemCount.value - 1;
-  return {
-    edge: "after",
-    slotIndex,
-    rowIndex: lastIndex,
-    targetIndex: Math.max(0, Math.min(arrayItemCount.value - 1, slotIndex)),
-  };
-}
-
-function startArrayItemDrag(index: number, event: PointerEvent) {
-  if (!canDragArrayItem(index)) {
-    event.preventDefault();
-    return;
-  }
-  const row = (event.currentTarget as HTMLElement | null)?.closest<HTMLElement>(".array-item");
-  const listElement = row?.parentElement;
-  if (!listElement) return;
-  event.preventDefault();
-  event.stopPropagation();
-  clearArrayOptimisticMove();
-  (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId);
-  arrayPointerDrag.value = {
-    sourceIndex: index,
-    targetIndex: index,
-    edge: "after",
-    pointerId: event.pointerId,
-    startX: event.clientX,
-    startY: event.clientY,
-    dragging: false,
-    listElement,
-  };
-  arrayDrag.value = { sourceIndex: index, targetIndex: index, edge: "after" };
-  window.addEventListener("pointermove", handleArrayItemDragMove);
-  window.addEventListener("pointerup", stopArrayItemDrag);
-  window.addEventListener("pointercancel", stopArrayItemDrag);
-  window.addEventListener("keydown", handleArrayItemDragKeydown, true);
-}
-
-function handleArrayItemDragMove(event: PointerEvent) {
-  const drag = arrayPointerDrag.value;
-  if (!drag || event.pointerId !== drag.pointerId) return;
-  event.preventDefault();
-  const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
-  if (!drag.dragging && distance < ARRAY_POINTER_DRAG_THRESHOLD_PX) return;
-  const next = arrayDropSlotFromPoint(drag.listElement, drag.sourceIndex, event.clientY);
-  arrayPointerDrag.value = {
-    ...drag,
-    dragging: true,
-    targetIndex: next.targetIndex,
-    edge: next.edge,
-  };
-  arrayDrag.value = {
-    sourceIndex: drag.sourceIndex,
-    targetIndex: next.targetIndex === drag.sourceIndex ? -1 : next.rowIndex,
-    edge: next.edge,
-  };
-}
-
-function stopArrayItemDrag(event?: PointerEvent) {
-  const drag = arrayPointerDrag.value;
-  if (drag && (!event || event.pointerId === drag.pointerId)) {
-    if (drag.dragging) {
-      keepArrayOptimisticMove(drag.sourceIndex, drag.targetIndex);
-      moveArrayElement(drag.sourceIndex, drag.targetIndex);
-    }
-    arrayPointerDrag.value = null;
-  }
-  arrayDrag.value = null;
-  stopArrayItemDragListeners();
-}
-
-function cancelArrayItemDrag() {
-  arrayPointerDrag.value = null;
-  arrayDrag.value = null;
-  stopArrayItemDragListeners();
-}
-
-function handleArrayItemDragKeydown(event: KeyboardEvent) {
-  if (event.key !== "Escape" || !arrayPointerDrag.value) return;
-  event.preventDefault();
-  event.stopPropagation();
-  cancelArrayItemDrag();
-}
-
-function stopArrayItemDragListeners() {
-  window.removeEventListener("pointermove", handleArrayItemDragMove);
-  window.removeEventListener("pointerup", stopArrayItemDrag);
-  window.removeEventListener("pointercancel", stopArrayItemDrag);
-  window.removeEventListener("keydown", handleArrayItemDragKeydown, true);
-}
-
-function nudgeArrayElement(index: number, direction: 1 | -1, event: KeyboardEvent) {
-  if (!canMoveArrayItem(index, direction)) return;
-  event.preventDefault();
-  moveArrayElement(index, index + direction);
-}
-
-function arrayItemClass(item: ArrayRenderItem): Record<string, boolean> {
-  const pointerDrag = arrayPointerDrag.value;
-  const drag = arrayDrag.value;
-  const isMoving = pointerDrag?.dragging === true && pointerDrag.sourceIndex === item.sourceIndex;
-  return {
-    dragging: isMoving,
-    "preview-moving": isMoving && pointerDrag.targetIndex !== pointerDrag.sourceIndex,
-    "drop-before": drag?.targetIndex === item.displayIndex && drag.edge === "before",
-    "drop-after": drag?.targetIndex === item.displayIndex && drag.edge === "after",
-  };
-}
-
 function updateManagedTypeQuery(event: Event) {
   managedTypeQuery.value = (event.target as HTMLInputElement | null)?.value || "";
 }
@@ -754,7 +494,7 @@ function commitManagedType(value: string) {
 </script>
 
 <template>
-  <div v-if="inspectorProperty" class="unity-property-tree" :class="{ compact }">
+  <div v-if="inspectorProperty && fieldAccess.visible && propertyIsVisible(inspectorProperty)" class="unity-property-tree" :class="{ compact }">
     <div v-if="inspectorProperty.header" class="property-header-label">
       {{ inspectorProperty.header }}
     </div>
@@ -762,6 +502,8 @@ function commitManagedType(value: string) {
       v-if="hasCustomDraw"
       :property="inspectorProperty"
       :property-drawers="propertyDrawers"
+      :field-presentation="fieldPresentation"
+      @field-action="$emit('fieldAction', $event)"
       :disabled="editorDisabled"
       :readonly="editorReadonly"
       :compact="compact"
@@ -769,89 +511,20 @@ function commitManagedType(value: string) {
     />
 
     <div v-else-if="inspectorProperty.isArray" class="property-container array-container">
-      <div class="property-container-header" :title="inspectorProperty.tooltip || inspectorProperty.propertyPath">
-        <div class="array-header-title">
-          <button
-            type="button"
-            class="array-fold-button"
-            :class="{ collapsed: arrayCollapsed }"
-            :aria-expanded="!arrayCollapsed"
-            :aria-label="propertyLabel(inspectorProperty)"
-            @click="toggleArrayCollapsed"
-          >
-            <LucideIcon :icon="ChevronRight" :size="13" />
-          </button>
-          <span class="property-name">{{ propertyLabel(inspectorProperty) }}</span>
-        </div>
-        <div class="array-controls">
-          <input
-            class="array-size-input"
-            type="number"
-            min="0"
-            :value="arraySizeDisplay"
-            :disabled="!canEdit"
-            :readonly="editorReadonly"
-            :title="inspectorProperty.propertyPath"
-            @change="commitArraySize"
-            @keydown.esc.prevent="restoreArraySizeOnEscape"
-          />
-          <button type="button" class="array-add-button" :disabled="!canEdit" @click="addArrayElement">
-            <LucideIcon :icon="Plus" :size="13" />
-            <span>{{ t("unity.property.array.add") }}</span>
-          </button>
-        </div>
-      </div>
-      <div v-if="!arrayCollapsed" class="property-children">
-        <div v-if="arrayRenderItems.length === 0" class="array-empty">
-          {{ t("unity.property.array.empty") }}
-        </div>
-        <div
-          v-for="item in arrayRenderItems"
-          :key="item.child.propertyPath"
-          class="array-item"
-          :class="arrayItemClass(item)"
-          :data-array-source-index="item.sourceIndex"
-        >
-          <button
-            type="button"
-            class="array-index-handle"
-            :disabled="!canDragArrayItem(item.sourceIndex)"
-            :aria-label="t('unity.property.array.move', item.displayIndex)"
-            :title="t('unity.property.array.dragToReorder')"
-            @pointerdown="startArrayItemDrag(item.sourceIndex, $event)"
-            @keydown.arrow-up="nudgeArrayElement(item.sourceIndex, -1, $event)"
-            @keydown.arrow-down="nudgeArrayElement(item.sourceIndex, 1, $event)"
-          >
-            <span class="array-item-index">{{ item.displayIndex }}</span>
-          </button>
-          <div class="array-item-content">
-            <UnitySerializedPropertyTree
-              :node="item.child"
-              :source="childSource(item.child)"
-              :disabled="editorDisabled"
-              :readonly="editorReadonly"
-              :property-drawers="propertyDrawers"
-              hide-root-object-header
-              compact
-              @commit="$emit('commit', $event)"
-              @preview="$emit('preview', $event)"
-            />
-          </div>
-          <button
-            type="button"
-            class="array-icon-button array-remove-button"
-            :disabled="!canEdit"
-            :aria-label="t('unity.property.array.remove', item.displayIndex)"
-            :title="t('unity.property.array.remove', item.displayIndex)"
-            @click="removeArrayElement(item.sourceIndex)"
-          >
-            <LucideIcon :icon="Trash2" :size="13" />
-          </button>
-        </div>
-      </div>
+        <UnityPropertyList :property="inspectorProperty" :editable="canEdit" :state-key="listStateKey"
+          :field-presentation="fieldProps" @field-action="fieldAction"
+          :load-children="propertyTreeBinding.loadChildren" @command="commitLeaf">
+          <template #default="{ item }">
+            <UnitySerializedPropertyTree :node="item" :source="childSource(item)"
+              :disabled="editorDisabled" :readonly="editorReadonly" :property-drawers="propertyDrawers"
+              :field-presentation="fieldPresentation" @field-action="$emit('fieldAction', $event)"
+              hide-root-object-header compact @commit="$emit('commit', $event)" @preview="$emit('preview', $event)" />
+          </template>
+        </UnityPropertyList>
     </div>
 
     <div v-else-if="inspectorProperty.isManagedReference" class="property-container managed-reference-container">
+      <PropertyField v-bind="fieldProps" class="property-chrome" @action="fieldAction">
       <div class="property-container-header" :title="inspectorProperty.tooltip || inspectorProperty.propertyPath">
         <span class="property-name">{{ propertyLabel(inspectorProperty) }}</span>
         <div class="managed-type-control">
@@ -880,6 +553,7 @@ function commitManagedType(value: string) {
           />
         </div>
       </div>
+      </PropertyField>
       <div v-if="children.length" class="property-children">
         <UnitySerializedPropertyTree
           v-for="child in children"
@@ -889,6 +563,8 @@ function commitManagedType(value: string) {
           :disabled="editorDisabled"
           :readonly="editorReadonly"
           :property-drawers="propertyDrawers"
+          :field-presentation="fieldPresentation"
+          @field-action="$emit('fieldAction', $event)"
           compact
           @commit="$emit('commit', $event)"
           @preview="$emit('preview', $event)"
@@ -901,31 +577,38 @@ function commitManagedType(value: string) {
       class="property-container object-container"
       :class="{ 'hide-root-header': hideObjectHeader }"
     >
+      <PropertyField v-if="!hideObjectHeader" v-bind="fieldProps" class="property-chrome" @action="fieldAction">
       <div
-        v-if="!hideObjectHeader"
         class="property-container-header"
         :title="inspectorProperty.tooltip || inspectorProperty.propertyPath"
       >
         <span class="property-name">{{ propertyLabel(inspectorProperty) }}</span>
         <span class="property-type">{{ propertyType }}</span>
       </div>
+      </PropertyField>
       <div class="property-children">
-        <UnitySerializedPropertyTree
-          v-for="child in children"
-          :key="child.propertyPath"
-          :node="child"
-          :source="childSource(child)"
-          :disabled="editorDisabled"
-          :readonly="editorReadonly"
-          :property-drawers="propertyDrawers"
-          compact
-          @commit="$emit('commit', $event)"
-          @preview="$emit('preview', $event)"
-        />
+        <template v-for="group in groupedChildren" :key="group.key">
+          <details v-if="group.label" class="property-foldout-group">
+            <summary><LucideIcon :icon="ChevronRight" :size="13" />{{ group.label }}</summary>
+            <div class="property-group-body">
+              <UnitySerializedPropertyTree v-for="child in group.children" :key="child.propertyPath"
+                :node="child" :source="childSource(child)" :disabled="editorDisabled" :readonly="editorReadonly"
+                :property-drawers="propertyDrawers" :field-presentation="fieldPresentation" compact
+                @field-action="$emit('fieldAction', $event)" @commit="$emit('commit', $event)" @preview="$emit('preview', $event)" />
+            </div>
+          </details>
+          <template v-else>
+            <UnitySerializedPropertyTree v-for="child in group.children" :key="child.propertyPath"
+              :node="child" :source="childSource(child)" :disabled="editorDisabled" :readonly="editorReadonly"
+              :property-drawers="propertyDrawers" :field-presentation="fieldPresentation" compact
+              @field-action="$emit('fieldAction', $event)" @commit="$emit('commit', $event)" @preview="$emit('preview', $event)" />
+          </template>
+        </template>
       </div>
     </div>
 
-    <div v-else class="property-leaf" :class="{ 'hide-leaf-label': hideLeafLabel }" :title="numberLabelTitle(inspectorProperty)">
+    <PropertyField v-else v-bind="fieldProps" class="property-chrome" @action="fieldAction">
+    <div class="property-leaf" :class="{ 'hide-leaf-label': hideLeafLabel }" :title="numberLabelTitle(inspectorProperty)">
       <button
         v-if="!hideLeafLabel && canDragNumberLabel(inspectorProperty)"
         type="button"
@@ -950,6 +633,7 @@ function commitManagedType(value: string) {
         :enum-value-flag="inspectorProperty.enumValueFlag"
         :title="inspectorProperty.propertyPath"
         :tooltip="inspectorProperty.tooltip"
+        :unit="inspectorProperty.unit"
         :has-range="inspectorProperty.hasRange"
         :range-min="inspectorProperty.rangeMin"
         :range-max="inspectorProperty.rangeMax"
@@ -964,7 +648,8 @@ function commitManagedType(value: string) {
         @commit="commitLeaf"
       />
     </div>
-    <div v-if="inspectorProperty.snapshot.childrenTruncated && !arrayCollapsed" class="property-continuation">
+    </PropertyField>
+    <div v-if="inspectorProperty.snapshot.childrenTruncated && !inspectorProperty.isArray" class="property-continuation">
       <BaseButton v-if="propertyTreeBinding.loadChildren" class="property-load-more" :disabled="loadingChildren" @click="loadChildren">
         {{ loadingChildren ? t('common.loading') : t('common.loadMore') }}
       </BaseButton>
@@ -1003,15 +688,16 @@ function commitManagedType(value: string) {
   min-width: 0;
   min-height: var(--unity-property-row-height);
   display: grid;
-  grid-template-columns: minmax(84px, 0.42fr) minmax(0, 1fr);
+  grid-template-columns: var(--unity-property-columns, minmax(84px, 0.42fr) minmax(0, 1fr));
   align-items: center;
   gap: 8px;
 }
 
-.compact > .property-leaf,
-.compact > .property-container > .property-container-header {
-  grid-template-columns: minmax(72px, 0.34fr) minmax(0, 1fr);
+.unity-property-tree.compact {
+  --unity-property-columns: minmax(72px, 0.34fr) minmax(0, 1fr);
 }
+
+.property-chrome.overridden :deep(.property-name) { font-weight: 600; }
 
 .property-name,
 .property-type {
@@ -1076,52 +762,6 @@ function commitManagedType(value: string) {
   border-left: 0;
 }
 
-.array-container > .property-children {
-  gap: 4px;
-  padding-left: 0;
-  border-left: 0;
-}
-
-.array-header-title {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
-  align-items: center;
-  gap: 2px;
-}
-
-.array-fold-button {
-  width: 22px;
-  min-width: 22px;
-  min-height: 22px;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-color: transparent;
-  background: transparent;
-  color: var(--text-secondary);
-}
-
-.array-fold-button:not(.collapsed) svg {
-  transform: rotate(90deg);
-}
-
-.array-fold-button:hover,
-.array-fold-button:focus-visible {
-  border-color: var(--border-color);
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-.array-controls {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(54px, 72px) auto;
-  justify-content: start;
-  gap: 6px;
-}
-
 .managed-type-control {
   min-width: 0;
   display: grid;
@@ -1129,7 +769,6 @@ function commitManagedType(value: string) {
   gap: 6px;
 }
 
-.array-size-input,
 .managed-type-search {
   width: 100%;
   min-width: 0;
@@ -1165,108 +804,9 @@ function commitManagedType(value: string) {
   font-family: var(--font-mono-identifier);
 }
 
-.array-size-input:focus,
 .managed-type-search:focus {
   outline: none;
   border-color: var(--accent-color);
-}
-
-.array-empty {
-  min-height: var(--unity-property-row-height);
-  display: flex;
-  align-items: center;
-  padding: 0 8px;
-  border: 1px dashed color-mix(in srgb, var(--border-color) 82%, transparent);
-  border-radius: 6px;
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-
-.array-item {
-  position: relative;
-  min-width: 0;
-  display: grid;
-  grid-template-columns: 42px minmax(0, 1fr) 24px;
-  align-items: start;
-  gap: 6px;
-  padding: 2px 0;
-  border-radius: 6px;
-}
-
-.array-item::before,
-.array-item::after {
-  content: "";
-  position: absolute;
-  left: 48px;
-  right: 0;
-  height: 2px;
-  border-radius: 999px;
-  background: var(--accent-color);
-  opacity: 0;
-  pointer-events: none;
-}
-
-.array-item::before {
-  top: -2px;
-}
-
-.array-item::after {
-  bottom: -2px;
-}
-
-.array-item.drop-before::before,
-.array-item.drop-after::after {
-  opacity: 0.82;
-}
-
-.array-item.dragging {
-  opacity: 0.58;
-}
-
-.array-item.preview-moving {
-  background: var(--hover-bg);
-}
-
-.array-item-content {
-  min-width: 0;
-}
-
-.array-index-handle {
-  min-width: 0;
-  min-height: var(--unity-property-row-height);
-  padding: 0 6px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  border-color: transparent;
-  background: transparent;
-  color: var(--text-secondary);
-  font-family: var(--font-mono-identifier);
-  font-size: 11px;
-  cursor: grab;
-  user-select: none;
-}
-
-.array-index-handle:hover:not(:disabled),
-.array-index-handle:focus-visible {
-  border-color: var(--border-color);
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-.array-index-handle:active {
-  cursor: grabbing;
-}
-
-.array-index-handle:disabled {
-  opacity: 1;
-  cursor: default;
-}
-
-.array-item-index {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 button {
@@ -1285,41 +825,7 @@ button:focus-visible {
   outline-offset: 2px;
 }
 
-.array-add-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.array-icon-button {
-  width: 24px;
-  min-width: 24px;
-  min-height: 24px;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-color: transparent;
-  background: transparent;
-  color: var(--text-secondary);
-}
-
-.array-icon-button:hover:not(:disabled),
-.array-icon-button:focus-visible {
-  border-color: var(--border-color);
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-.array-remove-button:hover:not(:disabled),
-.array-remove-button:focus-visible {
-  border-color: var(--status-danger-border);
-  background: var(--status-danger-bg);
-  color: var(--status-danger-fg);
-}
-
 button:disabled,
-.array-size-input:disabled,
 .managed-type-search:disabled {
   opacity: 0.58;
 }
@@ -1332,4 +838,10 @@ button.property-name-drag {
   background: transparent;
   font-size: inherit;
 }
+.property-foldout-group { min-width: 0; }
+.property-foldout-group > summary { display: flex; align-items: center; gap: 4px; min-height: 26px; cursor: pointer; color: var(--text-secondary); list-style: none; }
+.property-foldout-group > summary::-webkit-details-marker { display: none; }
+.property-foldout-group[open] > summary svg { transform: rotate(90deg); }
+.property-foldout-group > summary:focus-visible { outline: 1px solid var(--accent-color); outline-offset: -1px; }
+.property-group-body { display: grid; gap: 6px; padding: 4px 0 4px 12px; border-left: 1px solid var(--border-color); }
 </style>

@@ -3,6 +3,8 @@
 mod storage;
 pub(crate) mod schema;
 mod property;
+#[cfg(test)]
+mod index_tests;
 pub(crate) fn prefab_property_projection(root:&std::path::Path,path:&str,bytes:&[u8])->Result<(String,std::collections::BTreeMap<std::path::PathBuf,String>,std::collections::HashMap<String,String>),String>{
     property::advanced::projection(root,path,bytes)
 }

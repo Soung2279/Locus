@@ -6,12 +6,26 @@ import { registerFrontendWorkbench } from "../services/frontendWorkbench";
 import { registerNativeViewHost } from "../components/view/viewHostRegistry";
 import * as viewService from "../services/view";
 import * as ipc from "../services/ipc";
+import { installLocusRuntime } from "../services/locusRuntime";
 
 const releases: Array<() => void> = [];
 const scope = { checkoutId: "a", expectedGeneration: 2, expectedMaterializationEpoch: 4 };
 afterEach(() => { releases.splice(0).forEach((release) => release()); document.body.innerHTML = ""; vi.restoreAllMocks(); });
 
 describe("unified frontend TypeScript SDK", () => {
+  it("passes the View display window to GPU output creation", async () => {
+    const invoke = vi.fn().mockResolvedValue({ id: "gpu", owner: "owner", domainGeneration: "domain" });
+    const uninstall = installLocusRuntime({ kind: "tauri", invoke, subscribe: async () => () => {} });
+    const sdk = createFrontendSdk(scope, { windowLabel: "workbench-shared-child" });
+    try {
+      await sdk.unity.renderer.createOutput();
+      expect(invoke).toHaveBeenCalledWith("unity_renderer_create", { workspaceRef: scope, windowLabel: "workbench-shared-child" }, expect.any(AbortSignal));
+    } finally {
+      await sdk.unity.renderer.dispose();
+      uninstall();
+    }
+  });
+
   it("discovers native components and initializes a directory structure without a template", async () => {
     const sdk = createFrontendSdk(scope);
     expect(await sdk.views.components()).toEqual(expect.arrayContaining(["LinkBoard", "CanvasView", "GraphView", "SerializedTableView", "UnityPropertyDraw", "BaseButton"]));

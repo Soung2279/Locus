@@ -1,9 +1,9 @@
 import { searchWorkspaceAssets } from "../../services/asset";
 import { normalizeAppError } from "../../services/errors";
-import { getLocusRuntime } from "../../services/locusRuntime";
+import { getLocusRuntime, withLocusInvocationSignal } from "../../services/locusRuntime";
 import { getLastEffort, getLastModel, getModelDefaults } from "../../services/model";
 import { archiveSession, chat as launchSessionChat, createSession as createLocusSession, deleteSession, forkSession, forkSessionFromMessage, getSessionActiveRun, listArchivedCheckoutSessions, listSessionEvents, listCheckoutSessions, loadSession as loadLocusSession, queueChatInput, renameSession, rollbackSessionToMessage, unarchiveSession, undoLatestConversationTurn } from "../../services/session";
-import { applyUnitySerializedProperties, discoverUnitySerializedProperties, readUnitySerializedProperty, writeUnitySerializedProperty } from "../../services/unitySerializedProperty";
+import { applyUnitySerializedProperties, discoverUnitySerializedProperties, executeUnityPropertyObjects, readUnitySerializedProperties, readUnitySerializedProperty, writeUnitySerializedProperty } from "../../services/unitySerializedProperty";
 import { viewCallScript, viewFsAccess, viewFsAppendFile, viewFsCopyFile, viewFsLstat, viewFsMkdir, viewFsReadFile, viewFsReaddir, viewFsRename, viewFsRm, viewFsStat, viewFsUnlink, viewFsWriteFile, viewOpenFrontendLog, viewReadFrontendLog, viewStorageGet, viewStorageRemove, viewStorageSet, type ViewLlmCallRequest, type ViewLlmCallResult, type ViewSessionChatRequest, type ViewSessionChatResult, type ViewSessionCreateRequest, type ViewSessionQueueInputRequest, type ViewSessionWaitRequest, type ViewSessionWaitResult, type ViewSessionWaitStatus, type ViewRuntimeUpdateEvent } from "../../services/view";
 import { WORKSPACE_EVENT_NAME, workspaceMaterializationMatches, type WorkspaceRef, type RoutedWorkspaceEvent } from "../../services/project";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
@@ -359,10 +359,12 @@ async function callRuntimeLlm(request: ViewLlmCallRequest): Promise<ViewLlmCallR
 }
 
 
-return {
+const api: ViewRuntimeApi = {
             workspaceRef: requireViewWorkspaceRef(),
             callScript: (scriptName, method, args) =>
               viewCallScript(requireViewWorkspaceRef(), { viewId: options.viewId, scriptName, method, args }),
+            unityPropertyObjects: request => executeUnityPropertyObjects(requireViewWorkspaceRef(), request),
+            unityPropertyReadMany: requests => readUnitySerializedProperties(requireViewWorkspaceRef(), requests),
             unityPropertyRead: (request) => readUnitySerializedProperty(requireViewWorkspaceRef(), request),
             unityPropertyDiscover: (request) => discoverUnitySerializedProperties(requireViewWorkspaceRef(), request),
             unityPropertyWrite: (request) => writeUnitySerializedProperty(requireViewWorkspaceRef(), request),
@@ -419,4 +421,20 @@ return {
               subscribeWorkspaceEvent<ViewRuntimeUpdateEvent>("unity-editor-update", handler, true),
             reload: options.reload,
           };
+// A pooled native child can outlive the View that created this API. Retained
+// async callbacks must not issue another operation after that binding closes.
+if (getLocusRuntime().kind !== "unity") return api;
+return Object.fromEntries(Object.entries(api).map(([key, value]) => [key,
+  typeof value !== "function" ? value : async (...args: unknown[]) => {
+    if (options.scope.disposed) throw new DOMException("View binding was released", "AbortError");
+    try {
+      const result = await withLocusInvocationSignal(options.scope.context.signal, () => (value as (...args: unknown[]) => unknown)(...args));
+      if (options.scope.disposed) throw new DOMException("View binding changed", "AbortError");
+      return result;
+    } catch (error) {
+      if (options.scope.disposed) throw new DOMException("View binding changed", "AbortError");
+      throw error;
+    }
+  },
+])) as unknown as ViewRuntimeApi;
 }

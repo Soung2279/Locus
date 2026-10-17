@@ -1,3 +1,6 @@
+export { default as UnityPropertyScope } from "./UnityPropertyScope.vue";
+export { default as UnityPropertyField } from "./UnityPropertyField.vue";
+export { useUnityPropertyBinding } from "./unityPropertyScope";
 export { default as UnityBoolField } from "./UnityBoolField.vue";
 export { default as UnityBoundsField } from "./UnityBoundsField.vue";
 export { default as UnityColorField } from "./UnityColorField.vue";

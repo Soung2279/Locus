@@ -1,5 +1,16 @@
 use crate::view::{UnitySerializedPropertyTarget, UnitySerializedPropertyWriteResult};
 
+#[tokio::test]
+async fn property_read_batch_rejects_bad_budget_before_editor_access() {
+    let empty = super::UnitySerializedPropertyReadManyRequest { reads: vec![] };
+    assert!(super::read_many("", empty).await.unwrap_err().contains("1 to 32"));
+    let value = serde_json::json!({"target":{"kind":"asset","path":"Assets/Test.asset","targetFileId":"9223372036854775807"},"arrayOffset":64});
+    let read: super::UnitySerializedPropertyReadRequest = serde_json::from_value(value).unwrap();
+    assert_eq!(read.target.target_file_id, Some(9223372036854775807));
+    assert!(super::read_many("", super::UnitySerializedPropertyReadManyRequest { reads: vec![read; 33] }).await.unwrap_err().contains("1 to 32"));
+}
+
+
 #[test]
 fn property_restore_wire_preserves_complete_prefab_identity() {
     let global_id = "GlobalObjectId_V1-2-01234567890123456789012345678901-9007199254740993-9223372036854775807";

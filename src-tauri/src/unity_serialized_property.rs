@@ -7,6 +7,7 @@ use crate::view::{
 };
 
 pub mod property_tree;
+pub mod objects;
 #[cfg(test)]
 mod wire_tests;
 
@@ -107,6 +108,78 @@ pub async fn read(
         schema.enrich_read_result(&mut result);
     }
     Ok(result)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnitySerializedPropertyReadManyRequest {
+    pub reads: Vec<UnitySerializedPropertyReadRequest>,
+}
+
+/// One workspace admission and one Editor turn. Item failures remain local;
+/// schema enrichment is identical to the single-read path.
+pub async fn read_many(
+    working_dir: &str,
+    request: UnitySerializedPropertyReadManyRequest,
+) -> Result<Vec<UnitySerializedPropertyReadResult>, String> {
+    if request.reads.is_empty() || request.reads.len() > 32 {
+        return Err("Property read batch requires 1 to 32 requests.".into());
+    }
+    let index = crate::unity_serialized_schema::try_load_current_schema(working_dir).await;
+    let mut payloads = Vec::with_capacity(request.reads.len());
+    let mut schemas = Vec::with_capacity(request.reads.len());
+    let mut slots: Vec<Option<UnitySerializedPropertyReadResult>> = vec![None; request.reads.len()];
+    let mut positions = Vec::new();
+    for (position, read) in request.reads.iter().enumerate() {
+        if let Err(message) = validate_object_target(&read.target) {
+            slots[position] = Some(UnitySerializedPropertyReadResult {
+                ok: false, message, binding_id: read.binding_id.clone(), target: read.target.clone(),
+                property: crate::view::UnitySerializedPropertySnapshot::default(), properties: vec![],
+            });
+            continue;
+        }
+        positions.push(position);
+        let schema = index.as_ref().filter(|schema|
+            !crate::unity_serialized_schema::target_is_static_schema_excluded(&read.target)
+                && schema.can_enrich_target(&read.target));
+        payloads.push(serde_json::json!({
+            "bindingId":read.binding_id,"target":read.target,
+            "maxDepth":read.max_depth.unwrap_or_default(),
+            "maxArrayItems":read.max_array_items.unwrap_or_default(),
+            "arrayOffset":read.array_offset.unwrap_or_default(),
+            "autoExpandCharLimit":read.auto_expand_char_limit.unwrap_or_default(),
+            "hierarchyFields":read.hierarchy_fields,
+            "schemaMode":if schema.is_some() {"dynamic"} else {"full"},
+        }));
+        schemas.push(schema);
+    }
+    if payloads.is_empty() { return Ok(slots.into_iter().flatten().collect()); }
+    let raw = match crate::unity_bridge::property_tree_read_many(working_dir, &serde_json::json!({"reads":payloads})).await {
+        Ok(raw) => raw,
+        Err(error) if error.contains("unknown message type: property_tree_read_many") => {
+            // Read-only compatibility for an older installed bridge. Never retry
+            // timeouts/connection failures or change the selected data backend.
+            let mut results = Vec::with_capacity(payloads.len());
+            for payload in &payloads {
+                let result = match crate::unity_bridge::property_tree_read(working_dir, payload).await {
+                    Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| e.to_string())?,
+                    Err(message) => serde_json::json!({"ok":false,"message":message,"target":payload["target"],"bindingId":payload["bindingId"]}),
+                };
+                results.push(result);
+            }
+            serde_json::json!({"results":results}).to_string()
+        }
+        Err(error) => return Err(error),
+    };
+    #[derive(Deserialize)]
+    struct Response { results: Vec<UnitySerializedPropertyReadResult> }
+    let mut response: Response = serde_json::from_str(&raw).map_err(|e| format!("Invalid property read batch: {e}"))?;
+    if response.results.len() != schemas.len() { return Err("Property read batch result count mismatch.".into()); }
+    for (result, schema) in response.results.iter_mut().zip(schemas) {
+        if result.ok { if let Some(schema) = schema { schema.enrich_read_result(result); } }
+    }
+    for (position, result) in positions.into_iter().zip(response.results) { slots[position] = Some(result); }
+    Ok(slots.into_iter().flatten().collect())
 }
 
 pub async fn discover(

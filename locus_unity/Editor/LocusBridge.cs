@@ -438,6 +438,8 @@ namespace Locus
             public bool isPlaying;
             public bool isPaused;
             public string activeScenePath;
+            public string propertyDataVersion;
+            public PropertyDataChangeSet propertyDataChanges;
             public EditorSelectionSnapshot selection;
         }
 
@@ -467,6 +469,7 @@ namespace Locus
             LocusAsync.CaptureMainThread();
             RefreshCachedEditorState();
             EditorApplication.update += PumpMainThreadQueue;
+            TrackPropertyDataChanges();
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             EditorApplication.pauseStateChanged += OnPauseStateChanged;
             EditorApplication.delayCall += Start;
@@ -1349,6 +1352,7 @@ namespace Locus
                 additionalScenePaths.Add(path);
             }
             _additionalOpenScenePathsStatus = string.Join("|", additionalScenePaths.ToArray());
+            NativePublishChangedEditorState();
         }
 
         private static void MaybeSendEditorUpdateEvent()
@@ -1357,7 +1361,7 @@ namespace Locus
             UnityEngine.Object selection = Selection.activeObject;
             int selectionInstanceId = LocusObjectIdentity.InstanceId(selection);
             bool selectionChanged = selectionInstanceId != _lastEditorUpdateSelectionInstanceId;
-            if (!selectionChanged && _lastEditorUpdateEventAt >= 0 && now - _lastEditorUpdateEventAt < EditorUpdateEventIntervalSeconds)
+            if (!selectionChanged && _lastPropertyDataPublished == _propertyDataRevision && _lastEditorUpdateEventAt >= 0 && now - _lastEditorUpdateEventAt < EditorUpdateEventIntervalSeconds)
                 return;
 
             RefreshCachedEditorState();
@@ -1372,6 +1376,9 @@ namespace Locus
             payload.isPlaying = _isPlaying;
             payload.isPaused = _isPaused;
             payload.activeScenePath = _activeScenePath;
+            payload.propertyDataVersion = PropertyDataVersion;
+            payload.propertyDataChanges = TakePropertyDataChanges();
+            _lastPropertyDataPublished = _propertyDataRevision;
             FillEditorSelectionSnapshot(_reusableSelectionSnapshot, selection, selectionInstanceId);
             payload.selection = _reusableSelectionSnapshot;
             SendEventToRust("unity-editor-update", JsonUtility.ToJson(payload));
@@ -1635,6 +1642,17 @@ namespace Locus
                     case "ping":
                         return OkResponse(reqId, "pong");
 
+                    case "native_view_open":
+                    {
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try { tcs.SetResult(OkResponse(reqId, LocusNativeViewWindow.OpenFromJson(msg.message))); }
+                            catch (Exception ex) { tcs.SetResult(ErrorResponse(reqId, ex.Message)); }
+                        });
+                        return await tcs.Task.ConfigureAwait(false);
+                    }
+
                     case "configure_locus_external_editor":
                     {
                         var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
@@ -1838,6 +1856,12 @@ namespace Locus
                     case "view_binding_read":
                         return await HandlePropertyTreeRead(reqId, msg.message).ConfigureAwait(false);
 
+                    case "property_tree_read_many":
+                        return await HandlePropertyTreeReadMany(reqId, msg.message).ConfigureAwait(false);
+
+                    case "property_objects":
+                        return await HandlePropertyObjects(reqId, msg.message).ConfigureAwait(false);
+
                     case "property_tree_write":
                     case "view_binding_write":
                         return await HandlePropertyTreeWrite(reqId, msg.message).ConfigureAwait(false);
@@ -1852,6 +1876,12 @@ namespace Locus
 
                     case "capture_viewport":
                         return await HandleCaptureViewport(reqId, msg.message).ConfigureAwait(false);
+                    case "capture_spatial_snapshot":
+                        return await HandleSpatialCapture(reqId, msg.message).ConfigureAwait(false);
+                    case "capture_attachment":
+                        return await HandleCaptureAttachment(reqId, msg.message).ConfigureAwait(false);
+                    case "release_spatial_capture":
+                        return await HandleSpatialCaptureRelease(reqId, msg.message).ConfigureAwait(false);
 
                     case "request_recompile":
                     {
@@ -2151,6 +2181,12 @@ namespace Locus
 
                     case "asset_preview_render":
                         return await HandleAssetPreviewRender(reqId, msg.message).ConfigureAwait(false);
+
+                    case "render_output":
+                        return await HandleRenderOutput(reqId, msg.message).ConfigureAwait(false);
+
+                    case "search_scene_objects":
+                        return await HandleSceneObjectSearch(reqId, msg.message).ConfigureAwait(false);
 
                     case "validate_scene_object":
                     {

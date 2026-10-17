@@ -3,6 +3,9 @@ import { h, markRaw, shallowReactive, type VNodeChild } from "vue";
 import {
   createInspectorPropertyTreeBinding,
   createPropertyTree,
+  resolveInspectorFieldPresentation,
+  type InspectorFieldPresentationResolver,
+  type InspectorPropertyFieldAction,
   type InspectorProperty,
   type InspectorPropertyCommit,
   type InspectorPropertyDrawerInput,
@@ -12,7 +15,9 @@ import {
   type InspectorPropertyTreeSnapshotInput,
   type PropertyTree,
 } from "../../services/propertyTree";
-import type { UnitySerializedPropertyTarget } from "../../services/unitySerializedProperty";
+import type { UnitySerializedPropertyTarget, UnityPropertyDataChanges } from "../../services/unitySerializedProperty";
+import { createUnityPropertyResources, type UnityPropertyResource } from "./unityPropertyResources";
+import { isCoalesciblePropertyValue } from "../../services/propertyEditQueue";
 import {
   resolveUnityPropertyTarget,
   unityPropertyObjectTarget,
@@ -20,6 +25,8 @@ import {
   unityPropertyTargetKey,
   type UnityPropertyPathTargetKind,
 } from "../../services/unityPropertyPath";
+import PropertyField from "../property-field/PropertyField.vue";
+import { propertyFieldAccess, type PropertyFieldAction } from "../property-field/propertyField";
 import UnityPropertyEditor from "./UnityPropertyEditor.vue";
 import UnitySerializedPropertyTree from "./UnitySerializedPropertyTree.vue";
 import type { UnitySerializedPropertyCommitEvent } from "./unitySerializedValue";
@@ -29,6 +36,8 @@ export type UnityPropertyPathInput = string | UnitySerializedPropertyTarget;
 export type { UnityPropertyPathTargetKind };
 
 export interface UnityBoundPropertyReadRequest {
+  /** Explicit refresh bypasses the object value cache. */
+  force?: boolean;
   arrayOffset?: number | null;
   bindingId?: string | null;
   target: UnitySerializedPropertyTarget;
@@ -55,6 +64,11 @@ export interface UnityBoundPropertyApplyRequest {
 }
 
 export interface UnityBoundPropertyReadResult extends InspectorPropertySnapshot {
+  dataVersion?: string;
+  dependencyObjectIds?: string[];
+  conservativeInvalidation?: boolean;
+  /** Local adapter read overlapped a newer mutation; do not reconcile it. */
+  stale?: boolean;
   ok?: boolean;
   bindingId?: string | null;
   message?: string;
@@ -64,6 +78,10 @@ export interface UnityBoundPropertyReadResult extends InspectorPropertySnapshot 
 
 export interface UnityBoundPropertyWriteResult extends UnityBoundPropertyReadResult {
   saved?: boolean;
+  applied?: boolean;
+  persisted?: boolean;
+  /** Unity validation may have modified sibling fields. */
+  refreshObject?: boolean;
 }
 
 export interface UnityBoundPropertyApplyResult {
@@ -73,6 +91,7 @@ export interface UnityBoundPropertyApplyResult {
 }
 
 export interface UnityBoundPropertyWriteOptions {
+  coalesce?: boolean;
   label?: string;
   undoable?: boolean;
   beforeSnapshot?: InspectorPropertySnapshot | null;
@@ -88,6 +107,7 @@ export interface UnityBoundPropertyApplyOptions {
 }
 
 export interface UnityBoundPropertyRuntimeAdapter {
+  invalidate?(target?: UnitySerializedPropertyTarget): void;
   read(request: UnityBoundPropertyReadRequest): Promise<UnityBoundPropertyReadResult>;
   write(
     request: UnityBoundPropertyWriteRequest,
@@ -109,6 +129,8 @@ export interface UnityBoundPropertyRuntimeOptions {
 }
 
 export interface UnityBoundPropertyDrawOptions {
+  fieldPresentation?: InspectorFieldPresentationResolver;
+  onFieldAction?: (event: InspectorPropertyFieldAction) => void;
   propertyDrawers?: InspectorPropertyDrawerInput;
   disabled?: boolean;
   readonly?: boolean;
@@ -212,10 +234,7 @@ export class UnityBoundProperty {
   }
 
   async write(value: unknown, options: UnityBoundPropertyWriteOptions = {}) {
-    const result = await this.tree.writeProperty(this.raw, value, {
-      ...options,
-      refresh: options.refresh ?? true,
-    });
+    const result = await this.tree.writeProperty(this.raw, value, options);
     return result;
   }
 
@@ -242,6 +261,8 @@ export class UnityBoundProperty {
   draw(options: UnityBoundPropertyDrawOptions = {}): VNodeChild {
     return this.raw.draw({
       drawers: options.propertyDrawers,
+      fieldPresentation: options.fieldPresentation,
+      onFieldAction: options.onFieldAction,
       disabled: options.disabled,
       readonly: options.readonly,
       compact: options.compact,
@@ -267,8 +288,18 @@ export class UnityBoundPropertyTree {
   readonly adapter: UnityBoundPropertyRuntimeAdapter;
   readonly bindingId: string;
   readonly target: UnitySerializedPropertyTarget;
+  private readonly readTarget: UnitySerializedPropertyTarget;
   readonly options: UnityBoundPropertyRuntimeOptions;
-  private readonly state: { snapshots: InspectorPropertyTreeSnapshotInput | null; raw: PropertyTree };
+  dataVersion?: string;
+  dependencyObjectIds: string[] = [];
+  conservativeInvalidation = false;
+  private readonly state: { snapshots: InspectorPropertyTreeSnapshotInput | null; raw: PropertyTree; pending: number; error: string };
+  private editSequence = 0;
+  private readSequence = 0;
+  private readonly appliedSequences = new Map<string, number>();
+  private readonly drafts = new Map<string, { sequence: number; target: UnitySerializedPropertyTarget; snapshot: InspectorPropertySnapshot }>();
+  get pending() { return this.state.pending; }
+  get error() { return this.state.error; }
   get snapshots() { return this.state.snapshots; }
   get raw() { return this.state.raw; }
 
@@ -279,11 +310,21 @@ export class UnityBoundPropertyTree {
     options: UnityBoundPropertyRuntimeOptions = {},
   ) {
     this.adapter = adapter;
+    this.readTarget = { ...target };
     this.target = unityPropertyObjectTarget(target);
     this.bindingId = normalizeBindingId(this.target, options.idPrefix);
     this.options = options;
-    this.state = shallowReactive({ snapshots, raw: this.createTree(snapshots) });
+    this.state = shallowReactive({ snapshots, raw: this.createTree(snapshots), pending: 0, error: "" });
     markRaw(this);
+  }
+
+  dependsOn(objectIds: Set<string>) {
+    return this.conservativeInvalidation || this.dependencyObjectIds.some(id => objectIds.has(id)) ||
+      this.raw.properties.some(property => {
+        const snapshot = property.snapshot;
+        return !!snapshot.referenceTarget?.globalObjectId && objectIds.has(snapshot.referenceTarget.globalObjectId) ||
+          snapshot.attributes?.some(attribute => /(?:ShowIf|HideIf|ListDrawerSettings)Attribute$/.test(attribute.type ?? ""));
+      });
   }
 
   resolveProperty(property: InspectorProperty): InspectorProperty | null {
@@ -316,20 +357,71 @@ export class UnityBoundPropertyTree {
     return unityPropertyTargetWithPath(target, property.propertyPath);
   }
 
+  /** Merge one authoritative field without rereading unrelated objects. Object
+   * identity is part of the key: two components may have identical field paths. */
+  private patch(target: UnitySerializedPropertyTarget, value: InspectorPropertySnapshot): boolean {
+    const key = unityPropertyTargetKey(target);
+    let found = false;
+    const replace = (snapshot: InspectorPropertySnapshot, owner = this.target): InspectorPropertySnapshot => {
+      const current = snapshotTarget(snapshot) ?? owner;
+      if (unityPropertyTargetKey(unityPropertyTargetWithPath(current, snapshot.propertyPath)) === key) {
+        found = true;
+        return { ...snapshot, ...value, propertyPath: snapshot.propertyPath,
+          bindingTarget: snapshot.bindingTarget ?? value.bindingTarget };
+      }
+      if (!snapshot.children?.length) return snapshot;
+      const children = snapshot.children.map(child => replace(child, current));
+      return children.some((child, index) => child !== snapshot.children![index]) ? { ...snapshot, children } : snapshot;
+    };
+    const snapshots = Array.isArray(this.snapshots) ? this.snapshots.map(root => replace(root))
+      : this.snapshots ? replace(this.snapshots) : null;
+    if (found) { this.state.snapshots = snapshots; this.state.raw = this.createTree(snapshots); }
+    return found;
+  }
+
+  private restoreDrafts() {
+    for (const draft of this.drafts.values()) this.patch(draft.target, draft.snapshot);
+  }
+
+  /** Reconcile a sibling binding's receipt without losing this tree's drafts. */
+  reconcileReceipt(result: UnityBoundPropertyWriteResult) {
+    if (!result.target || result.ok === false) return;
+    if (this.patch(result.target, result)) {
+      ++this.editSequence;
+      this.restoreDrafts();
+    }
+  }
+
   async refresh() {
+    const read = ++this.readSequence;
+    const edit = this.editSequence;
+    // Revalidation must not collapse an already expanded array back to its
+    // initial eight-item page (and unmount a field being edited).
+    const initialBudget = this.options.maxArrayItems ?? 64;
+    let visibleBudget = initialBudget;
+    for (const property of this.raw.properties) if (property.isArray)
+      visibleBudget = Math.max(visibleBudget, Math.min(1024, property.children.length));
     const result = await this.adapter.read({
       bindingId: this.bindingId,
-      target: this.target,
+      target: this.readTarget,
+      force: true,
       maxDepth: this.options.maxDepth,
-      maxArrayItems: this.options.maxArrayItems,
+      maxArrayItems: visibleBudget > initialBudget ? visibleBudget : this.options.maxArrayItems,
     });
     if (result.ok === false) throw new Error(result.message || "Failed to read Unity properties.");
+    // A read dispatched before a newer edit must not revert that edit.
+    if (result.stale || read !== this.readSequence || edit !== this.editSequence) return this;
     this.state.snapshots = snapshotsFromReadResult(result);
+    this.dataVersion = result.dataVersion;
+    this.dependencyObjectIds = result.dependencyObjectIds ?? [];
+    this.conservativeInvalidation = result.conservativeInvalidation ?? false;
     this.state.raw = this.createTree(this.snapshots);
+    this.restoreDrafts();
     return this;
   }
 
   async loadChildren(property: InspectorProperty) {
+    const edit = this.editSequence;
     const target = this.targetForProperty(property);
     const arrayOffset = property.isArray ? property.children.length : 0;
     const result = await this.adapter.read({
@@ -339,6 +431,7 @@ export class UnityBoundPropertyTree {
       arrayOffset,
     });
     if (result.ok === false) throw new Error(result.message || "Failed to read Unity properties.");
+    if (result.stale || edit !== this.editSequence) return;
     if (property.isArray && result.arraySize !== property.arraySize) { await this.refresh(); return; }
     const loaded = arrayOffset ? { ...result, children: [...property.children.map((child) => child.snapshot), ...(result.children ?? [])], visibleChildCount: property.children.length + (result.children?.length ?? 0) } : result;
     const key = unityPropertyTargetKey(target);
@@ -367,35 +460,79 @@ export class UnityBoundPropertyTree {
     mode: UnityPropertyWriteMode = "commit",
   ) {
     const target = this.targetForProperty(commit.property);
+    const key = unityPropertyTargetKey(target);
+    const sequence = ++this.editSequence;
+    const scalar = isCoalesciblePropertyValue(commit.value) && commit.property.isLeaf;
+    if (scalar) {
+      const draft = { ...commit.snapshot, value: commit.value, displayValue: String(commit.value ?? "") };
+      this.drafts.set(key, { sequence, target, snapshot: draft });
+      this.patch(target, draft);
+    }
+    this.state.pending++;
+    this.state.error = "";
     let notified = false;
     const onApplied = async (applied: UnityBoundPropertyWriteResult) => {
+      // History replays remain authoritative. Superseded queued callers share
+      // the latest receipt but must not repeat its refresh/project callback.
+      const replay = notified;
       notified = true;
-      if (mode === "commit" && options.refresh !== false) await this.refresh();
+      if (!replay && sequence < (this.appliedSequences.get(key) ?? 0)) return;
+      if (applied.ok === false) throw new Error(applied.message || "Failed to write Unity property.");
+      ++this.editSequence;
+      this.appliedSequences.set(key, Math.max(sequence, this.appliedSequences.get(key) ?? 0));
+      if (this.drafts.get(key)?.sequence === sequence) {
+        this.drafts.delete(key);
+        this.state.error = "";
+      }
+      const matches = applied.propertyPath === commit.propertyPath;
+      const patched = matches && this.patch(target, applied);
+      this.restoreDrafts();
+      // Structural changes and validation side effects need an authoritative
+      // refresh. Scalar receipts already contain their actual/clamped value.
+      if (mode === "commit" && options.refresh !== false &&
+          (options.refresh === true || !scalar || !patched || applied.refreshObject)) await this.refresh();
       await options.onApplied?.(applied);
     };
-    const result = await this.adapter.write({
-      bindingId: this.bindingId,
-      target,
-      value: commit.value,
-      writeMode: mode,
-    }, {
-      ...options,
-      beforeSnapshot: options.beforeSnapshot ?? commit.snapshot,
-      onApplied,
-    });
-    if (!notified) await onApplied(result);
-    return result;
+    try {
+      const result = await this.adapter.write({
+        bindingId: this.bindingId, target, value: commit.value, writeMode: mode,
+      }, { ...options, beforeSnapshot: options.beforeSnapshot ?? commit.snapshot, onApplied });
+      if (!notified) await onApplied(result);
+      return result;
+    } catch (error) {
+      // Keep the newest draft available for correction/retry. Never roll it
+      // back because an earlier request failed.
+      this.state.error = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally { this.state.pending--; }
   }
 
   async apply(
     writes: UnityBoundPropertyApplyWrite[],
     options: UnityBoundPropertyApplyOptions = {},
   ) {
-    const result = await this.adapter.apply({ writes }, options);
-    if (options.refresh !== false) {
-      await this.refresh();
-    }
-    return result;
+    ++this.editSequence;
+    this.state.pending++;
+    let notified = false;
+    const onApplied = async (result: UnityBoundPropertyApplyResult) => {
+      ++this.editSequence;
+      notified = true;
+      let refresh = options.refresh === true || result.results.length !== writes.length;
+      for (let i = 0; i < result.results.length; i++) {
+        const receipt = result.results[i];
+        const target = receipt.target ?? writes[i]?.target;
+        if (!receipt.ok || !target || !this.patch(target, receipt)) refresh = true;
+        if (receipt.refreshObject || !isCoalesciblePropertyValue(writes[i]?.value)) refresh = true;
+      }
+      this.restoreDrafts();
+      if (refresh && options.refresh !== false) await this.refresh();
+      await options.onApplied?.(result);
+    };
+    try {
+      const result = await this.adapter.apply({ writes }, { ...options, onApplied });
+      if (!notified) await onApplied(result);
+      return result;
+    } finally { this.state.pending--; }
   }
 
   async undo() {
@@ -410,7 +547,8 @@ export class UnityBoundPropertyTree {
     if (this.raw.rootProperties.length > 1) {
       return h("div", { class: "unity-property-tree-roots" }, this.raw.rootProperties.map((property) =>
         h(UnitySerializedPropertyTree, {
-          source: this.bindingInput(property), propertyDrawers: options.propertyDrawers,
+          source: this.bindingInput(property), node: property, propertyDrawers: options.propertyDrawers,
+          fieldPresentation: options.fieldPresentation, onFieldAction: options.onFieldAction,
           disabled: options.disabled, readonly: options.readonly, compact: options.compact,
           onCommit: (event: UnitySerializedPropertyCommitEvent) => this.handleDrawEvent(event, options, "commit"),
           onPreview: (event: UnitySerializedPropertyCommitEvent) => this.handleDrawEvent(event, options, "preview"),
@@ -418,6 +556,8 @@ export class UnityBoundPropertyTree {
     }
     return h(UnitySerializedPropertyTree, {
       source: this.bindingInput(),
+      fieldPresentation: options.fieldPresentation,
+      onFieldAction: options.onFieldAction,
       propertyDrawers: options.propertyDrawers,
       disabled: options.disabled,
       readonly: options.readonly,
@@ -431,6 +571,9 @@ export class UnityBoundPropertyTree {
     if (property.children.length || property.isArray || property.isManagedReference || property.drawer.container) {
       return h(UnitySerializedPropertyTree, {
         source: this.bindingInput(property),
+        node: property,
+        fieldPresentation: options.fieldPresentation,
+        onFieldAction: options.onFieldAction,
         propertyDrawers: options.propertyDrawers,
         disabled: options.disabled,
         readonly: options.readonly,
@@ -441,20 +584,26 @@ export class UnityBoundPropertyTree {
       });
     }
 
-    return h(UnityPropertyEditor, {
+    const field = resolveInspectorFieldPresentation(property, options.fieldPresentation);
+    const access = propertyFieldAccess({ ...field,
+      readonly: field.readonly || options.readonly || property.state.readonly,
+      disabled: field.disabled || options.disabled || property.state.disabled });
+    if (!access.visible) return null;
+    const editor = h(UnityPropertyEditor, {
       modelValue: property.value,
       propertyType: propertyType(property),
       displayValue: property.displayValue,
       bindingTarget: this.targetForProperty(property),
       editable: property.editable,
-      disabled: options.disabled,
-      readonly: options.readonly,
+      disabled: access.disabled,
+      readonly: access.readonly,
       enumOptions: property.enumOptions,
       isFlagsEnum: property.isFlagsEnum,
       enumValueIndex: property.enumValueIndex,
       enumValueFlag: property.enumValueFlag,
       title: property.propertyPath,
       tooltip: property.tooltip,
+      unit: property.unit,
       hasRange: property.hasRange,
       rangeMin: property.rangeMin,
       rangeMax: property.rangeMax,
@@ -465,6 +614,7 @@ export class UnityBoundPropertyTree {
       referenceTypeFullName: property.referenceTypeFullName,
       referenceTypeAssembly: property.referenceTypeAssembly,
       onCommit: (value: unknown) => {
+        if (access.disabled || access.readonly) return;
         const commit = property.createCommit(value);
         const target = this.targetForProperty(property);
         options.onCommit?.(eventFromCommit(commit, target));
@@ -472,6 +622,7 @@ export class UnityBoundPropertyTree {
           .catch(warnUnityPropertyWriteFailure);
       },
       onPreview: (value: unknown) => {
+        if (access.disabled || access.readonly) return;
         const commit = property.createCommit(value);
         const target = this.targetForProperty(property);
         const event = eventFromCommit(commit, target);
@@ -481,6 +632,11 @@ export class UnityBoundPropertyTree {
           .catch(warnUnityPropertyWriteFailure);
       },
     });
+    if (!Object.keys(field).length) return editor;
+    return h(PropertyField, { ...field, label: property.label, fieldKey: field.fieldKey || `${this.bindingId}:${property.propertyPath}`,
+      showLabel: options.showLabel !== false, tooltip: property.tooltip, disabled: access.disabled, readonly: access.readonly,
+      onAction: (action: PropertyFieldAction) => options.onFieldAction?.({ action, property, propertyPath: property.propertyPath, snapshot: property.snapshot }),
+    }, { default: () => editor });
   }
 
   private createTree(snapshots: InspectorPropertyTreeSnapshotInput | null | undefined): PropertyTree {
@@ -521,6 +677,11 @@ export class UnityBoundPropertyTree {
       );
       return;
     }
+    const field = resolveInspectorFieldPresentation(property, options.fieldPresentation);
+    const access = propertyFieldAccess({ ...field,
+      readonly: field.readonly || options.readonly || property.state.readonly,
+      disabled: field.disabled || options.disabled || property.state.disabled });
+    if (!access.visible || access.readonly || access.disabled) return;
     const commit = property.createCommit(event.value);
     if (mode === "preview") {
       options.onPreview?.({ ...event, writeMode: "preview" });
@@ -535,6 +696,12 @@ export class UnityBoundPropertyTree {
 }
 
 export interface UnityPropertyRuntime {
+  /** Lazy component demand; retain/release is normally owned by PropertyField. */
+  bind(input: UnityPropertyPathInput, options?: UnityBoundPropertyRuntimeOptions): UnityPropertyResource;
+  observeDataVersion(version?: string, changes?: UnityPropertyDataChanges): void;
+  setActive(active: boolean): void;
+  invalidate(target?: UnitySerializedPropertyTarget): void;
+  dispose(): void;
   refreshTargets(target: UnitySerializedPropertyTarget): Promise<void>;
   parsePath(path: string): UnitySerializedPropertyTarget;
   objectTarget(input: UnityPropertyPathInput): UnitySerializedPropertyTarget;
@@ -569,7 +736,35 @@ export function createUnityPropertyRuntime(
   adapter: UnityBoundPropertyRuntimeAdapter,
 ): UnityPropertyRuntime {
   const trees = new Set<WeakRef<UnityBoundPropertyTree>>();
+  let disposed = false, hostActive = true;
+  function active() { if (disposed) throw new Error("Property runtime disposed."); }
+  const transport = adapter;
+  adapter = {
+    ...transport,
+    async write(request, options = {}) {
+      active();
+      let notified = false;
+      const onApplied = async (result: UnityBoundPropertyWriteResult) => {
+        notified = true; resources.reconcile(result); await options.onApplied?.(result);
+      };
+      const result = await transport.write(request, { ...options, onApplied });
+      if (!notified) await onApplied(result);
+      return result;
+    },
+    async apply(request, options = {}) {
+      active();
+      let notified = false;
+      const onApplied = async (result: UnityBoundPropertyApplyResult) => {
+        notified = true; result.results.forEach(receipt => resources.reconcile(receipt)); await options.onApplied?.(result);
+      };
+      const result = await transport.apply(request, { ...options, onApplied });
+      if (!notified) await onApplied(result);
+      return result;
+    },
+  };
   async function refreshTargets(target: UnitySerializedPropertyTarget) {
+    adapter.invalidate?.(target);
+    resources.invalidate(target);
     const jobs: Promise<unknown>[] = [];
     for (const reference of trees) {
       const tree = reference.deref();
@@ -586,6 +781,7 @@ export function createUnityPropertyRuntime(
     input: UnityPropertyPathInput,
     options: UnityBoundPropertyRuntimeOptions = {},
   ): Promise<UnityBoundPropertyTree> {
+    active();
     const target = resolveUnityPropertyTarget(input);
     const result = await adapter.read({
       bindingId: normalizeBindingId(unityPropertyObjectTarget(target), options.idPrefix),
@@ -600,6 +796,9 @@ export function createUnityPropertyRuntime(
       snapshotsFromReadResult(result),
       options,
     );
+    tree.dataVersion = result.dataVersion;
+    tree.dependencyObjectIds = result.dependencyObjectIds ?? [];
+    tree.conservativeInvalidation = result.conservativeInvalidation ?? false;
     trees.add(new WeakRef(tree));
     return tree;
   }
@@ -644,7 +843,15 @@ export function createUnityPropertyRuntime(
     return adapter.apply({ writes }, options);
   }
 
-  return {
+  const runtime: UnityPropertyRuntime = {
+    bind: (input, options) => resources.bind(input, options),
+    observeDataVersion: (version, changes) => resources.observeVersion(version, changes),
+    setActive: active => {
+      if (hostActive !== active) { hostActive = active; adapter.invalidate?.(); }
+      resources.setActive(active);
+    },
+    invalidate: target => { adapter.invalidate?.(target); resources.invalidate(target); },
+    dispose: () => { disposed = true; trees.clear(); resources.dispose(); },
     refreshTargets,
     parsePath: resolveUnityPropertyTarget,
     objectTarget: unityPropertyObjectTarget,
@@ -655,6 +862,8 @@ export function createUnityPropertyRuntime(
     readProperty,
     property: readProperty,
   };
+  const resources = createUnityPropertyResources(runtime);
+  return runtime;
 }
 
 export function unityBoundPropertySnapshots(

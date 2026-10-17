@@ -84,6 +84,7 @@ namespace Locus
             public string[] lines;
         }
 
+        [Serializable]
         public sealed class SerializedPropertyBindingTarget
         {
             public string globalObjectId;
@@ -221,6 +222,8 @@ namespace Locus
             public int index;
             public int toIndex;
             public int size;
+            public bool initialize;
+            public string[] values;
         }
 
         private sealed class SerializedManagedReferenceWriteCommand
@@ -1105,6 +1108,8 @@ namespace Locus
                 attributes = SerializedFieldAttributes(fieldInfo)
             };
 
+            if (!dynamicSchema) ApplyPropertyListPresentation(prop, snapshot, fieldInfo);
+
             bool compactValue = IsSerializedPropertyCompactValue(prop.propertyType);
             if (depth < maxDepth && !compactValue)
                 snapshot.children = SnapshotChildren(prop, depth, maxDepth, maxArrayItems, isArray, arraySize, dynamicSchema);
@@ -1275,7 +1280,20 @@ namespace Locus
             if (action == "insert" || action == "add")
             {
                 int index = ClampArrayIndex(command.index, prop.arraySize, true);
-                prop.InsertArrayElementAtIndex(index);
+                if (command.initialize) InsertInitializedListElement(prop, index);
+                else prop.InsertArrayElementAtIndex(index);
+                return;
+            }
+
+            if (action == "insertreferences")
+            {
+                InsertListReferences(prop, ClampArrayIndex(command.index, prop.arraySize, true), command.values);
+                return;
+            }
+
+            if (action == "duplicate")
+            {
+                DuplicateSerializedListElement(prop, command.index);
                 return;
             }
 
@@ -1732,42 +1750,52 @@ namespace Locus
             return type != null && type.IsEnum && Attribute.IsDefined(type, typeof(FlagsAttribute), false);
         }
 
-        private static string SerializedFieldTooltip(FieldInfo field)
+        private sealed class SerializedFieldMetadata
         {
-            TooltipAttribute attr = field != null
-                ? field.GetCustomAttribute<TooltipAttribute>(true)
-                : null;
-            return attr != null ? attr.tooltip ?? "" : "";
+            public string Tooltip = "", Header = "";
+            public bool HasRange, Multiline;
+            public float RangeMin, RangeMax;
+            public int MinLines, MaxLines;
+            public Attribute[] Declarations = new Attribute[0];
+            public bool HasDynamicListPresentation;
+            public SerializedPropertyAttributeInfo[] Attributes = new SerializedPropertyAttributeInfo[0];
+        }
+        private static readonly SerializedFieldMetadata EmptySerializedFieldMetadata = new SerializedFieldMetadata();
+        private static readonly Dictionary<FieldInfo, SerializedFieldMetadata> SerializedFieldMetadataCache = new Dictionary<FieldInfo, SerializedFieldMetadata>();
+
+        private static SerializedFieldMetadata SerializedFieldMetadataFor(FieldInfo field)
+        {
+            if (field == null) return EmptySerializedFieldMetadata;
+            SerializedFieldMetadata metadata;
+            if (SerializedFieldMetadataCache.TryGetValue(field, out metadata)) return metadata;
+            // Reflection/attribute construction is immutable within this AppDomain.
+            // Do it once per field, not once per value and once per attribute kind.
+            var attributes = field.GetCustomAttributes(true).OfType<Attribute>().ToArray();
+            var range = attributes.OfType<RangeAttribute>().FirstOrDefault();
+            var textArea = attributes.OfType<TextAreaAttribute>().FirstOrDefault();
+            var multiline = attributes.OfType<MultilineAttribute>().FirstOrDefault();
+            metadata = new SerializedFieldMetadata {
+                Tooltip = attributes.OfType<TooltipAttribute>().FirstOrDefault()?.tooltip ?? "",
+                Header = attributes.OfType<HeaderAttribute>().FirstOrDefault()?.header ?? "",
+                HasRange = range != null, RangeMin = range != null ? range.min : 0,
+                RangeMax = range != null ? range.max : 0, Multiline = textArea != null || multiline != null,
+                MinLines = textArea != null ? textArea.minLines : multiline != null ? multiline.lines : 0,
+                MaxLines = textArea != null ? textArea.maxLines : 0,
+                Declarations = attributes,
+                HasDynamicListPresentation = attributes.Any(a => a.GetType().FullName == "Sirenix.OdinInspector.ShowIfAttribute" ||
+                    a.GetType().FullName == "Sirenix.OdinInspector.HideIfAttribute" || a.GetType().FullName == "Sirenix.OdinInspector.ListDrawerSettingsAttribute"),
+                Attributes = attributes.Take(32).Select(SerializedFieldAttributeInfo).ToArray()
+            };
+            if (SerializedFieldMetadataCache.Count >= 8192) SerializedFieldMetadataCache.Clear();
+            SerializedFieldMetadataCache[field] = metadata;
+            return metadata;
         }
 
-        private static string SerializedFieldHeader(FieldInfo field)
-        {
-            HeaderAttribute attr = field != null
-                ? field.GetCustomAttribute<HeaderAttribute>(true)
-                : null;
-            return attr != null ? attr.header ?? "" : "";
-        }
-
-        private static bool HasSerializedFieldRange(FieldInfo field)
-        {
-            return field != null && field.GetCustomAttribute<RangeAttribute>(true) != null;
-        }
-
-        private static float SerializedFieldRangeMin(FieldInfo field)
-        {
-            RangeAttribute attr = field != null
-                ? field.GetCustomAttribute<RangeAttribute>(true)
-                : null;
-            return attr != null ? attr.min : 0f;
-        }
-
-        private static float SerializedFieldRangeMax(FieldInfo field)
-        {
-            RangeAttribute attr = field != null
-                ? field.GetCustomAttribute<RangeAttribute>(true)
-                : null;
-            return attr != null ? attr.max : 0f;
-        }
+        private static string SerializedFieldTooltip(FieldInfo field) => SerializedFieldMetadataFor(field).Tooltip;
+        private static string SerializedFieldHeader(FieldInfo field) => SerializedFieldMetadataFor(field).Header;
+        private static bool HasSerializedFieldRange(FieldInfo field) => SerializedFieldMetadataFor(field).HasRange;
+        private static float SerializedFieldRangeMin(FieldInfo field) => SerializedFieldMetadataFor(field).RangeMin;
+        private static float SerializedFieldRangeMax(FieldInfo field) => SerializedFieldMetadataFor(field).RangeMax;
 
         private static float SerializedFieldNumberStep(FieldInfo field, SerializedProperty prop)
         {
@@ -1776,44 +1804,10 @@ namespace Locus
             return 0f;
         }
 
-        private static bool IsSerializedFieldMultiline(FieldInfo field)
-        {
-            return field != null &&
-                   (field.GetCustomAttribute<TextAreaAttribute>(true) != null ||
-                    field.GetCustomAttribute<MultilineAttribute>(true) != null);
-        }
-
-        private static int SerializedFieldMinLines(FieldInfo field)
-        {
-            if (field == null)
-                return 0;
-            TextAreaAttribute textArea = field.GetCustomAttribute<TextAreaAttribute>(true);
-            if (textArea != null)
-                return textArea.minLines;
-            MultilineAttribute multiline = field.GetCustomAttribute<MultilineAttribute>(true);
-            return multiline != null ? multiline.lines : 0;
-        }
-
-        private static int SerializedFieldMaxLines(FieldInfo field)
-        {
-            if (field == null)
-                return 0;
-            TextAreaAttribute textArea = field.GetCustomAttribute<TextAreaAttribute>(true);
-            return textArea != null ? textArea.maxLines : 0;
-        }
-
-        private static SerializedPropertyAttributeInfo[] SerializedFieldAttributes(FieldInfo field)
-        {
-            if (field == null)
-                return new SerializedPropertyAttributeInfo[0];
-
-            return field
-                .GetCustomAttributes(true)
-                .OfType<Attribute>()
-                .Take(32)
-                .Select(SerializedFieldAttributeInfo)
-                .ToArray();
-        }
+        private static bool IsSerializedFieldMultiline(FieldInfo field) => SerializedFieldMetadataFor(field).Multiline;
+        private static int SerializedFieldMinLines(FieldInfo field) => SerializedFieldMetadataFor(field).MinLines;
+        private static int SerializedFieldMaxLines(FieldInfo field) => SerializedFieldMetadataFor(field).MaxLines;
+        private static SerializedPropertyAttributeInfo[] SerializedFieldAttributes(FieldInfo field) => SerializedFieldMetadataFor(field).Attributes;
 
         private static SerializedPropertyAttributeInfo SerializedFieldAttributeInfo(Attribute attr)
         {
@@ -1836,6 +1830,8 @@ namespace Locus
                 value = multiline.lines.ToString(CultureInfo.InvariantCulture);
             else if (min != null)
                 value = min.min.ToString(CultureInfo.InvariantCulture);
+            else
+                value = PropertyListAttributeValue(attr);
 
             Type type = attr.GetType();
             return new SerializedPropertyAttributeInfo

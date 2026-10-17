@@ -1,4 +1,9 @@
 import { h, type Component, type VNodeChild } from "vue";
+import PropertyField from "../components/property-field/PropertyField.vue";
+import {
+  propertyFieldAccess, propertyFieldActions, propertyFieldActionDisabled,
+  type PropertyFieldPresentation, type PropertyFieldAction,
+} from "../components/property-field/propertyField";
 
 export type InspectorDrawerKind =
   | "array"
@@ -84,6 +89,11 @@ export interface InspectorPropertySubassetEntry {
 }
 
 export interface InspectorPropertySnapshot {
+  /** Optional authoring metadata; absent metadata keeps legacy rendering unchanged. */
+  fieldPresentation?: PropertyFieldPresentation;
+  prefabOverride?: boolean;
+  isPrefabInstance?: boolean;
+  prefabSource?: string;
   restoreState?: string | null;
   propertyPath: string;
   semanticPath?: string;
@@ -118,6 +128,8 @@ export interface InspectorPropertySnapshot {
   managedReferenceDisplayName?: string;
   managedReferenceTypes?: InspectorManagedReferenceTypeOption[];
   tooltip?: string;
+  /** Display-only input suffix, supplied by the authoring adapter. */
+  unit?: string;
   header?: string;
   hasRange?: boolean;
   rangeMin?: number;
@@ -238,7 +250,47 @@ export type InspectorPropertyDrawerInput =
   | null
   | undefined;
 
+export type InspectorFieldPresentationResolver = (property: InspectorProperty) => PropertyFieldPresentation | null | undefined;
+
+export interface InspectorPropertyFieldAction {
+  action: PropertyFieldAction;
+  propertyPath: string;
+  property: InspectorProperty;
+  snapshot: InspectorPropertySnapshot;
+}
+
+/** Explicit business metadata takes precedence over native Prefab flags. Null suppresses native decoration. */
+export function resolveInspectorFieldPresentation(
+  property: InspectorProperty,
+  resolver?: InspectorFieldPresentationResolver,
+): PropertyFieldPresentation {
+  const explicit = resolver?.(property);
+  if (explicit !== undefined) return explicit ?? {};
+  if (property.snapshot.fieldPresentation) return property.snapshot.fieldPresentation;
+  const snapshot = property.snapshot;
+  const nativeSource = snapshot.isPrefabInstance === true && !!snapshot.prefabSource;
+  const hasOverriddenChildren = property.children.some(function hasOverride(child): boolean {
+    const resolved = resolver?.(child);
+    const authored = resolved === undefined ? child.snapshot.fieldPresentation : resolved;
+    if (authored && !propertyFieldAccess(authored).visible) return false;
+    const ownOverride = authored ? authored.provenance?.state === "overridden" || authored.provenance?.hasOverriddenChildren
+      : resolved !== null && child.snapshot.prefabOverride === true;
+    return !!ownOverride || child.children.some(hasOverride);
+  });
+  if (!snapshot.prefabOverride && !nativeSource && !hasOverriddenChildren) return {};
+  return {
+    scope: snapshot.prefabOverride || nativeSource ? "template-and-instance" : undefined,
+    provenance: {
+      state: snapshot.prefabOverride ? "overridden" : nativeSource ? "inherited" : "local",
+      sourceLabel: snapshot.prefabSource || undefined,
+      hasOverriddenChildren,
+    },
+  };
+}
+
 export interface InspectorPropertyDrawerOptions {
+  fieldPresentation?: InspectorFieldPresentationResolver;
+  onFieldAction?: (event: InspectorPropertyFieldAction) => void;
   drawer?: Component | null;
   drawers?: InspectorPropertyDrawerInput;
   disabled?: boolean;
@@ -262,6 +314,7 @@ export interface InspectorPropertyDrawerProps {
   fieldTypeFullName: string;
   fieldTypeAssembly: string;
   tooltip: string;
+  unit: string;
   header: string;
   hasRange: boolean;
   rangeMin: number;
@@ -451,6 +504,7 @@ export class InspectorProperty {
   readonly managedReferenceDisplayName: string;
   readonly managedReferenceTypes: InspectorManagedReferenceTypeOption[];
   readonly tooltip: string;
+  readonly unit: string;
   readonly header: string;
   readonly hasRange: boolean;
   readonly rangeMin: number;
@@ -516,6 +570,7 @@ export class InspectorProperty {
       this.managedReferenceDisplayName,
     );
     this.tooltip = init.snapshot.tooltip || "";
+    this.unit = init.snapshot.unit?.trim() || "";
     this.header = init.snapshot.header || "";
     this.hasRange = init.snapshot.hasRange === true;
     this.rangeMin = Number.isFinite(init.snapshot.rangeMin) ? Number(init.snapshot.rangeMin) : 0;
@@ -1006,6 +1061,7 @@ function normalizeSnapshot(
     fieldTypeFullName: source.fieldTypeFullName || "",
     fieldTypeAssembly: source.fieldTypeAssembly || "",
     tooltip: source.tooltip || "",
+    unit: source.unit?.trim() || "",
     header: source.header || "",
     hasRange: source.hasRange === true,
     rangeMin: Number.isFinite(source.rangeMin) ? Number(source.rangeMin) : 0,
@@ -1173,21 +1229,67 @@ function drawInspectorProperty(
   options: InspectorPropertyDrawerOptions,
   config: InspectorPropertyDrawerConfig,
 ): VNodeChild {
+  const field = resolveInspectorFieldPresentation(property, options.fieldPresentation);
+  const access = propertyFieldAccess({
+    ...field,
+    disabled: field.disabled || options.disabled || property.state.disabled,
+    // Non-editable container headers must not make their editable children read-only.
+    readonly: field.readonly || options.readonly,
+  });
+  if (!access.visible) return null;
+  const effectiveOptions = { ...options, disabled: access.disabled, readonly: access.readonly };
+  const content = () => drawInspectorPropertyContent(property, effectiveOptions, config);
+  if (!Object.keys(field).length) return content();
+  const chromeProps = {
+    ...field, label: property.label, fieldKey: field.fieldKey || `${config.context.targetId}:${property.propertyPath}`,
+    showLabel: false, tooltip: property.tooltip, disabled: access.disabled, readonly: access.readonly || property.state.readonly,
+    onAction: (action: PropertyFieldAction) => {
+      const current = resolveInspectorFieldPresentation(property, options.fieldPresentation);
+      const effective = { ...current, disabled: current.disabled || options.disabled || property.state.disabled,
+        readonly: current.readonly || options.readonly || property.state.readonly };
+      const allowed = propertyFieldActions(effective).find(item => item.id === action.id);
+      if (allowed && !propertyFieldActionDisabled(allowed, effective)) {
+        options.onFieldAction?.({ action: allowed, property, propertyPath: property.propertyPath, snapshot: property.snapshot });
+      }
+    },
+  };
+  if (property.children.length && !resolveInspectorPropertyDrawerComponent(property, effectiveOptions, config)) {
+    return h("div", { class: ["inspector-property-draw-group", options.compact ? "compact" : ""], "data-property-path": property.propertyPath }, [
+      h(PropertyField, chromeProps, { default: () => options.showLabel === false ? null : h("div", { class: "inspector-property-draw-header" }, [
+        h("span", { class: "inspector-property-draw-label" }, property.label),
+        h("span", { class: "inspector-property-draw-type" }, property.valueType),
+      ]) }),
+      h("div", { class: "inspector-property-draw-children" }, property.children.map(child => child.draw(childDrawOptions(effectiveOptions)))),
+    ]);
+  }
+  return h(PropertyField, chromeProps, { default: content });
+}
+
+function drawInspectorPropertyContent(
+  property: InspectorProperty,
+  options: InspectorPropertyDrawerOptions,
+  config: InspectorPropertyDrawerConfig,
+): VNodeChild {
   const component = resolveInspectorPropertyDrawerComponent(property, options, config);
   if (!component) return drawInspectorPropertyFallback(property, options);
 
-  const disabled = options.disabled ?? property.state.disabled;
-  const readonly = options.readonly ?? property.state.readonly;
+  const disabled = options.disabled || property.state.disabled;
+  const readonly = options.readonly || property.state.readonly;
   const compact = options.compact === true;
   const commit = (value: unknown, targetProperty = property) => {
-    const targetDisabled = options.disabled ?? targetProperty.state.disabled;
-    const targetReadonly = options.readonly ?? targetProperty.state.readonly;
-    if (targetDisabled || targetReadonly || !targetProperty.editable) return;
+    const targetDisabled = options.disabled || targetProperty.state.disabled;
+    const targetReadonly = options.readonly || targetProperty.state.readonly;
+    const targetField = resolveInspectorFieldPresentation(targetProperty, options.fieldPresentation);
+    const targetAccess = propertyFieldAccess(targetField);
+    if (targetDisabled || targetReadonly || !targetProperty.editable || !targetAccess.visible || targetAccess.readonly || targetAccess.disabled) return;
     options.onCommit?.(normalizeDrawCommit(targetProperty, value));
   };
   const drawOptions = childDrawOptions(options);
   const draw = (targetProperty = property, nextOptions: InspectorPropertyDrawerOptions = {}) =>
-    targetProperty.draw({ ...drawOptions, ...nextOptions });
+    targetProperty.draw({ ...drawOptions, ...nextOptions,
+      readonly: drawOptions.readonly || nextOptions.readonly,
+      disabled: drawOptions.disabled || nextOptions.disabled,
+    });
   const drawChild = (
     propertyOrPath: InspectorProperty | string,
     nextOptions: InspectorPropertyDrawerOptions = {},
@@ -1212,6 +1314,7 @@ function drawInspectorProperty(
     fieldTypeFullName: property.fieldTypeFullName,
     fieldTypeAssembly: property.fieldTypeAssembly,
     tooltip: property.tooltip,
+    unit: property.unit,
     header: property.header,
     hasRange: property.hasRange,
     rangeMin: property.rangeMin,
@@ -1531,6 +1634,8 @@ function drawInspectorPropertyFallback(
 
 function childDrawOptions(options: InspectorPropertyDrawerOptions): InspectorPropertyDrawerOptions {
   return {
+    fieldPresentation: options.fieldPresentation,
+    onFieldAction: options.onFieldAction,
     drawers: options.drawers,
     disabled: options.disabled,
     readonly: options.readonly,

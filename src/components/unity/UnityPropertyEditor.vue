@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import InputUnit from "../ui/InputUnit.vue";
 import UnityBoolField from "./UnityBoolField.vue";
 import UnityBoundsField from "./UnityBoundsField.vue";
 import UnityColorField from "./UnityColorField.vue";
@@ -38,6 +39,8 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   title?: string;
   ariaLabel?: string;
+  /** Display-only suffix; never changes parsing, scaling or the stored value. */
+  unit?: string;
   tooltip?: string;
   hasRange?: boolean;
   rangeMin?: number;
@@ -62,6 +65,7 @@ const props = withDefaults(defineProps<{
   placeholder: "",
   title: "",
   ariaLabel: "",
+  unit: "",
   tooltip: "",
   hasRange: false,
   rangeMin: 0,
@@ -199,6 +203,7 @@ function restoreTextOnEscape(event: KeyboardEvent) {
     />
     <UnityNumberField
       v-else-if="isUnityNumberPropertyType(propertyType)"
+      :unit="unit"
       :model-value="modelValue"
       :property-type="propertyType"
       :disabled="disabled"
@@ -216,6 +221,7 @@ function restoreTextOnEscape(event: KeyboardEvent) {
     />
     <UnityVectorField
       v-else-if="isUnityVectorPropertyType(propertyType)"
+      :unit="unit"
       :model-value="modelValue"
       :property-type="propertyType"
       :disabled="disabled"
@@ -251,6 +257,7 @@ function restoreTextOnEscape(event: KeyboardEvent) {
     />
     <UnityBoundsField
       v-else-if="isUnityBoundsPropertyType(propertyType)"
+      :unit="unit"
       :model-value="modelValue"
       :property-type="propertyType"
       :disabled="disabled"
@@ -327,10 +334,11 @@ function restoreTextOnEscape(event: KeyboardEvent) {
       @keydown.enter.prevent="blurOnEnter"
       @keydown.esc.prevent="restoreTextOnEscape"
     />
+    <InputUnit v-else :unit="unit" :disabled="disabled" :readonly="readonly" v-slot="{ unitId }">
     <input
-      v-else
       class="unity-text-field"
       type="text"
+      :aria-describedby="unitId"
       :value="text"
       :disabled="disabled"
       :readonly="readonly"
@@ -342,6 +350,7 @@ function restoreTextOnEscape(event: KeyboardEvent) {
       @keydown.enter.prevent="blurOnEnter"
       @keydown.esc.prevent="restoreTextOnEscape"
     />
+    </InputUnit>
   </div>
 </template>
 

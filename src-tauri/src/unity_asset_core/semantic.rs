@@ -324,6 +324,28 @@ impl SemanticAsset {
                             )?
                             .clone();
                     }
+                    "duplicate" => {
+                        let index = value["index"].as_u64()
+                            .and_then(|index| usize::try_from(index).ok())
+                            .ok_or("property.invalid_index: duplicate needs a non-negative index")?;
+                        let element = resolved.value.and_then(Value::as_array)
+                            .and_then(|items| items.get(index))
+                            .ok_or("property.invalid_index: duplicate source does not exist")?;
+                        fn contains_managed_reference(value: &Value) -> bool {
+                            match value {
+                                Value::Object(object) => managed_id(value).is_some()
+                                    || object.values().any(contains_managed_reference),
+                                Value::Array(items) => items.iter().any(contains_managed_reference),
+                                _ => false,
+                            }
+                        }
+                        if contains_managed_reference(element) {
+                            return Err("property.explicit_graph_required: managed references require an explicit graph copy".into());
+                        }
+                        operation["op"] = json!("array_insert");
+                        operation["index"] = json!(index + 1);
+                        operation["value"] = element.clone();
+                    }
                     "delete" => {
                         operation["op"] = json!("array_remove");
                         operation["index"] = value["index"].clone();

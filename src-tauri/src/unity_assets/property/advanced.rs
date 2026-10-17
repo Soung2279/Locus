@@ -60,7 +60,9 @@ pub(in crate::unity_assets) fn projection(
     Ok((
         text,
         dependencies,
-        context.graph.guids.into_iter().collect(),
+        context.schema.guid_index(root).into_iter()
+            .filter_map(|(guid, paths)| (paths.len() == 1).then(|| (guid, paths[0].clone())))
+            .collect(),
     ))
 }
 impl Context {
@@ -74,14 +76,8 @@ impl Context {
     ) -> Result<Self, String> {
         let mut graph = PrefabGraph::default();
         let mut schema = crate::unity_assets::schema::ProjectSchema::load(root)?;
-        let mut ambiguous_guids = BTreeSet::new();
-        for (guid, paths) in schema.guid_index(root) {
-            if paths.len() == 1 {
-                graph.guids.insert(guid, paths[0].clone());
-            } else {
-                ambiguous_guids.insert(guid);
-            }
-        }
+        // Resolve only consumed Prefab GUIDs. Copying the entire project's
+        // discovery index per scalar read dominated the warm request cost.
         let mut pending: VecDeque<_> = paths.into_iter().collect();
         let mut dependencies = BTreeMap::new();
         let mut path_aliases = BTreeMap::new();
@@ -114,16 +110,16 @@ impl Context {
                 let guid = instance.data["m_SourcePrefab"]["guid"]
                     .as_str()
                     .ok_or("property.prefab_source_missing")?;
-                if ambiguous_guids.contains(&guid.to_ascii_lowercase()) {
-                    return Err("property.ambiguous_guid".into());
+                let guid = guid.to_ascii_lowercase();
+                if !graph.guids.contains_key(&guid) {
+                    let candidates = schema.resolve_guid_paths(&guid)?;
+                    if candidates.len() > 1 { return Err("property.ambiguous_guid".into()); }
+                    let source = candidates.first().ok_or("property.prefab_guid_missing")?
+                        .strip_prefix(root).map_err(|_| "property.schema_scope")?
+                        .to_string_lossy().replace('\\', "/");
+                    graph.guids.insert(guid.clone(), source);
                 }
-                pending.push_back(
-                    graph
-                        .guids
-                        .get(&guid.to_ascii_lowercase())
-                        .ok_or("property.prefab_guid_missing")?
-                        .clone(),
-                );
+                pending.push_back(graph.guids[&guid].clone());
             }
             dependencies.insert(path.clone(), bytes);
             if let Some(bytes) = schema.indexed_meta(root, &path) {
@@ -143,6 +139,7 @@ impl Context {
                 );
             }
         }
+        schema.check_index()?;
         let mut schema_dependencies = BTreeSet::new();
         for (path, bytes) in schema.captured_sources() {
             let relative = path
@@ -352,7 +349,15 @@ pub(super) async fn execute(root: &Path, request: Value) -> Result<Value, String
     .await
     .map_err(|e| e.to_string())??;
     if request["action"] == "read_property" {
-        return Ok(results.remove(0));
+        let mut result = results.remove(0);
+        if request["profile"] == true {
+            result["profile"] = json!({"totalMs":started.elapsed().as_secs_f64()*1000.0,
+                "indexSource":context.schema.index_source,"indexLoadMs":context.schema.index_load_ms,
+                "fullProjectScans":if context.schema.index_source == "scan" {1} else {0},
+                "effectiveBuilds":context.effective_builds.get(),"treeBuilds":context.tree_builds.get(),
+                "readProjections":context.read_projections.get()});
+        }
+        return Ok(result);
     }
     let prepare_ms = started.elapsed().as_secs_f64() * 1000.0;
     let changed_files = candidates
@@ -410,7 +415,9 @@ pub(super) async fn execute(root: &Path, request: Value) -> Result<Value, String
     response
     };
     if request["profile"] == true {
-        response["profile"] = json!({"prepareMs":prepare_ms,"commitMs":commit_ms,"projectionMs":projection_started.elapsed().as_secs_f64()*1000.0,"totalMs":started.elapsed().as_secs_f64()*1000.0,
+        response["profile"] = json!({"indexSource":context.schema.index_source,"indexLoadMs":context.schema.index_load_ms,
+            "fullProjectScans":if context.schema.index_source == "scan" {1} else {0},
+            "prepareMs":prepare_ms,"commitMs":commit_ms,"projectionMs":projection_started.elapsed().as_secs_f64()*1000.0,"totalMs":started.elapsed().as_secs_f64()*1000.0,
         "effectiveBuilds":context.effective_builds.get(),"treeBuilds":context.tree_builds.get(),"readProjections":context.read_projections.get(),"materializedCompilePasses":context.materialized_passes,"overrideValidationPasses":context.validation_passes,"changedFiles":changed_files,"editor":committed.get("editorTimings")});
     }
     Ok(response)

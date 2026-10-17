@@ -30,7 +30,7 @@ describe("Unity embedded window setting", () => {
     expect(bridge).toContain("UnityEmbed.disabled");
     expect(bridge).toContain("sync_unity_embed_enabled_marker");
     expect(unityWindow).toContain("RefreshEmbedFeatureState(false)");
-    expect(unityWindow).toContain("if (!_frontendWindowConfigured || !_embedFeatureEnabled)");
+    expect(unityWindow).toContain("if (_closing || !_frontendWindowConfigured || !_embedFeatureEnabled)");
     expect(unityWindow.indexOf("RefreshEmbedFeatureState(false)")).toBeLessThan(
       unityWindow.indexOf("SendOpenOrUpdate(false)", unityWindow.indexOf("private void SyncOverlay")),
     );

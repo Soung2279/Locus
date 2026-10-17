@@ -118,7 +118,9 @@ fn apply_webview_client_bounds(
 }
 
 pub fn sync_after_page_load(webview: &tauri::Webview) -> Result<(), String> {
-    if webview.label() != MAIN_WINDOW_LABEL {
+    if webview.label() != MAIN_WINDOW_LABEL
+        && !crate::workspace_window::is_workspace_window(webview.label())
+    {
         return Ok(());
     }
     let client_size = webview.window().inner_size().map_err(|error| {

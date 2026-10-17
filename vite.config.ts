@@ -36,6 +36,7 @@ export default defineConfig(async () => ({
         // and service graph entirely.
         main: path.resolve(import.meta.dirname, "index.html"),
         window: path.resolve(import.meta.dirname, "window.html"),
+        unityView: path.resolve(import.meta.dirname, "unity-view.html"),
       },
       output: {
         manualChunks(id) {

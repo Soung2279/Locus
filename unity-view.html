@@ -1,0 +1,4 @@
+<!doctype html>
+<html><head><meta charset="UTF-8"><title>Locus View</title><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<script>window.addEventListener('error',e=>window.chrome?.webview?.postMessage(JSON.stringify({type:'host-error',message:e.message})));window.addEventListener('unhandledrejection',e=>{if(e.reason?.name!=='AbortError')window.chrome?.webview?.postMessage(JSON.stringify({type:'host-error',message:String(e.reason?.message||e.reason)}));});</script>
+</head><body><div id="app"></div><script type="module" src="/src/unity-view-main.ts"></script></body></html>

@@ -9,7 +9,7 @@ import {
 } from "./workspaceEventHub";
 import type { RoutedWorkspaceEvent } from "./project";
 
-export type LocusRuntimeKind = "tauri" | "browser";
+export type LocusRuntimeKind = "tauri" | "browser" | "unity";
 export type RuntimeUnsubscribe = () => void;
 
 export interface LocusRuntimeInvokeActivity {
@@ -25,7 +25,7 @@ export type LocusRuntimeInvokeActivityListener = (
 
 export interface LocusRuntime {
   kind: LocusRuntimeKind;
-  invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
+  invoke<T>(command: string, args?: Record<string, unknown>, signal?: AbortSignal): Promise<T>;
   subscribe<T>(
     eventName: string,
     handler: (payload: T) => unknown,
@@ -34,6 +34,21 @@ export interface LocusRuntime {
 }
 
 const invokeActivityListeners = new Set<LocusRuntimeInvokeActivityListener>();
+let installedRuntime: LocusRuntime | null = null;
+let invocationSignal: AbortSignal | undefined;
+/** Scope the immediate service invocation; the transport owns the signal
+ * after dispatch. Never hold ambient state across an asynchronous boundary. */
+export function withLocusInvocationSignal<T>(signal: AbortSignal, dispatch: () => T): T {
+  const previous = invocationSignal;
+  invocationSignal = signal;
+  try { return dispatch(); } finally { invocationSignal = previous; }
+}
+/** A native host supplies transport without impersonating Tauri internals. */
+export function installLocusRuntime(runtime: LocusRuntime): () => void {
+  if (installedRuntime) throw new Error("A Locus host runtime is already installed.");
+  installedRuntime = runtime;
+  return () => { if (installedRuntime === runtime) installedRuntime = null; };
+}
 let nextInvokeActivityId = 1;
 
 function publishInvokeActivity(activity: LocusRuntimeInvokeActivity): void {
@@ -99,6 +114,7 @@ export function invokeLocusRuntime<T>(
   command: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
+  if (installedRuntime) return installedRuntime.invoke<T>(command, args, invocationSignal);
   return invokeRuntime<T>(resolveRuntimeKind(), command, args);
 }
 
@@ -127,6 +143,12 @@ function resolveRuntimeKind(): LocusRuntimeKind {
 }
 
 export function getLocusRuntime(): LocusRuntime {
+  if (installedRuntime) {
+    const runtime = installedRuntime;
+    return { ...runtime, invoke<T>(command: string, args?: Record<string, unknown>, signal?: AbortSignal) {
+      return runtime.invoke<T>(command, args, signal ?? invocationSignal);
+    } };
+  }
   const kind = resolveRuntimeKind();
 
   return {

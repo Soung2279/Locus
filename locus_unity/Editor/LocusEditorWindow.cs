@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -88,9 +89,18 @@ namespace Locus
         private double _resizeBoostUntil;
         private volatile bool _sendInFlight;
         private volatile bool _sentOpen;
+        private bool _closing;
+        private bool _nativeParked;
         private volatile int _failedSends;
-        private string _statusMessage = "Waiting for Locus desktop.";
+        private string _statusMessage = "正在连接 Locus…";
+        private string _webViewState = "loading", _webViewError;
+        private bool _showConnectionDetails;
+        private double _nextStatusAt;
+        private volatile bool _statusInFlight;
+        private string _pendingStatus;
+        [Serializable] private sealed class WebViewStatus { public string state, error; }
         private bool _hasScreenRect;
+        private float _pixelsPerPoint = 1;
         private int _screenX;
         private int _screenY;
         private int _screenWidth;
@@ -503,6 +513,8 @@ namespace Locus
 
         private void BeginControlEpoch()
         {
+            _closing = false;
+            _nativeParked = false;
             _instanceId = Guid.NewGuid().ToString("N");
             _controlRevision = 0;
             _sentOpen = false;
@@ -678,6 +690,7 @@ namespace Locus
             RefreshDesktopState(false);
             SendOpenOrUpdate(false);
             SendAssetDragState(false);
+            RefreshWebViewStatus(now);
 
             if (_failedSends > 0 || ShouldShowStartButton() || _desktopLaunchInFlight)
                 Repaint();
@@ -685,7 +698,7 @@ namespace Locus
 
         private void SendOpenOrUpdate(bool force)
         {
-            if (!_frontendWindowConfigured || !_embedFeatureEnabled)
+            if (_closing || !_frontendWindowConfigured || !_embedFeatureEnabled)
                 return;
             if (_sendInFlight && !force)
                 return;
@@ -698,11 +711,132 @@ namespace Locus
             SendControlMessage(message, false);
         }
 
+        private void RefreshWebViewStatus(double now)
+        {
+            string pending = System.Threading.Interlocked.Exchange(ref _pendingStatus, null);
+            if (pending != null)
+            {
+                var status = JsonUtility.FromJson<WebViewStatus>(pending);
+                bool changed = _webViewState != status.state || _webViewError != status.error;
+                _webViewState = status.state;
+                _webViewError = status.error;
+                switch (status.state)
+                {
+                    case "ready": _statusMessage = ""; break;
+                    case "capacity": _statusMessage = "已打开 4 个 Locus 窗口，关闭一个后自动继续。"; break;
+                    case "disconnected": _statusMessage = "Locus 连接已断开"; break;
+                    case "error":
+                        _statusMessage = status.error == "host-recovering" ? "正在恢复 Locus…"
+                            : status.error == "host-restart-required" ? "请重启 Locus 后重新连接"
+                            : status.error == "load-timeout" ? "打开超时，请重试"
+                            : status.error == "recovery-exhausted" ? "恢复失败，请重试"
+                            : "无法显示 Locus，请重试";
+                        break;
+                    default: _statusMessage = "正在打开 Locus…"; break;
+                }
+                if (changed) Repaint();
+            }
+            if (_closing || _statusInFlight || now < _nextStatusAt) return;
+            _nextStatusAt = now + (_webViewState == "ready" ? 3 : 1);
+            string instance = _instanceId;
+            string pipeName = GetControlPipeName();
+            byte[] line = Encoding.UTF8.GetBytes(JsonUtility.ToJson(BuildMessage("status", false)) + "\n");
+            _statusInFlight = true;
+            Task.Run(async () =>
+            {
+                string reply;
+                try
+                {
+                    using (var timeout = new System.Threading.CancellationTokenSource(800))
+                    using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+                    {
+                        await pipe.ConnectAsync(200, timeout.Token).ConfigureAwait(false);
+                        await pipe.WriteAsync(line, 0, line.Length, timeout.Token).ConfigureAwait(false);
+                        byte[] buffer = new byte[8192]; int used = 0;
+                        while (used < buffer.Length)
+                        {
+                            int count = await pipe.ReadAsync(buffer, used, buffer.Length - used, timeout.Token).ConfigureAwait(false);
+                            if (count == 0) throw new IOException("Connection closed");
+                            used += count;
+                            if (buffer[used - 1] == 10) break;
+                        }
+                        if (used == buffer.Length) throw new IOException("Invalid status reply");
+                        reply = Encoding.UTF8.GetString(buffer, 0, used);
+                    }
+                }
+                catch { reply = "{\"state\":\"disconnected\"}"; }
+                if (!_closing && instance == _instanceId) System.Threading.Interlocked.Exchange(ref _pendingStatus, reply);
+                _statusInFlight = false;
+            });
+        }
+
+        private void RetryWebView()
+        {
+            _statusMessage = "正在连接 Locus…";
+            _webViewState = "loading";
+            _webViewError = null;
+            _nextStatusAt = 0;
+            _nextHeartbeatAt = 0;
+            SendControlMessage(BuildMessage("retry", true), true);
+        }
+
         private void SendClose(string reason)
         {
+            _closing = true;
+            ParkNativeWebViewBeforeClose();
             EmbedControlMessage message = BuildMessage("close", false, reason);
             SendControlMessage(message, true);
             _sentOpen = false;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeParkWindowMessage
+        {
+            public IntPtr hwnd;
+            public uint message;
+            public UIntPtr wParam;
+            public IntPtr lParam;
+            public uint time;
+            public int x, y;
+            public uint reserved;
+        }
+        [DllImport("user32.dll", EntryPoint = "PeekMessageW")]
+        private static extern bool PeekNativeParkMessage(out NativeParkWindowMessage message, IntPtr hwnd, uint min, uint max, uint remove);
+
+        private void ParkNativeWebViewBeforeClose()
+        {
+            if (_nativeParked || !LocusWebViewNative.Supported || (!_sentOpen && !_hasLastSent)) return;
+            _nativeParked = true;
+            // This is a lifetime barrier, not a rendering loop. Unity must keep
+            // its HWND alive until WebView2 has moved to the Locus parking parent.
+            byte[] line = Encoding.UTF8.GetBytes(JsonUtility.ToJson(BuildMessage("park", false)) + "\n");
+            string pipeName = GetControlPipeName();
+            using (var timeout = new System.Threading.CancellationTokenSource(200))
+            using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+            {
+                var parked = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await pipe.ConnectAsync(100, timeout.Token).ConfigureAwait(false);
+                        await pipe.WriteAsync(line, 0, line.Length, timeout.Token).ConfigureAwait(false);
+                        await pipe.FlushAsync(timeout.Token).ConfigureAwait(false);
+                        byte[] reply = new byte[1];
+                        return await pipe.ReadAsync(reply, 0, 1, timeout.Token).ConfigureAwait(false) == 1 && reply[0] == 1;
+                    }
+                    catch { return false; }
+                });
+                var elapsed = Stopwatch.StartNew();
+                while (!parked.IsCompleted && elapsed.ElapsedMilliseconds < 250)
+                {
+                    // SDK parenting can send synchronous messages back to this
+                    // UI thread. Peek pumps sent messages; it does not dispatch
+                    // queued input, Editor updates, or arbitrary managed work.
+                    NativeParkWindowMessage ignored;
+                    PeekNativeParkMessage(out ignored, IntPtr.Zero, 0, 0, 0);
+                    System.Threading.Thread.Sleep(1);
+                }
+            }
         }
 
         private void SendAssetDrop(DroppedAssetRef[] assetRefs)
@@ -878,7 +1012,8 @@ namespace Locus
             bool messageVisible = visible
                 && _screenWidth > 12
                 && _screenHeight > 12
-                && selectedDockTab;
+                && selectedDockTab
+                && !LocusWebViewNative.HasBlockingPopup(this, position);
             long parentHwnd = _lastSentParentHwnd;
             double now = EditorApplication.timeSinceStartup;
             bool forceHostProbe = !_hasLastSent
@@ -887,13 +1022,7 @@ namespace Locus
                     && now >= _nextHostWindowProbeAt);
             if (!_hasLastSent || selectedDockTab)
             {
-                parentHwnd = GetUnityHostHwnd(
-                    _screenX,
-                    _screenY,
-                    _screenWidth,
-                    _screenHeight,
-                    _lastSentParentHwnd,
-                    forceHostProbe);
+                parentHwnd = LocusWebViewNative.Supported ? LocusWebViewNative.FindOwner(this).ToInt64() : 0;
                 if (forceHostProbe)
                     _nextHostWindowProbeAt = now + HostWindowProbeIntervalSeconds;
             }
@@ -1222,6 +1351,7 @@ namespace Locus
 
         private void UpdateScreenRectFromGUI()
         {
+            _pixelsPerPoint = EditorGUIUtility.pixelsPerPoint;
             Vector2 topLeft = GUIUtility.GUIToScreenPoint(Vector2.zero);
             Vector2 bottomRight = GUIUtility.GUIToScreenPoint(new Vector2(
                 position.width,
@@ -1238,7 +1368,7 @@ namespace Locus
 
         private void StoreScreenRect(Vector2 topLeft, Vector2 bottomRight)
         {
-            float scale = EditorGUIUtility.pixelsPerPoint;
+            float scale = _pixelsPerPoint;
             int nextX = Mathf.RoundToInt(topLeft.x * scale);
             int nextY = Mathf.RoundToInt(topLeft.y * scale);
             int nextWidth = Mathf.Max(1, Mathf.RoundToInt((bottomRight.x - topLeft.x) * scale));
@@ -1294,7 +1424,6 @@ namespace Locus
                         _sentOpen = true;
                         RecordLastSent(message);
                         _failedSends = 0;
-                        _statusMessage = "Overlay signal sent.";
                     }
                     else if (isAssetDropMessage)
                     {
@@ -1309,9 +1438,8 @@ namespace Locus
                     {
                         int failures = _failedSends + 1;
                         _failedSends = failures;
-                        _statusMessage = failures <= 1
-                            ? "Waiting for Locus desktop."
-                            : "Waiting for Locus desktop: " + ex.Message;
+                        _statusMessage = "正在连接 Locus…";
+                        _webViewError = ex.Message;
                     }
                 }
                 finally
@@ -1405,37 +1533,10 @@ namespace Locus
                 Mathf.Max(0f, rect.width - 28f),
                 rect.height - 38f);
             Rect statusRect = new Rect(inner.x, titleRect.yMax + 8f, inner.width, 34f);
-            Rect pipeRect = new Rect(inner.x, statusRect.yMax + 10f, inner.width, 18f);
-            GUIStyle executablePathStyle = new GUIStyle(EditorStyles.miniLabel)
-            {
-                wordWrap = true,
-                clipping = TextClipping.Clip
-            };
-            string executablePathText = GetDesktopExecutablePathText();
-            float executablePathHeight = string.IsNullOrEmpty(executablePathText)
-                ? 0f
-                : Mathf.Max(
-                    18f,
-                    executablePathStyle.CalcHeight(new GUIContent(executablePathText), inner.width));
-            Rect executablePathRect = new Rect(
-                inner.x,
-                pipeRect.yMax + 8f,
-                inner.width,
-                executablePathHeight);
-            float buttonY = string.IsNullOrEmpty(executablePathText)
-                ? pipeRect.yMax + 12f
-                : executablePathRect.yMax + 10f;
-            Rect buttonRect = new Rect(
-                inner.x,
-                buttonY,
-                Mathf.Min(116f, inner.width),
-                24f);
+            Rect buttonRect = new Rect(inner.x, statusRect.yMax + 8f, Mathf.Min(116f, inner.width), 24f);
 
             GUI.Label(titleRect, _windowTitle, EditorStyles.boldLabel);
             GUI.Label(statusRect, _statusMessage, EditorStyles.wordWrappedLabel);
-            EditorGUI.SelectableLabel(pipeRect, GetFullControlPipeName(), EditorStyles.miniLabel);
-            if (!string.IsNullOrEmpty(executablePathText))
-                EditorGUI.SelectableLabel(executablePathRect, executablePathText, executablePathStyle);
 
             if (ShouldShowStartButton())
             {
@@ -1443,6 +1544,20 @@ namespace Locus
                 {
                     if (GUI.Button(buttonRect, _desktopLaunchInFlight ? "启动中..." : "启动 Locus"))
                         StartLocusDesktop();
+                }
+            }
+            else if (_webViewState == "disconnected" || (_webViewState == "error" && _webViewError != "host-recovering" && _webViewError != "host-restart-required"))
+            {
+                if (GUI.Button(buttonRect, "重新连接")) RetryWebView();
+            }
+            if (_webViewState != "ready")
+            {
+                var detailsRect = new Rect(inner.x, buttonRect.yMax + 10f, inner.width, 18f);
+                _showConnectionDetails = EditorGUI.Foldout(detailsRect, _showConnectionDetails, "连接详情", true);
+                if (_showConnectionDetails)
+                {
+                    string details = GetFullControlPipeName() + "\n" + GetDesktopExecutablePathText() + "\n" + _webViewError;
+                    EditorGUI.SelectableLabel(new Rect(inner.x, detailsRect.yMax + 4f, inner.width, Mathf.Max(30f, rect.height - detailsRect.yMax - 12f)), details, EditorStyles.wordWrappedMiniLabel);
                 }
             }
         }
@@ -1464,7 +1579,7 @@ namespace Locus
 
             // While the overlay pipe link is healthy, Locus desktop must be the
             // connected pipe server, so the registry and process probes can be skipped.
-            if (_sentOpen && _failedSends == 0)
+            if (_sentOpen && _failedSends == 0 && _webViewState != "disconnected")
             {
                 _desktopProcessRunning = true;
                 return;

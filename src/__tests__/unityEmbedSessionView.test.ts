@@ -17,7 +17,7 @@ describe("Unity embedded session view", () => {
     const runtime = read("src/services/locusRuntime.ts");
 
     expect(command).toContain(String.raw`const CONTROL_PIPE_NAME_PREFIX: &str = r"\\.\pipe\locus_tauri_unity_embed_";`);
-    expect(command).toContain('const EMBED_URL: &str = "/unity-embed?host=tauri-overlay";');
+    expect(command).toContain('const EMBED_URL: &str = "/unity-embed?host=webview";');
     expect(app).toContain("const UnityEmbeddedSessionView = defineAsyncComponent");
     expect(app).toContain("isUnityEmbedWindow");
     expect(app).toContain("<UnityEmbeddedSessionView");
@@ -45,8 +45,8 @@ describe("Unity embedded session view", () => {
     expect(workspace).toContain("<WorkspaceTree");
     expect(view).not.toContain("useEmbeddedChatSession");
     expect(view).not.toContain("<EmbeddedChatPane");
-    expect(runtime).toContain('export type LocusRuntimeKind = "tauri" | "browser";');
-    expect(runtime).not.toContain('"unity"');
+    // Native View controls install a separate transport; the desktop overlay
+    // must still avoid inventing a Tauri-compatible global bridge.
     expect(runtime).not.toContain("locusUnityBridge");
     expect(runtime).not.toContain("EventSource");
     expect(runtime).not.toContain("fetch(");
@@ -127,7 +127,7 @@ describe("Unity embedded session view", () => {
     expect(app).toContain(".on_window_event(|window, event|");
     expect(app).toContain("WindowEvent::CloseRequested");
     expect(app).toContain("api.prevent_close();");
-    expect(app).toContain("window.emit(MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ())");
+    expect(app).toContain("emit_to(window.label(), MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ())");
     expect(app).toContain("commands::request_app_exit");
     expect(system).toContain("pub async fn request_app_exit(app_handle: AppHandle)");
     expect(system).toContain("crate::commands::destroy_unity_embed_control_window_on_main(&app_handle);");
@@ -187,7 +187,7 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("fn should_ignore_stale_control_message");
     expect(command).toContain("if should_ignore_stale_control_message(&label, &msg)");
     expect(command).toContain("UnityEmbedControlRevisionState");
-    expect(command).toContain('msg.kind != "open"');
+    expect(command).toContain("control_revision::should_ignore");
     expect(command).toContain("schedule_transient_close_destroy(app_handle, label);");
     expect(command).toContain("cancel_transient_close_destroy(&label);");
   });
@@ -201,10 +201,10 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("run_on_main_thread");
     expect(command).toContain("UNITY_EMBED_QUIESCE_TIMEOUT");
     expect(command).toContain("fn quiesce_unity_embed_control_windows_on_main");
-    expect(command).toContain("windows_impl::quiesce_owned_overlay(&window)");
-    expect(command).toContain("SetParent(child, None)");
-    expect(command).toContain("SetWindowLongPtrW(child, GWLP_HWNDPARENT, 0)");
-    expect(command).toContain("let _ = ShowWindow(child, SW_HIDE);");
+    expect(command).toContain("crate::unity_embed_webview::park(label)");
+    const native = read("src-tauri/src/unity_embed_webview.rs");
+    expect(native).toContain("controller.SetParentWindow(parking)");
+    expect(command).not.toContain("SetParent(");
     expect(command).toContain("record_embed_windows_quiesced(&scope_key, &labels);");
     expect(command).toContain("received_while_quiesced");
     expect(command).toContain("current_quiesce.1 != expected_epoch");
@@ -222,109 +222,30 @@ describe("Unity embedded session view", () => {
     expect(releaseCall).toBeGreaterThan(installCall);
   });
 
-  it("suppresses Windows mouse activation for the embedded overlay outside the composer", () => {
-    const view = read("src/components/UnityEmbeddedSessionView.vue");
-    const service = read("src/services/unity.ts");
+  it("uses native WebView input without overlay activation patches", () => {
+    const host = read("src/components/UnityNativeEmbedHost.vue");
+    const native = read("src-tauri/src/unity_embed_webview.rs");
     const command = read("src-tauri/src/commands/unity_embed.rs");
-    const app = read("src-tauri/src/lib.rs");
-
-    expect(view).toContain("ACTIVATION_ALLOWED_SELECTOR");
-    expect(view).toContain(".chat-composer-input");
-    expect(view).not.toContain("\".chat-input-shell\",");
-    expect(view).not.toContain("\".chat-composer\",");
-    expect(view).toContain("applyMouseActivationSuppressed(true)");
-    expect(service).toContain("setUnityEmbedMouseActivationSuppressed");
-    expect(service).toContain("unity_embed_set_mouse_activation_suppressed");
-    expect(service).toContain("activateUnityEmbedForInput");
-    expect(service).toContain("unity_embed_activate_for_input");
-    expect(service).toContain("getUnityEmbedFocusDebugSnapshot");
-    expect(service).toContain("unity_embed_focus_debug_snapshot");
-    expect(service).toContain("mouseActivateHookInstalled");
-    expect(service).toContain("mouseActivateHookedHwndCount");
-    expect(service).toContain("mouseActivateBlockCount");
-    expect(service).toContain("overlayChildWindow");
-    expect(service).toContain("activationGuardEnabled");
-    expect(command).toContain("MouseActivationState");
-    expect(command).toContain("guard_enabled");
-    expect(command).toContain("const USE_CHILD_EMBED_OVERLAY: bool = true;");
-    expect(command).toContain("PopupSyncMode::Intentional");
-    expect(command).toContain("PopupSyncMode::Recoverable");
-    expect(command).toContain("OverlayMountOutcome::DeferredParent");
-    expect(command).toContain("transient_unity_embed_parent_owner");
-    expect(command).toContain("position_transient_parent_overlay");
-    expect(command).toContain("position_popup_overlay_with_owner");
-    expect(command).toContain('hwnd_class(parent) != "UnityContainerWndClass"');
-    expect(command).toContain('title != "Locus" && title != expected_title');
-    expect(command).toContain("GetWindowLongPtrW(child, GWLP_HWNDPARENT) != owner_hwnd");
-    expect(command).toContain("SetWindowLongPtrW(child, GWLP_HWNDPARENT, owner_hwnd)");
-    expect(command).toContain("let reparent_from_popup = (current_style & WS_CHILD.0) == 0;");
-    expect(command).toContain("let needs_parent_update = current_parent != parent || reparent_from_popup;");
-    expect(command).toContain("position_child_overlay");
-    expect(command).toContain("ScreenToClient");
-    expect(command).toContain("ClientToScreen(parent, &mut parent_origin)");
-    expect(command).toContain("let child_matches = if needs_style_update || needs_parent_update");
-    expect(command).toContain("if !child_matches");
-    expect(command).toContain("SetParent");
-    expect(command).toContain("SetWindowSubclass");
-    expect(command).toContain("RemoveWindowSubclass");
-    expect(command).toContain("WM_MOUSEACTIVATE");
-    expect(command).toContain("MA_NOACTIVATE");
-    expect(command).toContain("WS_EX_NOACTIVATE");
-    expect(command).toContain("set_window_visible_no_activate");
-    expect(command).toContain("SW_SHOWNOACTIVATE");
-    expect(command).toContain("SW_HIDE");
-    expect(command).toContain("let desired_visible = should_show_window_now(&window, &msg);");
-    expect(command).toContain("needs_visibility_apply(&label, desired_visible)");
-    expect(command).toContain("record_applied_visibility(&label, desired_visible)");
-    expect(command).toContain("collect_descendant_windows");
-    expect(command).toContain("GW_CHILD");
-    expect(command).toContain("mouse_hook_sync_loop");
-    expect(command).toContain("reconcile_mouse_activate_hooks");
-    expect(command).toContain("current_hwnds.difference(&previous_hwnds)");
-    expect(command).toContain("activate_for_input");
-    expect(command).toContain("focus_embed_window_for_input");
-    expect(command).toContain("AttachThreadInput");
-    expect(command).toContain("SetKeyboardFocus");
-    expect(command).toContain("COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC");
-    expect(command).toContain("controller.MoveFocus");
-    expect(command).toContain("MOUSE_HOOK_ROOT_COUNT");
-    expect(command).toContain("mouse_hook_sync_notify().notified()");
-    expect(command).toContain("mouse_activate_hook_installed");
-    expect(command).toContain("mouse_activate_hooked_hwnd_count");
-    expect(command).toContain("mouse_activate_block_count");
-    expect(command).toContain("activation_guard_enabled");
-    expect(command).toContain("overlay_child_window");
-    expect(command).toContain("unity_embed_set_mouse_activation_suppressed");
-    expect(command).toContain("unity_embed_activate_for_input");
-    expect(command).toContain("UnityEmbedFocusDebugSnapshot");
-    expect(command).toContain("foreground_title");
-    expect(app).toContain("commands::unity_embed_set_mouse_activation_suppressed");
-    expect(app).toContain("commands::unity_embed_activate_for_input");
-    expect(app).toContain("commands::unity_embed_focus_debug_snapshot");
+    expect(host).toContain(":owner-window=\"host.ownerWindow\"");
+    expect(host).not.toContain("activateUnityEmbedForInput");
+    expect(host).not.toContain("setUnityEmbedMouseActivationSuppressed");
+    expect(native).toContain("CreateCoreWebView2Controller");
+    expect(native).toContain("SetParentWindow");
+    expect(command).not.toContain("SetParent(");
+    expect(command).not.toContain("WebviewWindowBuilder::new");
   });
 
-  it("sends the current Unity host HWND for child-window mounting", () => {
+  it("uses the explicit Unity owner to locate the WebView container", () => {
     const unityWindow = read("locus_unity/Editor/LocusEditorWindow.cs");
-
-    expect(unityWindow).toContain("parentHwnd = GetUnityHostHwnd(");
-    expect(unityWindow).toContain("forceHostProbe);");
-    expect(unityWindow).toContain("IsUnityHostWindowForRect");
-    expect(unityWindow).toContain("IsUnityProcessForeground");
-    expect(unityWindow).toContain("FindUnityHostWindowForRect");
-    expect(unityWindow).toContain("EnumWindows");
-    expect(unityWindow).toContain("GetWindowThreadProcessId");
-    expect(unityWindow).toContain("IntersectionArea");
+    expect(unityWindow).toContain("LocusWebViewNative.Supported ? LocusWebViewNative.FindOwner(this).ToInt64() : 0");
+    expect(unityWindow).toContain("parentHwnd = parentHwnd");
   });
 
-  it("refreshes floating Unity overlay z-order when geometry is unchanged", () => {
+  it("does not run legacy popup polling or global window hooks", () => {
     const command = read("src-tauri/src/commands/unity_embed.rs");
-
-    expect(command).toContain("sync_popup_overlay_z_order(parent, child, target_rect);");
-    expect(command).toContain("fn sync_popup_overlay_z_order");
-    expect(command).toContain("if decision.positioned");
-    expect(command).toContain("SetWinEventHook");
-    expect(command).toContain("popup_sync_notify().notified()");
-    expect(command).toContain("SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOMOVE | SWP_NOSIZE");
+    expect(command).not.toContain("popup_sync_loop(");
+    expect(command).not.toContain("install_win_event_hooks(");
+    expect(command).not.toContain("sync_popup_overlay_z_order(");
   });
 
   it("bridges Unity asset drops into the embedded composer attachment bar", () => {
@@ -383,12 +304,12 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("unity_asset_drag_release_probe");
     expect(command).toContain("UnityAssetDragReleaseTarget::MainWindow");
     expect(command).toContain("UnityAssetDragReleaseTarget::ViewWindow");
-    expect(command).toContain("if !saw_left_button_down");
-    expect(command).toContain("emit_locus_asset_drop_to(&app_handle, MAIN_WINDOW_LABEL, refs)");
-    expect(command).toContain("emit_locus_asset_drop_to(&app_handle, &label, refs)");
+    expect(command).toContain("require_pressed_button && !self.saw_left_button_down");
+    expect(command).toContain("finish_unity_asset_drag_release(&app_handle, &workspace_ref, probe)");
+    expect(command).toContain("emit_locus_asset_drop_to(app_handle, label, refs)");
     expect(command).toContain("WindowFromPoint");
     expect(command).toContain("GetAsyncKeyState");
-    expect(command).toContain(".disable_drag_drop_handler()");
+    expect(command).not.toContain("WebviewWindowBuilder::new");
     expect(unityWindow).toContain("public DroppedAssetRef[] assetRefs;");
     expect(unityWindow).toContain('[MenuItem("Assets/Send to Locus", false, 0)');
     expect(unityWindow).toContain('[MenuItem("GameObject/Send to Locus", false, 0)');
@@ -527,7 +448,7 @@ describe("Unity embedded session view", () => {
     const app = read("src-tauri/src/lib.rs");
 
     expect(chat).toContain("function isUnityEmbeddedWindow()");
-    expect(chat).toContain('window.location.pathname === "/unity-embed"');
+    expect(chat).toContain('unityEmbedded || ownerWindow.location.pathname === "/unity-embed"');
     expect(chat).toContain("e.ctrlKey || e.metaKey");
     expect(service).toContain("open_unity_asset_inspector");
     expect(commands).toContain("pub async fn open_unity_asset_inspector");

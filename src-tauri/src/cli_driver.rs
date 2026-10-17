@@ -25,9 +25,12 @@ mod project_pool_acceptance;
 mod merge_sdk_commit_acceptance;
 mod merge_sdk_acceptance;
 mod worktree_sdk_acceptance;
+mod property_sdk_read;
 mod headless_development;
 mod asset_api_acceptance;
 mod frame_debugger;
+mod native_view;
+mod native_embed;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_SUITE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_POLL_MS: u64 = 500;
@@ -64,6 +67,8 @@ pub enum CliDriverSuite {
     TypeIndex,
     StateProbe,
     NativeBridge,
+    NativeView,
+    NativeEmbed,
     HotReload,
     HotReloadRelease,
     ParallelEditRefresh,
@@ -71,6 +76,7 @@ pub enum CliDriverSuite {
     Execute,
     FrameDebugger,
     PythonSdk,
+    PropertySdkRead,
     ModalDialog,
     SafeMode,
     YamlParity,
@@ -94,6 +100,8 @@ impl CliDriverSuite {
             CliDriverSuite::TypeIndex => "type-index",
             CliDriverSuite::StateProbe => "state-probe",
             CliDriverSuite::NativeBridge => "native-bridge",
+            CliDriverSuite::NativeView => "native-view",
+            CliDriverSuite::NativeEmbed => "native-embed",
             CliDriverSuite::HotReload => "hot-reload",
             CliDriverSuite::HotReloadRelease => "hot-reload-release",
             CliDriverSuite::ParallelEditRefresh => "parallel-edit-refresh",
@@ -101,6 +109,7 @@ impl CliDriverSuite {
             CliDriverSuite::Execute => "execute",
             CliDriverSuite::FrameDebugger => "frame-debugger",
             CliDriverSuite::PythonSdk => "python-sdk",
+            CliDriverSuite::PropertySdkRead => "property-sdk-read",
             CliDriverSuite::ModalDialog => "modal-dialog",
             CliDriverSuite::SafeMode => "safe-mode",
             CliDriverSuite::YamlParity => "yaml-parity",
@@ -122,6 +131,8 @@ impl CliDriverSuite {
             CliDriverSuite::TypeIndex => None,
             CliDriverSuite::StateProbe => Some("unity-state-probe-selftest"),
             CliDriverSuite::NativeBridge => Some("unity-native-bridge-selftest"),
+            CliDriverSuite::NativeView => None,
+            CliDriverSuite::NativeEmbed => None,
             CliDriverSuite::HotReload => Some("unity-hotreload-selftest"),
             CliDriverSuite::HotReloadRelease => Some("unity-hotreload-selftest"),
             CliDriverSuite::ParallelEditRefresh => None,
@@ -130,6 +141,7 @@ impl CliDriverSuite {
             CliDriverSuite::Execute => None,
             CliDriverSuite::FrameDebugger => None,
             CliDriverSuite::PythonSdk => None,
+            CliDriverSuite::PropertySdkRead => None,
             CliDriverSuite::ModalDialog => None,
             CliDriverSuite::SafeMode => None,
             CliDriverSuite::YamlParity => None,
@@ -341,7 +353,7 @@ impl UnityIntegrationTestRunRequest {
 impl CliDriverConfig {
     pub fn requires_frontend(&self) -> bool {
         self.suites.iter().any(|suite| {
-            matches!(suite, CliDriverSuite::SessionUndo | CliDriverSuite::AssetApi)
+            matches!(suite, CliDriverSuite::SessionUndo | CliDriverSuite::AssetApi | CliDriverSuite::NativeEmbed)
         })
     }
 
@@ -676,9 +688,12 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         "execute" | "exec" | "unity-execute" | "unity_execute" | "execute-code" | "run-states"
         | "run_states" | "runstates" => CliDriverSuite::Execute,
         "frame-debugger" => CliDriverSuite::FrameDebugger,
+        "native-view" => CliDriverSuite::NativeView,
+        "native-embed" => CliDriverSuite::NativeEmbed,
         "python-sdk" | "python_sdk" | "sdk" | "sdk-editor" | "sdk_editor" => {
             CliDriverSuite::PythonSdk
         }
+        "property-sdk-read" => CliDriverSuite::PropertySdkRead,
         "modal-dialog" | "modal_dialog" | "dialog" | "unity-dialog" | "unity_dialog" => {
             CliDriverSuite::ModalDialog
         }
@@ -946,6 +961,8 @@ async fn run_driver(
                 Ok(())
             }
             CliDriverSuite::Sidecar => run_sidecar_suite(&project, *suite, &sink).await,
+            CliDriverSuite::NativeView => native_view::run(&app_handle,&project,&config,&sink).await,
+            CliDriverSuite::NativeEmbed => native_embed::run(&app_handle,&project,&config,&sink).await,
             CliDriverSuite::TypeIndex => {
                 run_type_index_suite(&project, *suite, config.type_index_sample_mode, &sink).await
             }
@@ -1109,6 +1126,7 @@ async fn run_driver(
             }
             CliDriverSuite::FrameDebugger => frame_debugger::run(&project, &config, &sink).await,
             CliDriverSuite::PythonSdk if python_sdk_ran => Ok(()),
+            CliDriverSuite::PropertySdkRead => property_sdk_read::run(&app_handle, &project, &config, &sink).await,
             CliDriverSuite::PythonSdk => Err(
                 "The python-sdk suite did not run before the shared connection preflight"
                     .to_string(),
@@ -2770,6 +2788,48 @@ async fn run_yaml_parity_suite(
     }
 }
 
+/// Every listed test must carry its assembly, and assembly suites must not leak
+/// into the suite path. NUnit replaces an assembly root with a global-namespace
+/// [SetUpFixture], which previously left both wrong. Returns the first assembly
+/// for a filter round trip.
+fn unity_test_list_assembly_probe(list: &Value) -> Result<String, String> {
+    let tests = list
+        .get("tests")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut first_assembly = None;
+    for test in tests {
+        let name = test
+            .get("full_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let assembly = test
+            .get("assembly")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if assembly.is_empty() {
+            return Err(format!(
+                "Unity Test list returned '{name}' without an assembly"
+            ));
+        }
+        let leaked_suite = test
+            .get("path")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find(|part| part.to_ascii_lowercase().ends_with(".dll"));
+        if let Some(part) = leaked_suite {
+            return Err(format!(
+                "Unity Test list kept assembly suite '{part}' in the path of '{name}'"
+            ));
+        }
+        first_assembly.get_or_insert_with(|| assembly.to_string());
+    }
+    first_assembly.ok_or_else(|| "Unity Test list returned no test entries".to_string())
+}
+
 async fn run_unity_test_suite(
     project: &str,
     suite: CliDriverSuite,
@@ -2812,7 +2872,7 @@ async fn run_unity_test_suite(
         }),
     );
 
-    let list_request = json!({ "max_results": 50 });
+    let list_request = json!({ "max_results": 5000 });
     let list_text = unity_bridge::unity_test_list(project, &list_request).await?;
     let list: Value = serde_json::from_str(&list_text)
         .map_err(|error| format!("Unity Test list returned invalid JSON: {error}"))?;
@@ -2829,11 +2889,29 @@ async fn run_unity_test_suite(
     if matched == 0 {
         return Err("Unity Test Framework discovered no tests".to_string());
     }
+    let probe_assembly = unity_test_list_assembly_probe(&list)?;
+    let probe_text = unity_bridge::unity_test_list(
+        project,
+        &json!({ "assemblies": [probe_assembly.as_str()], "max_results": 1 }),
+    )
+    .await?;
+    let probe: Value = serde_json::from_str(&probe_text)
+        .map_err(|error| format!("Unity Test list returned invalid JSON: {error}"))?;
+    if probe
+        .get("matched")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        == 0
+    {
+        return Err(format!(
+            "Unity Test assembly filter '{probe_assembly}' matched no tests"
+        ));
+    }
     sink.emit(
         "suite_event",
         json!({
             "suite": suite.as_str(),
-            "line": format!("PASS  unity-test list: discovered {matched} Edit/Play Mode test(s)"),
+            "line": format!("PASS  unity-test list: discovered {matched} Edit/Play Mode test(s) with assembly identity"),
             "passed": 2,
             "failed": 0,
         }),
@@ -8314,7 +8392,11 @@ fn emit_json<T: Serialize>(event: &str, payload: &T) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_active_edit_session_count, CliDriverConfig, CliDriverSuite};
+    use super::{
+        parse_active_edit_session_count, unity_test_list_assembly_probe, CliDriverConfig,
+        CliDriverSuite,
+    };
+    use serde_json::json;
     use crate::unity_bridge::UnityLaunchCodeOptimization;
 
     fn parse(args: &[&str]) -> Option<Result<CliDriverConfig, String>> {
@@ -8551,6 +8633,35 @@ mod tests {
             2
         );
         assert!(parse_active_edit_session_count("owners:2").is_err());
+    }
+
+    #[test]
+    fn unity_test_list_assembly_probe_rejects_missing_assembly_identity() {
+        let valid = json!({ "tests": [
+            { "full_name": "Game.Tests.A", "assembly": "Game.Tests", "path": ["Game", "Tests", "A"] },
+            { "full_name": "Other.B", "assembly": "Other.Tests", "path": ["Other", "B"] }
+        ]});
+        assert_eq!(
+            unity_test_list_assembly_probe(&valid).unwrap(),
+            "Game.Tests"
+        );
+
+        // Global [SetUpFixture] replacing the TestAssembly root.
+        let missing = json!({ "tests": [
+            { "full_name": "Game.Tests.A", "assembly": "", "path": ["Game.Tests.dll", "Game", "A"] }
+        ]});
+        assert!(unity_test_list_assembly_probe(&missing)
+            .unwrap_err()
+            .contains("without an assembly"));
+
+        let leaked = json!({ "tests": [
+            { "full_name": "Game.Tests.A", "assembly": "Game.Tests", "path": ["Game.Tests.DLL", "A"] }
+        ]});
+        assert!(unity_test_list_assembly_probe(&leaked)
+            .unwrap_err()
+            .contains("Game.Tests.DLL"));
+
+        assert!(unity_test_list_assembly_probe(&json!({ "tests": [] })).is_err());
     }
 
     #[test]

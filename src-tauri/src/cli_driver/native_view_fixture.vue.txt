@@ -1,0 +1,17 @@
+<script setup>
+import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue';
+import { property, view, useViewContext } from '@locus/view-runtime';
+import { BaseButton, BaseCheckbox } from '@locus/components';
+const context=useViewContext();
+const target={...context.binding.targets[0],propertyPath:context.binding.data?.propertyPath||'m_Name'};
+const current=ref(''),updates=ref(0),error=ref('');
+const checked=ref(Array(120).fill(false));
+const created=Date.now();let ready=false;
+async function read(){const value=await property.readProperty(target);current.value=value.value;return {name:String(value.value),number:typeof value.value==='number'?value.value:0,events:updates.value,created,ready};}
+async function write(value){await property.write(target,value,{label:'Native View acceptance'});return await read();}
+const api=window.nativeAcceptance={read,write,measure:async()=>{const start=performance.now();checked.value[0]=!checked.value[0];await nextTick();return {number:performance.now()-start};},undo:async()=>{await view.undo.undo();return await read();},created,ready:false};
+onMounted(async()=>{try{await read();await view.onUpdate(()=>updates.value++);ready=true;api.ready=true;}catch(e){error.value=String(e);}});
+onBeforeUnmount(()=>{if(window.nativeAcceptance===api)delete window.nativeAcceptance;});
+</script>
+<template><section class="native-acceptance"><div id="value">{{current}}</div><div id="events">{{updates}}</div><div id="error">{{error}}</div><BaseButton id="write" @click="write(typeof current==='number'?current+1:'Changed by View')">写入</BaseButton><div class="native-rows"><BaseCheckbox v-for="row in 120" :key="row" v-model="checked[row-1]">字段 {{row}} · {{current}}</BaseCheckbox></div></section></template>
+<style scoped>.native-acceptance{padding:12px;color:var(--text-color);font-family:var(--font-ui)}#value,#events,#error{margin-bottom:8px}.native-rows{display:flex;flex-direction:column;gap:4px;margin-top:8px}</style>

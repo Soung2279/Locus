@@ -271,16 +271,22 @@ async fn rejected_steering_returns_to_normal_follow_up_without_stopping_output()
         recv(&mut ws).await;
         send(&mut ws, json!({"type":"response.steer.failed","steer":{"previous_response_id":"r1","input":user_input("update",None)},
             "error":{"code":"steering_not_supported"}})).await;
-        send(&mut ws, completed("r1", output("m1", "Original"))).await;
+        send(&mut ws, completed("r1", output("msg_m1", "Original"))).await;
+        let follow_up = recv(&mut ws).await;
+        assert_eq!(follow_up["previous_response_id"], "r1");
+        send(&mut ws, created("r2")).await;
+        send(&mut ws, completed("r2", output("msg_m2", "Continued"))).await;
     });
     let source = Source::default();
     source.queue("u1", "update");
     let mut turn = TurnState::default();
+    let mut history = vec![msg("u0", "user", "Start")];
+    let mut metadata = HashMap::new();
     let first = run(
         &base,
         &sid,
-        &[msg("u0", "user", "Start")],
-        &HashMap::new(),
+        &history,
+        &metadata,
         &mut turn,
         &source,
     )
@@ -290,6 +296,12 @@ async fn rejected_steering_returns_to_normal_follow_up_without_stopping_output()
     assert_eq!(first.end_turn, Some(false));
     assert!(!turn.has_steering_continuation());
     assert_eq!(*source.rejected.lock().unwrap(), vec!["u1"]);
+    save(&mut history, &mut metadata, "a1", &first);
+    history.push(msg("u1", "user", "update"));
+    let follow_up = run(&base, &sid, &history, &metadata, &mut turn, &source)
+        .await
+        .unwrap();
+    assert_eq!(follow_up.text, "Continued");
     server.await.unwrap();
     invalidate_cached_session(&sid);
 }
@@ -363,7 +375,7 @@ async fn failure_after_acceptance_returns_uncommitted_input_after_terminal_respo
         send(
             &mut ws,
             json!({"type":"response.incomplete","response":{"id":"r1",
-            "incomplete_details":{"reason":"steered"},"output":[output("m1","Preserved")]}}),
+            "incomplete_details":{"reason":"steered"},"output":[output("msg_m1","Preserved")]}}),
         )
         .await;
         send(
@@ -373,26 +385,39 @@ async fn failure_after_acceptance_returns_uncommitted_input_after_terminal_respo
             "error":{"code":"successor_creation_failed"}}),
         )
         .await;
+        drop(ws);
+
+        let mut ws = connect(&listener).await;
+        let replay = recv(&mut ws).await;
+        assert!(replay.get("previous_response_id").is_none());
+        assert!(replay["input"]
+            .as_array()
+            .unwrap()
+            .contains(&output("msg_m1", "Preserved")));
+        assert!(replay["input"].to_string().contains("update"));
+        send(&mut ws, created("r2")).await;
+        send(&mut ws, completed("r2", output("msg_m2", "Continued"))).await;
     });
     let source = Source::default();
     source.queue("u1", "update");
     let mut turn = TurnState::default();
-    let response = run(
-        &base,
-        &sid,
-        &[msg("u0", "user", "Start")],
-        &HashMap::new(),
-        &mut turn,
-        &source,
-    )
-    .await
-    .unwrap();
+    let mut history = vec![msg("u0", "user", "Start")];
+    let mut metadata = HashMap::new();
+    let response = run(&base, &sid, &history, &metadata, &mut turn, &source)
+        .await
+        .unwrap();
     assert_eq!(response.text, "Preserved");
     assert_eq!(response.finish_reason, "steered");
     assert_eq!(response.end_turn, Some(false));
     assert!(!turn.has_steering_continuation());
     assert!(source.committed.lock().unwrap().is_empty());
     assert_eq!(*source.rejected.lock().unwrap(), vec!["u1"]);
+    save(&mut history, &mut metadata, "a1", &response);
+    history.push(msg("u1", "user", "update"));
+    let follow_up = run(&base, &sid, &history, &metadata, &mut turn, &source)
+        .await
+        .unwrap();
+    assert_eq!(follow_up.text, "Continued");
     server.await.unwrap();
     invalidate_cached_session(&sid);
 }

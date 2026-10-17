@@ -53,13 +53,14 @@ const emit = defineEmits<{
 const {
   resetConfirm, handleResetOnboarding, activeCategory,
   providers, editingProvider, editKey, errorMsg, successMsg, isLoading,
-  claudeCodeTestStatus, claudeCodeTestResult, testClaudeCode,
+  claudeCodeTestStatus, claudeCodeTestResult, testClaudeCode, loadProviders,
   startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
   anthropicNativeLazyEnabled, anthropicNativeLazyBusy, setAnthropicNativeLazyEnabled,
   oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
   codexStep, codexStatus, codexQuota, codexRefreshing, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexContextWindow, setCodexSessionTitleGeneration, setCodexAutoReview, setCodexUseApplyPatch, setCodexPrefixCacheTtlSeconds, refreshCodexSubscription, consumeCodexResetCredit,
   requestCodexLogin,
+  codexClientVersionBusy, setCodexAutoUpdateClientVersion,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
   fileToolWorkspaceBoundary, fileToolWorkspaceBoundaryReady, fileToolWorkspaceBoundaryBusy,
@@ -302,10 +303,12 @@ watch(
           :codex-step="codexStep"
           :codex-status="codexStatus"
           :codex-quota="codexQuota"
-          :codex-refreshing="codexRefreshing"
+          :codex-refreshing="codexRefreshing || codexClientVersionBusy"
           :codex-reset-credit-busy-id="codexResetCreditBusyId"
           :codex-retrying="codexRetrying"
           :codex-transport="codexModelConfig.transport"
+          :codex-auto-update-client-version="codexModelConfig.autoUpdateClientVersion"
+          :codex-client-version-busy="codexClientVersionBusy"
           :codex-context-window="codexModelConfig.contextWindow"
           :codex-session-title-generation="codexModelConfig.generateSessionTitles"
           :codex-auto-review="codexModelConfig.autoReview"
@@ -324,6 +327,7 @@ watch(
           :claude-code-test-status="claudeCodeTestStatus"
           :claude-code-test-result="claudeCodeTestResult"
           @test-claude-code="testClaudeCode"
+          @claude-connection-changed="loadProviders(); emit('authChanged')"
           @start-edit="startEdit"
           @cancel-edit="cancelEdit"
           @save-key="saveKey"
@@ -345,6 +349,7 @@ watch(
           @consume-codex-reset-credit="consumeCodexResetCredit"
           @copy-code="copyCode"
           @update:codex-transport="setCodexTransportMode"
+          @update:codex-auto-update-client-version="setCodexAutoUpdateClientVersion"
           @update:codex-context-window="setCodexContextWindow"
           @update:codex-session-title-generation="setCodexSessionTitleGeneration"
           @update:codex-auto-review="setCodexAutoReview"
@@ -450,6 +455,7 @@ watch(
       <template v-if="activeCategory === 'general'">
         <GeneralSettings
           :locale="locale"
+          :agents="agents"
           :reset-confirm="resetConfirm"
           @set-locale="setLocale"
           @start-reset="resetConfirm = true"

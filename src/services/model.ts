@@ -37,6 +37,10 @@ export function getCodexAvailableModels(forceRefresh = false): Promise<ModelOpti
   return ipcInvoke<ModelOption[]>("get_codex_available_models", { forceRefresh });
 }
 
+export function getClaudeCodeModels(): Promise<ModelOption[]> {
+  return ipcInvoke<ModelOption[]>("get_claude_code_models");
+}
+
 export function saveCodexModelConfig(config: CodexModelConfig): Promise<void> {
   return ipcInvoke("save_codex_model_config", { config });
 }
@@ -73,8 +77,8 @@ export function saveCustomProviders(providers: CustomProvider[]): Promise<void> 
   return ipcInvoke("save_custom_providers", { providers });
 }
 
-export function testCustomEndpoint(endpoint: CustomEndpoint): Promise<string> {
-  return ipcInvoke<string>("test_custom_endpoint", { endpoint });
+export function testCustomEndpoint(endpoint: CustomEndpoint, codexTransport?: "http" | "websocket" | null): Promise<string> {
+  return ipcInvoke<string>("test_custom_endpoint", { endpoint, codexTransport: codexTransport ?? null });
 }
 
 export function getModelCatalog(): Promise<ModelCatalogResponse> {

@@ -5,10 +5,9 @@ use std::path::PathBuf;
 impl AgentInstance {
     pub(super) fn uses_codex_apply_patch(&self) -> bool {
         self.codex_use_apply_patch.load(Ordering::Relaxed)
-            && (matches!(self.backend, LlmBackend::OpenAiCodex { .. })
+            && (self.uses_codex_protocol()
                 || self.preview_codex_subscription)
-            && self
-                .effective_model
+            && self.codex_protocol_model().unwrap_or(&self.effective_model)
                 .trim()
                 .rsplit('/')
                 .next()

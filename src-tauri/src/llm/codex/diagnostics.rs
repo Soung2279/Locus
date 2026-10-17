@@ -157,12 +157,17 @@ impl Attempt {
             self.record.stage = "completed";
         }
         if error.is_some() || capture.is_some() {
-            eprintln!("[OpenAI Codex] stream attempt: session={} run={} iteration={:?} kind={} attempt={} transport={} stage={} reused={} previous_response={} response_id={} last_event={} request_bytes={} elapsed_ms={} idle_ms={} error={}",
+            let message = format!("stream attempt: session={} run={} iteration={:?} kind={} attempt={} transport={} stage={} reused={} previous_response={} response_id={} last_event={} request_bytes={} elapsed_ms={} idle_ms={} error={}",
                 self.record.session_id.as_deref().unwrap_or("-"), self.record.run_id.as_deref().unwrap_or("-"),
                 self.record.iteration, self.record.kind, self.record.attempt, self.record.transport,
                 self.record.stage, self.record.connection_reused, self.record.previous_response_id.is_some(),
                 self.record.response_id.as_deref().unwrap_or("-"), self.record.last_event.as_deref().unwrap_or("-"),
                 self.record.request_bytes, self.record.elapsed_ms, self.record.idle_ms, error.unwrap_or("none"));
+            if error.is_some_and(should_retry_safe_codex_error) {
+                tracing::warn!(log_module = "OpenAI Codex", "{message}");
+            } else {
+                eprintln!("[OpenAI Codex] {message}");
+            }
         }
         if let Some(capture) = capture {
             capture.record(self.record);

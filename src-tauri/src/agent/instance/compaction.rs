@@ -111,13 +111,15 @@ impl AgentInstance {
                 api_model,
                 endpoint,
                 api_format: crate::commands::ApiFormat::OpenaiResponses,
-                remote_compaction_mode: crate::commands::RemoteCompactionMode::CodexV2,
+                remote_compaction_mode,
+                codex_transport,
                 ..
-            } => {
+            } if codex_transport.is_some()
+                || *remote_compaction_mode == crate::commands::RemoteCompactionMode::CodexV2 => {
                 codex::compact_conversation_history_v2(
                     api_key,
                     None,
-                    crate::commands::CodexTransportMode::Http,
+                    codex_transport.unwrap_or(crate::commands::CodexTransportMode::Http),
                     Some(endpoint.as_str()),
                     api_model,
                     system_prompt,
@@ -132,7 +134,7 @@ impl AgentInstance {
                         capture,
                     },
                     self.effort.as_deref(),
-                    false,
+                    self.codex_fast_mode,
                     Some(&self.session_id),
                     Some(response_request_metadata),
                     self.debug,

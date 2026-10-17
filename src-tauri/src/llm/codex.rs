@@ -276,6 +276,11 @@ impl CodexStreamOptions {
         self
     }
 
+    pub fn with_request_context(mut self, run_id: &str, iteration: usize) -> Self {
+        self.request_context = Some((run_id.to_string(), iteration));
+        self
+    }
+
     fn response_idle_timeout(&self, model: &str) -> Duration {
         // Compaction can generate its encrypted output without intermediate
         // events. Keep request sends bounded separately from this wait.
@@ -309,6 +314,7 @@ struct LastWebsocketResponse {
 
 #[derive(Default)]
 struct CachedWebsocketSession {
+    api_key_fingerprint: Option<[u8; 32]>,
     connection: Option<CodexWebsocketStream>,
     last_response: Option<LastWebsocketResponse>,
     disable_websockets: bool,
@@ -346,6 +352,26 @@ pub fn invalidate_cached_session(session_id: &str) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     sessions.remove(session_id);
+}
+
+async fn ensure_api_key_session_identity(session_id: &str, api_key: &str) {
+    use sha2::{Digest, Sha256};
+    let fingerprint: [u8; 32] = Sha256::digest(api_key.as_bytes()).into();
+    let shared = cached_websocket_session(session_id);
+    let mut state = shared.lock().await;
+    if state.api_key_fingerprint != Some(fingerprint) {
+        let unbound = state.api_key_fingerprint.is_none()
+            && state.connection.is_none()
+            && state.last_response.is_none();
+        // A gateway key has no ChatGPT account ID. Rotating it must not reuse
+        // a socket authenticated with the previous key or its continuation.
+        // Before the first authenticated connection, preserve transport policy
+        // such as an explicitly skipped prewarm; there is no identity to clear.
+        if !unbound {
+            *state = CachedWebsocketSession::default();
+        }
+        state.api_key_fingerprint = Some(fingerprint);
+    }
 }
 
 pub async fn reset_cached_session_window(session_id: &str) {
@@ -3219,6 +3245,11 @@ where
         .then_some(session_id)
         .flatten();
     let mut active_transport = transport;
+    if account_id.is_none() {
+        if let Some(session_id) = transport_session_id {
+            ensure_api_key_session_identity(session_id, access_token).await;
+        }
+    }
     if active_transport == CodexTransportMode::Websocket
         && cached_websocket_http_fallback_enabled(transport_session_id, base_url, account_id).await
     {
@@ -4295,22 +4326,29 @@ where
         if submission.rejected {
             stream_state.end_turn = Some(false);
         }
-        store_cached_websocket_session_state(
-            &shared_session,
-            &connection_key,
-            socket,
-            LastWebsocketResponse {
-                request_signature: websocket_request_signature(&body),
-                input: body
-                    .get("input")
-                    .and_then(|value| value.as_array())
-                    .cloned()
-                    .unwrap_or_default(),
-                response_id: stream_state.response_id.clone().unwrap_or_default(),
-                items_added: stream_state.items_added.clone(),
-            },
-        )
-        .await;
+        if stream_state.got_completed_event {
+            store_cached_websocket_session_state(
+                &shared_session,
+                &connection_key,
+                socket,
+                LastWebsocketResponse {
+                    request_signature: websocket_request_signature(&body),
+                    input: body
+                        .get("input")
+                        .and_then(|value| value.as_array())
+                        .cloned()
+                        .unwrap_or_default(),
+                    response_id: stream_state.response_id.clone().unwrap_or_default(),
+                    items_added: stream_state.items_added.clone(),
+                },
+            )
+            .await;
+        } else {
+            // A rejected steer can leave a terminal `response.incomplete`
+            // whose ID is no longer a valid continuation baseline. Preserve its
+            // output for the agent, but replay the full history next time.
+            clear_cached_websocket_session_state(&shared_session, &connection_key, false).await;
+        }
     }
 
     let mut collected = collected;
@@ -5190,7 +5228,7 @@ mod tests {
     fn builds_user_input_blocks_with_images() {
         let input = build_input(&[user_message_with_images(
             "Describe this image",
-            vec![ImageData {
+            vec![ImageData { capture: None,
                 data: "YWJj".to_string(),
                 mime_type: "image/png".to_string(),
             }],
@@ -5228,7 +5266,7 @@ mod tests {
                 "tool-1",
                 "call_1",
                 "Unity screenshot captured.",
-                vec![ImageData {
+                vec![ImageData { capture: None,
                     data: "YWJj".to_string(),
                     mime_type: "image/png".to_string(),
                 }],
@@ -6037,6 +6075,19 @@ mod tests {
         let _idle_stream = CodexWebsocketStream::new(socket);
 
         server.await.expect("websocket test server task");
+    }
+
+    #[tokio::test]
+    async fn custom_codex_api_key_rotation_resets_gateway_session() {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let base = Some("http://localhost:8317/v1");
+        super::ensure_api_key_session_identity(&session_id, "first-key").await;
+        enable_cached_websocket_http_fallback(Some(&session_id), base, None).await;
+        super::ensure_api_key_session_identity(&session_id, "first-key").await;
+        assert!(cached_websocket_http_fallback_enabled(Some(&session_id), base, None).await);
+        super::ensure_api_key_session_identity(&session_id, "second-key").await;
+        assert!(!cached_websocket_http_fallback_enabled(Some(&session_id), base, None).await);
+        super::invalidate_cached_session(&session_id);
     }
 
     #[tokio::test]

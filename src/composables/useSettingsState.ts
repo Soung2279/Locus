@@ -1,6 +1,7 @@
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { clearWarmup, getWarmup, setWarmup } from "./warmupCache";
 import { resetTextViewerZoomScale } from "./useTextViewerZoom";
+import { useNewSessionSettings } from "./useNewSessionSettings";
 import { resetAllConfig } from "../services/project";
 import {
   getProviders,
@@ -210,6 +211,7 @@ export function useSettingsState(emit: SettingsEmit) {
     const prefixCacheTtlSeconds = Number(config?.prefixCacheTtlSeconds);
     return {
       transport: config?.transport === "http" ? "http" : "websocket",
+      autoUpdateClientVersion: config?.autoUpdateClientVersion !== false,
       contextWindow: normalizeCodexContextWindow(
         config?.contextWindow,
         config?.extendedContext === true,
@@ -385,6 +387,7 @@ export function useSettingsState(emit: SettingsEmit) {
       localStorage.removeItem("locus:collabTerminalHeight");
     } catch { /* ignore */ }
     resetTextViewerZoomScale();
+    useNewSessionSettings().reset();
     setThemePreference("main", "dark");
     setThemePreference("unityEmbed", "dark");
     try {
@@ -847,6 +850,7 @@ export function useSettingsState(emit: SettingsEmit) {
   async function refreshCodexSubscription() {
     if (
       codexRefreshing.value
+      || codexClientVersionBusy.value
       || codexQuota.value.loading
       || codexResetCreditBusyId.value !== null
       || !codexStatus.value.authenticated
@@ -928,6 +932,43 @@ export function useSettingsState(emit: SettingsEmit) {
     try {
       codexModelConfig.value = normalizeCodexModelConfig(await getCodexModelConfig());
     } catch { /* ignore */ }
+  }
+
+  const codexClientVersionBusy = ref(false);
+
+  async function setCodexAutoUpdateClientVersion(enabled: boolean) {
+    if (codexClientVersionBusy.value || codexRefreshing.value) return;
+    const previous = codexModelConfig.value;
+    if (previous.autoUpdateClientVersion === enabled) return;
+    const next = normalizeCodexModelConfig({ ...previous, autoUpdateClientVersion: enabled });
+    codexClientVersionBusy.value = true;
+    codexModelConfig.value = next;
+    try {
+      await serviceSaveCodexModelConfig(next);
+      emit("codexTransportChanged", next);
+    } catch (e) {
+      codexModelConfig.value = previous;
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.codex.clientVersionSaveFailed", err.message), {
+        code: err.code,
+        operation: "saveCodexModelConfig",
+      });
+      codexClientVersionBusy.value = false;
+      return;
+    }
+    try {
+      if (codexStatus.value.authenticated && !codexStatus.value.validationFailed) {
+        await useModelStore().loadCodexAvailableModels(true);
+      }
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", err.message, {
+        code: err.code,
+        operation: "codexModelsRefresh",
+      });
+    } finally {
+      codexClientVersionBusy.value = false;
+    }
   }
 
   async function setCodexTransportMode(transport: CodexTransportMode) {
@@ -1448,9 +1489,15 @@ export function useSettingsState(emit: SettingsEmit) {
       contextLength: Number.isFinite(model.contextLength) && model.contextLength > 0
         ? model.contextLength
         : DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH,
-      remoteCompactionMode: model.remoteCompactionMode === "codex_v2"
+      remoteCompactionMode: (apiFormat === "openai_responses"
+        && (model.codexTransport === "http" || model.codexTransport === "websocket"))
+        || model.remoteCompactionMode === "codex_v2"
         ? "codex_v2"
         : "disabled",
+      codexTransport: apiFormat === "openai_responses"
+        && (model.codexTransport === "http" || model.codexTransport === "websocket")
+        ? model.codexTransport
+        : null,
       supportsToolLazyLoading: model.supportsToolLazyLoading === true,
       supportedReasoningEfforts: normalizeReasoningEfforts(model.supportedReasoningEfforts),
       reasoningParamFormat: model.reasoningParamFormat ?? defaultReasoningParamFormat(apiFormat),
@@ -1701,7 +1748,7 @@ export function useSettingsState(emit: SettingsEmit) {
         serverTools: model.serverTools,
         supportsToolLazyLoading: model.supportsToolLazyLoading === true,
         supportsVision: model.supportsVision,
-      });
+      }, model.codexTransport ?? null);
       testStatus.value = customEndpointTestStatusForReply(reply);
       testResult.value = reply;
     } catch (e) {
@@ -1835,6 +1882,8 @@ export function useSettingsState(emit: SettingsEmit) {
     retryCodexValidation,
     copyCode,
     setCodexTransportMode,
+    codexClientVersionBusy,
+    setCodexAutoUpdateClientVersion,
     setCodexContextWindow,
     setCodexSessionTitleGeneration,
     setCodexAutoReview,

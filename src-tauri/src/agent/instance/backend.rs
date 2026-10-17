@@ -687,6 +687,7 @@ pub enum LlmBackend {
         api_format: crate::commands::ApiFormat,
         context_length: u32,
         remote_compaction_mode: crate::commands::RemoteCompactionMode,
+        codex_transport: Option<CodexTransportMode>,
         /// Model-level opt-in for protocol-native lazy tool loading
         /// (`defer_loading` + `tool_reference`) on Anthropic-format endpoints.
         supports_tool_lazy_loading: bool,

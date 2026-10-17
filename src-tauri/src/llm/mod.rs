@@ -18,8 +18,9 @@ pub mod utf8_stream;
 pub(crate) mod upstream_model;
 
 // The subscription /models endpoint filters its catalog by client version.
-// GPT-6 Sol and Luna require at least 0.155.0; keep this aligned with stable Codex.
-pub(crate) const CODEX_CLIENT_VERSION: &str = "0.156.1";
+// Baseline: @openai/codex stable on 2026-10-08. Desktop app build numbers
+// (26.x) are not the CLI/app-server versions used by this endpoint.
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.161.0";
 
 /// Normalize historical tool call arguments before replaying them to an
 /// OpenAI-shaped endpoint. Strict servers (vLLM-based providers such as

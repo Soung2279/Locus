@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "codex_model_version.rs"]
+mod client_version;
+
+static MODELS_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const DEFAULT_CODEX_PROVIDER_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const MODELS_ENDPOINT_PATH: &str = "/models";
 const RESPONSES_ENDPOINT_PATH: &str = "/responses";
@@ -78,7 +83,6 @@ pub struct CodexAvailableModel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexModelsResponse {
-    #[serde(default)]
     models: Vec<CodexRemoteModel>,
 }
 
@@ -228,40 +232,98 @@ pub async fn list_codex_available_models(
     base_url: Option<&str>,
     cache_dir: &Path,
     force_refresh: bool,
+    auto_update_client_version: bool,
+) -> Result<Vec<CodexAvailableModel>, String> {
+    let _refresh_guard = MODELS_REFRESH_LOCK.lock().await;
+    let version = if auto_update_client_version {
+        client_version::resolve(cache_dir, force_refresh).await
+    } else {
+        CODEX_CLIENT_VERSION.to_string()
+    };
+    list_models_with_version(
+        access_token,
+        account_id,
+        base_url,
+        cache_dir,
+        force_refresh,
+        &version,
+    )
+    .await
+}
+
+async fn list_models_with_version(
+    access_token: &str,
+    account_id: Option<&str>,
+    base_url: Option<&str>,
+    cache_dir: &Path,
+    force_refresh: bool,
+    version: &str,
 ) -> Result<Vec<CodexAvailableModel>, String> {
     if !force_refresh {
-        if let Some(cache) = load_fresh_cache(cache_dir) {
+        if let Some(cache) = load_fresh_cache(cache_dir, version) {
             return Ok(remote_models_to_available(cache.models));
         }
     }
 
     let stale_cache = load_cache(cache_dir);
-    let stale_etag = stale_cache.as_ref().and_then(|cache| cache.etag.as_deref());
-    match fetch_remote_models(access_token, account_id, base_url, stale_etag).await {
-        Ok(CodexModelsFetchOutcome::Modified { models, etag }) => {
-            persist_cache(cache_dir, &models, etag)?;
-            Ok(remote_models_to_available(models))
+    let mut versions = vec![version.to_string()];
+    if version != CODEX_CLIENT_VERSION {
+        if let Some(previous) = stale_cache
+            .as_ref()
+            .and_then(|cache| client_version::supported_version(&cache.client_version))
+            .filter(|previous| previous != version && previous != CODEX_CLIENT_VERSION)
+        {
+            versions.push(previous);
         }
-        Ok(CodexModelsFetchOutcome::NotModified) => {
-            let mut cache = stale_cache
-                .ok_or_else(|| "Codex models endpoint returned 304 without cache".to_string())?;
-            cache.fetched_at_ms = now_ms();
-            save_cache(cache_dir, &cache)?;
-            Ok(remote_models_to_available(cache.models))
-        }
-        Err(error) => {
-            // Manual refresh must surface failure while leaving the cache intact.
-            if force_refresh {
-                return Err(error);
+        versions.push(CODEX_CLIENT_VERSION.to_string());
+    }
+    let mut last_error = String::new();
+    for candidate in versions {
+        // ETags belong to the version that produced the catalog.
+        let matching_cache = stale_cache
+            .as_ref()
+            .filter(|cache| cache.client_version == candidate);
+        let stale_etag = matching_cache.and_then(|cache| cache.etag.as_deref());
+        let outcome =
+            fetch_remote_models(access_token, account_id, base_url, stale_etag, &candidate).await;
+        let outcome = match outcome {
+            Ok(CodexModelsFetchOutcome::NotModified) if matching_cache.is_none() => {
+                Err("Codex models endpoint returned 304 without a matching cache".to_string())
             }
-            if let Some(cache) = stale_cache {
-                eprintln!("[OpenAI Codex] using stale model cache after refresh failure: {error}");
-                Ok(remote_models_to_available(cache.models))
-            } else {
-                Err(error)
+            outcome => outcome,
+        };
+        match outcome {
+            Ok(CodexModelsFetchOutcome::Modified { models, etag }) => {
+                persist_cache(cache_dir, &models, etag, &candidate)?;
+                if candidate != version {
+                    client_version::remember_fallback(cache_dir, &candidate);
+                }
+                return Ok(remote_models_to_available(models));
+            }
+            Ok(CodexModelsFetchOutcome::NotModified) => {
+                let mut cache = matching_cache
+                    .cloned()
+                    .expect("matching cache checked above");
+                cache.fetched_at_ms = now_ms();
+                save_cache(cache_dir, &cache)?;
+                if candidate != version {
+                    client_version::remember_fallback(cache_dir, &candidate);
+                }
+                return Ok(remote_models_to_available(cache.models));
+            }
+            Err(error) => {
+                eprintln!("[OpenAI Codex] model refresh failed for client {candidate}: {error}");
+                last_error = error;
             }
         }
     }
+    // Manual refresh reports failures without overwriting the existing catalog.
+    if !force_refresh {
+        if let Some(cache) = stale_cache {
+            return Ok(remote_models_to_available(cache.models));
+        }
+    }
+    Err(last_error)
 }
 
 async fn fetch_remote_models(
@@ -269,6 +331,7 @@ async fn fetch_remote_models(
     account_id: Option<&str>,
     base_url: Option<&str>,
     etag: Option<&str>,
+    client_version: &str,
 ) -> Result<CodexModelsFetchOutcome, String> {
     let client = crate::network::rustls_reqwest_client(
         crate::network::ReqwestClientOptions::new()
@@ -280,11 +343,11 @@ async fn fetch_remote_models(
     let url = codex_models_endpoint(base_url);
     let mut request = client
         .get(&url)
-        .query(&[("client_version", CODEX_CLIENT_VERSION)])
+        .query(&[("client_version", client_version)])
         .header("Authorization", format!("Bearer {access_token}"))
         .header("Content-Type", "application/json")
         .header("originator", CODEX_ORIGINATOR_HEADER_VALUE)
-        .header("version", CODEX_CLIENT_VERSION);
+        .header("version", client_version);
 
     if let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) {
         request = request.header("ChatGPT-Account-ID", account_id);
@@ -322,6 +385,14 @@ async fn fetch_remote_models(
         .json::<CodexModelsResponse>()
         .await
         .map_err(|e| format!("Failed to parse Codex models response: {e}"))?;
+
+    if !payload
+        .models
+        .iter()
+        .any(|model| !model.slug.trim().is_empty())
+    {
+        return Err("Codex models endpoint returned an empty catalog".to_string());
+    }
 
     Ok(CodexModelsFetchOutcome::Modified {
         models: payload.models,
@@ -495,9 +566,9 @@ fn cache_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join(MODEL_CACHE_FILE)
 }
 
-fn load_fresh_cache(cache_dir: &Path) -> Option<CodexModelsCache> {
+fn load_fresh_cache(cache_dir: &Path, client_version: &str) -> Option<CodexModelsCache> {
     let cache = load_cache(cache_dir)?;
-    if cache.client_version != CODEX_CLIENT_VERSION {
+    if cache.client_version != client_version {
         return None;
     }
     if now_ms().saturating_sub(cache.fetched_at_ms) > MODEL_CACHE_TTL_MS {
@@ -510,18 +581,18 @@ fn load_cache(cache_dir: &Path) -> Option<CodexModelsCache> {
     std::fs::read_to_string(cache_path(cache_dir))
         .ok()
         .and_then(|value| serde_json::from_str::<CodexModelsCache>(&value).ok())
-        .filter(|cache| cache.client_version == CODEX_CLIENT_VERSION)
 }
 
 fn persist_cache(
     cache_dir: &Path,
     models: &[CodexRemoteModel],
     etag: Option<String>,
+    client_version: &str,
 ) -> Result<(), String> {
     let cache = CodexModelsCache {
         fetched_at_ms: now_ms(),
         etag,
-        client_version: CODEX_CLIENT_VERSION.to_string(),
+        client_version: client_version.to_string(),
         models: models.to_vec(),
     };
     save_cache(cache_dir, &cache)
@@ -552,6 +623,7 @@ mod tests {
     use super::{
         cached_context_limits, codex_models_endpoint, persist_cache, remote_models_to_available,
         resolve_context_limits, CodexReasoningLevel, CodexRemoteModel, CodexServiceTier,
+        CODEX_CLIENT_VERSION,
     };
 
     fn remote(slug: &str, priority: i32, visibility: &str) -> CodexRemoteModel {
@@ -629,7 +701,7 @@ mod tests {
         }))
         .expect("parse Astra release metadata");
         let dir = tempfile::tempdir().unwrap();
-        persist_cache(dir.path(), &[model.clone()], None).unwrap();
+        persist_cache(dir.path(), &[model.clone()], None, CODEX_CLIENT_VERSION).unwrap();
         let limits = resolve_context_limits(Some(dir.path()), "openai/gpt-6-astra", 272_000)
             .expect("Astra cached context limits");
         assert_eq!(limits.context_window, 272_000);
@@ -754,7 +826,8 @@ mod tests {
         let mut spark = remote("gpt-5.3-codex-spark", 1, "list");
         spark.context_window = Some(200_000);
         let plain = remote("gpt-5.3-codex", 2, "list");
-        persist_cache(dir.path(), &[spark, plain], None).expect("persist cache");
+        persist_cache(dir.path(), &[spark, plain], None, CODEX_CLIENT_VERSION)
+            .expect("persist cache");
 
         assert_eq!(
             cached_context_limits(dir.path(), "openai/gpt-5.3-codex-spark")
@@ -800,7 +873,7 @@ mod tests {
             model
         })
         .collect();
-        persist_cache(dir.path(), &models, None).expect("persist cache");
+        persist_cache(dir.path(), &models, None, CODEX_CLIENT_VERSION).expect("persist cache");
 
         for model in &models {
             for id in [model.slug.clone(), format!("openai/{}", model.slug)] {
@@ -823,8 +896,13 @@ mod tests {
     #[test]
     fn subscription_context_window_works_without_cached_metadata() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        persist_cache(dir.path(), &[remote("gpt-6-astra", 1, "list")], None)
-            .expect("persist cache without context metadata");
+        persist_cache(
+            dir.path(),
+            &[remote("gpt-6-astra", 1, "list")],
+            None,
+            CODEX_CLIENT_VERSION,
+        )
+        .expect("persist cache without context metadata");
 
         for cache_dir in [None, Some(dir.path())] {
             for model in ["openai/gpt-6-astra", "gpt-5.5", "gpt-future"] {
@@ -843,7 +921,7 @@ mod tests {
         let mut model = remote("gpt-6-astra", 1, "list");
         model.context_window = Some(272_000);
         model.effective_context_window_percent = 90;
-        persist_cache(dir.path(), &[model], None).expect("persist cache");
+        persist_cache(dir.path(), &[model], None, CODEX_CLIENT_VERSION).expect("persist cache");
 
         let custom = resolve_context_limits(Some(dir.path()), "openai/gpt-6-astra", 500_000)
             .expect("custom limits");
@@ -859,7 +937,7 @@ mod tests {
         model.context_window = Some(272_000);
         model.max_context_window = Some(272_000);
         model.auto_compact_token_limit = Some(244_800);
-        persist_cache(dir.path(), &[model], None).expect("persist cache");
+        persist_cache(dir.path(), &[model], None, CODEX_CLIENT_VERSION).expect("persist cache");
 
         for (requested, expected) in [(1, 16_000), (2_000_000, 1_000_000)] {
             for cache_dir in [None, Some(dir.path())] {

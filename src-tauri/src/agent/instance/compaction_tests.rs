@@ -16,6 +16,7 @@ async fn compaction_uses_the_native_agent_tool_snapshot_and_existing_http_turn()
         api_format: crate::commands::ApiFormat::OpenaiResponses,
         context_length: 500_000,
         remote_compaction_mode: crate::commands::RemoteCompactionMode::CodexV2,
+        codex_transport: None,
         supports_tool_lazy_loading: true,
         supported_reasoning_efforts: vec![],
         reasoning_param_format:

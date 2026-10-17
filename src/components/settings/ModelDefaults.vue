@@ -2,9 +2,10 @@
 import { computed } from "vue";
 import { t } from "../../i18n";
 import type { ModelOption, ModelDefaults, AgentInfo, EffortLevel } from "../../types";
-import { visibleProviderOrder, isProviderVisible } from "../../config/providerVisibility";
+import { visibleProviderOrder } from "../../config/providerVisibility";
 import { formatModelDisplayName, modelSupportsFastMode } from "../../utils/modelDisplay";
 import { groupModelsForSelector, modelListEntryName } from "../../utils/modelGrouping";
+import { isRemoteClaudeCode } from "../../services/claudeConnection";
 import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 
 const props = defineProps<{
@@ -23,7 +24,7 @@ const emit = defineEmits<{
 const providerLabels = computed<Record<string, string>>(() => ({
   openrouter: "OpenRouter",
   anthropic: t("model.provider.anthropic"),
-  claude_code: t("model.provider.claude_code"),
+  claude_code: t(isRemoteClaudeCode.value ? "model.provider.claude_code.remote" : "model.provider.claude_code"),
   openai_codex: t("model.provider.openai"),
   custom: t("model.provider.custom"),
 }));
@@ -142,13 +143,6 @@ function updateSubagentSpeed(agentId: string, value: string) {
   emit("update:modelDefaults", { ...props.modelDefaults, subagentFastModes });
   emit("save");
 }
-
-const claudeCodeVisible = isProviderVisible("claude_code");
-
-function updateClaudeCodeEnabled(value: boolean) {
-  emit("update:modelDefaults", { ...props.modelDefaults, claudeCodeEnabled: value });
-  emit("save");
-}
 </script>
 
 <template>
@@ -190,20 +184,6 @@ function updateClaudeCodeEnabled(value: boolean) {
         :aria-label="t('settings.models.plan')"
         @update:model-value="updatePlanModel"
       />
-    </div>
-
-    <div class="model-default-card compact" v-if="claudeCodeVisible">
-      <div class="model-default-row">
-        <div class="model-default-agent">
-          <span class="model-default-label">{{ t("settings.models.claudeCodeEnable") }}</span>
-          <span class="model-default-hint">{{ t("settings.models.claudeCodeEnableHint") }}</span>
-        </div>
-        <input
-          type="checkbox"
-          :checked="modelDefaults.claudeCodeEnabled === true"
-          @change="updateClaudeCodeEnabled(($event.target as HTMLInputElement).checked)"
-        />
-      </div>
     </div>
 
     <div class="section-label" style="margin-top: 8px;">{{ t("settings.models.subagent") }}</div>

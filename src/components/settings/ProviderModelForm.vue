@@ -92,6 +92,21 @@ function setReasoningEffortEnabled(effort: EffortLevel, enabled: boolean) {
 function updateReplayField(value: string) {
   props.model.reasoningReplayField = value === "" ? null : (value as ReasoningReplayField);
 }
+
+const responsesTransportOptions = computed(() => [
+  { value: "responses", label: t("settings.custom.responsesHttp") },
+  { value: "websocket", label: "Codex WebSocket" },
+  { value: "http", label: "Codex HTTP" },
+]);
+
+function updateCodexTransport(value: string) {
+  const wasCodex = props.model.codexTransport != null;
+  props.model.codexTransport = value === "http" || value === "websocket" ? value : null;
+  if (props.model.codexTransport) {
+    props.model.remoteCompactionMode = "codex_v2";
+    if (!wasCodex) props.model.supportsToolLazyLoading = true;
+  }
+}
 </script>
 
 <template>
@@ -137,11 +152,25 @@ function updateReplayField(value: string) {
     </div>
 
     <template v-if="apiFormat === 'openai_responses'">
+      <span class="form-row-label">{{ t("settings.custom.responsesTransport") }}</span>
+      <div class="form-control">
+        <BaseDropdown
+          class="select-md"
+          size="md"
+          menu-align="start"
+          :model-value="model.codexTransport ?? 'responses'"
+          :options="responsesTransportOptions"
+          :aria-label="t('settings.custom.responsesTransport')"
+          :disabled="saving"
+          @update:model-value="updateCodexTransport"
+        />
+        <span v-if="model.codexTransport" class="form-option-desc">{{ t("settings.custom.codexTransportDesc") }}</span>
+      </div>
       <span class="form-row-label form-row-label-top">{{ t("settings.custom.remoteCompaction") }}</span>
       <div class="form-control">
         <div class="form-option-row">
           <BaseCheckbox
-            :disabled="saving"
+            :disabled="saving || !!model.codexTransport"
             :model-value="model.remoteCompactionMode === 'codex_v2'"
             :aria-label="t('settings.custom.remoteCompaction')"
             @update:model-value="model.remoteCompactionMode = $event ? 'codex_v2' : 'disabled'"
@@ -149,6 +178,16 @@ function updateReplayField(value: string) {
           <span class="form-option-desc">{{ t("settings.custom.remoteCompactionDesc") }}</span>
         </div>
       </div>
+      <template v-if="model.codexTransport">
+        <span class="form-row-label">{{ t("settings.custom.nativeToolLoading") }}</span>
+        <div class="form-control form-control-inline">
+          <BaseCheckbox
+            v-model="model.supportsToolLazyLoading"
+            :disabled="saving"
+            :aria-label="t('settings.custom.nativeToolLoading')"
+          />
+        </div>
+      </template>
     </template>
 
     <span class="form-row-label">{{ t("settings.custom.imageUnderstanding") }}</span>

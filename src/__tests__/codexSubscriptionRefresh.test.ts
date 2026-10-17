@@ -133,4 +133,86 @@ describe("Codex subscription refresh", () => {
     await models.loadCodexAvailableModels();
     expect(mocks.invoke).toHaveBeenCalledWith("get_codex_available_models", { forceRefresh: false });
   });
+
+  it("defaults automatic client versions on and preserves an explicitly disabled choice", async () => {
+    const { state } = setup();
+    expect(state.codexModelConfig.value.autoUpdateClientVersion).toBe(true);
+    mocks.invoke.mockResolvedValueOnce({ transport: "http" });
+    await state.loadCodexModelConfig();
+    expect(state.codexModelConfig.value.autoUpdateClientVersion).toBe(true);
+    mocks.invoke.mockResolvedValueOnce({ transport: "http", autoUpdateClientVersion: false });
+    await state.loadCodexModelConfig();
+    expect(state.codexModelConfig.value.autoUpdateClientVersion).toBe(false);
+    mocks.invoke.mockResolvedValueOnce({ transport: "http", autoUpdateClientVersion: true });
+    await state.loadCodexModelConfig();
+    expect(state.codexModelConfig.value.autoUpdateClientVersion).toBe(true);
+  });
+
+  it.each([true, false])("saves automatic versions=%s before refreshing models and blocks overlapping refreshes", async (enabled) => {
+    const { state, models, modelRequest } = setup();
+    state.codexModelConfig.value.autoUpdateClientVersion = !enabled;
+    const saved = deferred<void>();
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "save_codex_model_config") return saved.promise;
+      if (command === "get_codex_available_models") return modelRequest.promise;
+      throw new Error(`Unexpected IPC command: ${command}`);
+    });
+
+    const change = state.setCodexAutoUpdateClientVersion(enabled);
+    expect(state.codexClientVersionBusy.value).toBe(true);
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+    expect(mocks.invoke).toHaveBeenCalledWith("save_codex_model_config", {
+      config: expect.objectContaining({ autoUpdateClientVersion: enabled }),
+    });
+    await state.setCodexAutoUpdateClientVersion(!enabled);
+    await state.refreshCodexSubscription();
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+
+    saved.resolve();
+    await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("get_codex_available_models", { forceRefresh: true }));
+    modelRequest.resolve([existingModel, newModel]);
+    await change;
+    expect(state.codexModelConfig.value.autoUpdateClientVersion).toBe(enabled);
+    expect(models.codexRemoteModels.map((model) => model.id)).toContain(newModel.id);
+    expect(state.codexClientVersionBusy.value).toBe(false);
+  });
+
+  it("rolls back the switch when saving fails, without fetching models", async () => {
+    const { state } = setup();
+    mocks.invoke.mockRejectedValueOnce(new Error("Disk unavailable"));
+    await state.setCodexAutoUpdateClientVersion(false);
+    expect(state.codexModelConfig.value.autoUpdateClientVersion).toBe(true);
+    expect(state.codexClientVersionBusy.value).toBe(false);
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+    expect(mocks.addNotice).toHaveBeenCalledWith("error", expect.stringContaining("Disk unavailable"), {
+      code: "unknown", operation: "saveCodexModelConfig",
+    });
+  });
+
+  it("keeps a saved switch and the previous models when its immediate refresh fails", async () => {
+    const { state, models } = setup();
+    state.codexModelConfig.value.autoUpdateClientVersion = false;
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "save_codex_model_config") return Promise.resolve();
+      if (command === "get_codex_available_models") return Promise.reject(new Error("Models unavailable"));
+      throw new Error(`Unexpected IPC command: ${command}`);
+    });
+    await state.setCodexAutoUpdateClientVersion(true);
+    expect(state.codexModelConfig.value.autoUpdateClientVersion).toBe(true);
+    expect(state.codexClientVersionBusy.value).toBe(false);
+    expect(models.codexRemoteModels).toEqual([existingModel]);
+    expect(mocks.addNotice).toHaveBeenCalledWith("error", "Models unavailable", {
+      code: "unknown", operation: "codexModelsRefresh",
+    });
+  });
+
+  it("can save the setting before login without requesting a subscription catalog", async () => {
+    const { state } = setup();
+    state.codexStatus.value.authenticated = false;
+    mocks.invoke.mockResolvedValueOnce(undefined);
+    await state.setCodexAutoUpdateClientVersion(false);
+    expect(state.codexModelConfig.value.autoUpdateClientVersion).toBe(false);
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+    expect(state.codexClientVersionBusy.value).toBe(false);
+  });
 });

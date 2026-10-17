@@ -196,6 +196,12 @@ pub async fn get_last_model(_app_handle: AppHandle) -> Result<String, AppError> 
 
 #[tauri::command]
 pub async fn save_last_model(model_id: String, _app_handle: AppHandle) -> Result<(), AppError> {
+    store_last_model(&model_id).map_err(AppError::from)
+}
+
+/// Writes the global most-recent model, the fallback for workspaces that have
+/// no remembered selection yet.
+pub(crate) fn store_last_model(model_id: &str) -> Result<(), String> {
     let trimmed = model_id.trim();
     // Save to persistent location (~/.locus/) — survives reinstalls
     let dir = persistent_config_dir().map_err(|e| format!("Failed to get config dir: {}", e))?;
@@ -284,20 +290,28 @@ pub async fn save_agent_model_preference(
     effort: String,
     _app_handle: AppHandle,
 ) -> Result<(), AppError> {
+    store_agent_model_preference(&agent_id, &model_id, &effort).map_err(AppError::from)
+}
+
+pub(crate) fn store_agent_model_preference(
+    agent_id: &str,
+    model_id: &str,
+    effort: &str,
+) -> Result<(), String> {
     let agent_id = crate::agent::definition::canonical_agent_id(agent_id.trim());
     if agent_id.is_empty() {
-        return Err("Agent id cannot be empty".to_string().into());
+        return Err("Agent id cannot be empty".to_string());
     }
     if crate::agent::definition::is_removed_agent_id(agent_id) {
-        return Err(format!("Unknown agent: {}", agent_id).into());
+        return Err(format!("Unknown agent: {}", agent_id));
     }
     let model_id = model_id.trim();
     if model_id.is_empty() {
-        return Err("Model id cannot be empty".to_string().into());
+        return Err("Model id cannot be empty".to_string());
     }
     let effort = effort.trim();
     if !matches!(effort, "none" | "low" | "medium" | "high" | "xhigh" | "max") {
-        return Err(format!("Unsupported reasoning effort: {}", effort).into());
+        return Err(format!("Unsupported reasoning effort: {}", effort));
     }
 
     let mut preferences = load_agent_model_preferences();
@@ -344,10 +358,6 @@ pub struct ModelDefaults {
     /// standard Codex service tier for that sub-agent.
     #[serde(default)]
     pub subagent_fast_modes: std::collections::HashMap<String, bool>,
-    /// Opt-in flag: Claude Code CLI models only join the model list after the
-    /// user explicitly enables them in model configuration.
-    #[serde(default)]
-    pub claude_code_enabled: bool,
 }
 
 impl Default for ModelDefaults {
@@ -358,7 +368,6 @@ impl Default for ModelDefaults {
             subagent_models: std::collections::HashMap::new(),
             subagent_efforts: std::collections::HashMap::new(),
             subagent_fast_modes: std::collections::HashMap::new(),
-            claude_code_enabled: false,
         }
     }
 }
@@ -385,6 +394,10 @@ fn default_codex_prefix_cache_ttl_seconds() -> u32 {
     DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS
 }
 
+fn default_codex_auto_update_client_version() -> bool {
+    true
+}
+
 impl Default for CodexTransportMode {
     fn default() -> Self {
         Self::Websocket
@@ -394,6 +407,9 @@ impl Default for CodexTransportMode {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexModelConfig {
+    /// Follow the stable CLI/app-server version when refreshing the model catalog.
+    #[serde(default = "default_codex_auto_update_client_version")]
+    pub auto_update_client_version: bool,
     #[serde(default)]
     pub transport: CodexTransportMode,
     /// Raw context window for all Codex subscription models. Missing values retain
@@ -421,6 +437,7 @@ pub struct CodexModelConfig {
 impl Default for CodexModelConfig {
     fn default() -> Self {
         Self {
+            auto_update_client_version: default_codex_auto_update_client_version(),
             transport: CodexTransportMode::default(),
             context_window: None,
             extended_context: false,
@@ -468,13 +485,16 @@ pub(crate) fn load_codex_model_config() -> Result<CodexModelConfig, String> {
 #[tauri::command]
 pub async fn get_model_defaults(_app_handle: AppHandle) -> Result<ModelDefaults, AppError> {
     let primary_path = persistent_config_dir()?.join("model_defaults.json");
-    if let Some(defaults) = std::fs::read_to_string(&primary_path)
+    let mut defaults = std::fs::read_to_string(&primary_path)
         .ok()
         .and_then(|s| serde_json::from_str::<ModelDefaults>(&s).ok())
-    {
-        return Ok(defaults);
+        .unwrap_or_default();
+    // A pinned main model used to override every manual switch. It now seeds
+    // the remembered selection once; users can pin it again in Settings.
+    if let Err(error) = super::selection_memory::migrate_legacy_main_model(&mut defaults) {
+        tracing::warn!("[model] main model selection migration failed: {error}");
     }
-    Ok(ModelDefaults::default())
+    Ok(defaults)
 }
 
 #[tauri::command]
@@ -482,7 +502,11 @@ pub async fn save_model_defaults(
     defaults: ModelDefaults,
     _app_handle: AppHandle,
 ) -> Result<(), AppError> {
-    let json = serde_json::to_string_pretty(&defaults)
+    write_model_defaults(&defaults).map_err(AppError::from)
+}
+
+pub(crate) fn write_model_defaults(defaults: &ModelDefaults) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(defaults)
         .map_err(|e| format!("Failed to serialize: {}", e))?;
     // Save to persistent location
     let dir = persistent_config_dir().map_err(|e| format!("Failed to get config dir: {}", e))?;
@@ -494,6 +518,17 @@ pub async fn save_model_defaults(
 #[tauri::command]
 pub async fn get_codex_model_config() -> Result<CodexModelConfig, AppError> {
     load_codex_model_config().map_err(AppError::from)
+}
+
+#[tauri::command]
+pub fn get_claude_code_models() -> Result<Vec<serde_json::Value>, String> {
+    let connection = crate::llm::claude_code_cli::ssh::load_settings()?;
+    let model = if connection.remote.is_some() {
+        connection.info.and_then(|info| info.model)
+    } else { crate::llm::claude_code_cli::configured_model() };
+    Ok(model.into_iter().map(|model| serde_json::json!({
+        "id": format!("claude_code/{model}"), "name": model, "provider": "claude_code"
+    })).collect())
 }
 
 #[tauri::command]
@@ -516,6 +551,7 @@ pub async fn get_codex_available_models(
         config.base_url.as_deref(),
         &cache_dir,
         force_refresh.unwrap_or(false),
+        load_codex_model_config().map_err(AppError::from)?.auto_update_client_version,
     )
     .await
     .map_err(AppError::from)
@@ -701,7 +737,26 @@ pub(crate) fn normalize_custom_endpoint_config(endpoint: &mut CustomEndpoint) {
 }
 
 #[tauri::command]
-pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, AppError> {
+pub async fn test_custom_endpoint(
+    endpoint: CustomEndpoint,
+    codex_transport: Option<CodexTransportMode>,
+) -> Result<String, AppError> {
+    if let Some(transport) = codex_transport.filter(|_| endpoint.api_format == ApiFormat::OpenaiResponses) {
+        use crate::llm::codex;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let message = serde_json::from_value(serde_json::json!({
+            "id": "probe", "role": "user", "content": "Reply OK.", "createdAt": 0,
+        })).map_err(|e| format!("Failed to prepare connection test: {e}"))?;
+        let mut turn = codex::TurnState::default();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(35), codex::stream_chat(
+            &endpoint.api_key, None, transport, Some(&endpoint.endpoint), &endpoint.api_model,
+            "Connection test.", &[message], &[], None, Some("low"), false, false,
+            Some(&session_id), None, &mut turn, &|_| {}, &|_| {}, &|_, _| {},
+        )).await;
+        codex::reset_cached_session_window(&session_id).await;
+        return result.map_err(|_| "Codex connection test timed out".to_string())?
+            .map(|response| response.text).map_err(Into::into);
+    }
     let client = crate::network::reqwest_client(
         crate::network::ReqwestClientOptions::new()
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -850,7 +905,7 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
     }
 }
 
-// ===== Custom providers (v3: model-level remote compaction capability) =====
+// ===== Custom providers (v4: opt-in Codex transport) =====
 //
 // Stored in custom_providers.json; api keys stay in the keychain under the
 // legacy "endpoint/{provider_id}" name so migrated endpoints keep their
@@ -890,6 +945,10 @@ pub struct CustomProviderModel {
     pub context_length: u32,
     #[serde(default)]
     pub remote_compaction_mode: RemoteCompactionMode,
+    /// None keeps the generic Responses client. Some opts into the complete
+    /// Codex wire protocol using the provider's API key and base URL.
+    #[serde(default)]
+    pub codex_transport: Option<CodexTransportMode>,
     /// Protocol-native lazy tool loading (`defer_loading`/`tool_reference`)
     /// for Anthropic-format endpoints; the endpoint must support it.
     #[serde(default)]
@@ -938,7 +997,7 @@ struct CustomProvidersFile {
     providers: Vec<CustomProvider>,
 }
 
-const CUSTOM_PROVIDERS_FILE_VERSION: u32 = 3;
+const CUSTOM_PROVIDERS_FILE_VERSION: u32 = 4;
 
 pub(crate) fn custom_providers_path() -> Result<std::path::PathBuf, String> {
     Ok(persistent_config_dir()?.join("custom_providers.json"))
@@ -990,6 +1049,11 @@ pub(crate) fn normalize_custom_provider_config(provider: &mut CustomProvider) {
     let api_format = provider.api_format.clone();
     let mut seen_ids: HashSet<String> = HashSet::new();
     for model in &mut provider.models {
+        if api_format != ApiFormat::OpenaiResponses {
+            model.codex_transport = None;
+        } else if model.codex_transport.is_some() {
+            model.remote_compaction_mode = RemoteCompactionMode::CodexV2;
+        }
         if model.id.trim().is_empty() {
             model.id = model_row_id_from_api_model(&model.api_model);
         } else {
@@ -1050,6 +1114,7 @@ fn migrate_endpoint_to_provider(mut endpoint: CustomEndpoint) -> CustomProvider 
             api_model: endpoint.api_model,
             context_length: endpoint.context_length,
             remote_compaction_mode: RemoteCompactionMode::Disabled,
+            codex_transport: None,
             supports_tool_lazy_loading: endpoint.supports_tool_lazy_loading,
             supported_reasoning_efforts: endpoint.supported_reasoning_efforts,
             reasoning_param_format: endpoint.reasoning_param_format,
@@ -1139,7 +1204,11 @@ fn migrate_custom_providers_file(file: &mut CustomProvidersFile) -> bool {
     // in-memory default after the first successful load.
     for provider in &mut file.providers {
         for model in &mut provider.models {
-            model.remote_compaction_mode = RemoteCompactionMode::Disabled;
+            if file.version < 3 {
+                model.remote_compaction_mode = RemoteCompactionMode::Disabled;
+            }
+            // Existing endpoints must not silently switch wire protocols.
+            model.codex_transport = None;
         }
     }
     file.version = CUSTOM_PROVIDERS_FILE_VERSION;
@@ -1769,7 +1838,7 @@ fn normalized_hidden_directory_set(hidden_dirs: Vec<String>) -> HashSet<String> 
         .collect()
 }
 
-fn should_skip_workspace_entry_with_hidden(
+pub(super) fn should_skip_workspace_entry_with_hidden(
     file_name: &str,
     is_dir: bool,
     exclude_meta: bool,
@@ -1802,7 +1871,7 @@ fn join_workspace_rel_path(sub_path: &str, file_name: &str) -> String {
     }
 }
 
-fn is_allowed_linked_asset_rel_path(rel_path: &str) -> bool {
+pub(super) fn is_allowed_linked_asset_rel_path(rel_path: &str) -> bool {
     LINKED_ASSET_ROOT_DIRS.iter().any(|root| {
         rel_path == *root
             || rel_path
@@ -2792,6 +2861,18 @@ pub async fn close_headless_unity_project(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn restart_unresponsive_unity_project(
+    app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    expected_process_id: u32,
+    expected_created_at_ms: u64,
+) -> Result<(), AppError> {
+    crate::sdk::restart_unresponsive_unity_editor(
+        &app_handle, workspace_ref, expected_process_id, expected_created_at_ms,
+    ).await.map_err(AppError::from)
+}
+
 /// Drive a Unity recompile + domain reload and wait for it to settle. Thin
 /// wrapper over `recompile_and_wait` so plugin pushes and corpus changes can
 /// be converged deterministically from a host driver (the same flow the
@@ -3254,7 +3335,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_codex_model_config_keeps_opt_in_features_disabled() {
+    fn legacy_codex_model_config_defaults() {
         let config: CodexModelConfig =
             serde_json::from_str(r#"{"transport":"websocket"}"#).expect("codex config");
 
@@ -3268,6 +3349,11 @@ mod tests {
         assert!(!config.generate_session_titles);
         assert!(!config.auto_review);
         assert!(!config.use_apply_patch);
+        assert!(config.auto_update_client_version);
+        assert!(CodexModelConfig::default().auto_update_client_version);
+        let explicitly_disabled: CodexModelConfig =
+            serde_json::from_str(r#"{"autoUpdateClientVersion":false}"#).expect("codex config");
+        assert!(!explicitly_disabled.auto_update_client_version);
         assert_eq!(
             config.prefix_cache_ttl_seconds,
             DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS
@@ -3777,6 +3863,25 @@ mod tests {
     }
 
     #[test]
+    fn custom_codex_v3_migration_keeps_compaction_and_defaults_to_generic_http() {
+        let mut file: CustomProvidersFile = serde_json::from_value(serde_json::json!({
+            "version":3, "providers":[{"id":"cpa", "name":"CPA", "endpoint":"http://localhost/v1",
+                "apiFormat":"openai_responses", "models":[{"id":"sol", "name":"Sol",
+                    "apiModel":"gpt-5.6-sol", "remoteCompactionMode":"codex_v2"}]}]
+        })).unwrap();
+        assert!(migrate_custom_providers_file(&mut file));
+        assert_eq!(file.providers[0].models[0].remote_compaction_mode, RemoteCompactionMode::CodexV2);
+        assert_eq!(file.providers[0].models[0].codex_transport, None);
+        let persisted = serde_json::to_string(&file).unwrap();
+        let mut reloaded: CustomProvidersFile = serde_json::from_str(&persisted).unwrap();
+        assert!(!migrate_custom_providers_file(&mut reloaded));
+        reloaded.providers[0].models[0].codex_transport = Some(CodexTransportMode::Websocket);
+        reloaded.providers[0].models[0].remote_compaction_mode = RemoteCompactionMode::Disabled;
+        normalize_custom_provider_config(&mut reloaded.providers[0]);
+        assert_eq!(reloaded.providers[0].models[0].remote_compaction_mode, RemoteCompactionMode::CodexV2);
+    }
+
+    #[test]
     fn deepseek_v4_provider_forces_reasoning_replay_and_infers_its_field() {
         let mut provider: CustomProvider = serde_json::from_value(serde_json::json!({
             "id": "deepseek",
@@ -3819,6 +3924,7 @@ mod tests {
                     name: mid.to_string(),
                     context_length: 128_000,
                     remote_compaction_mode: RemoteCompactionMode::Disabled,
+                    codex_transport: None,
                     supports_tool_lazy_loading: false,
                     supported_reasoning_efforts: vec!["high".to_string()],
                     reasoning_param_format: None,

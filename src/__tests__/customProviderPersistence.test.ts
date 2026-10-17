@@ -114,6 +114,7 @@ function providerModel(partial: Partial<CustomProviderModel> = {}): CustomProvid
     name: "model",
     contextLength: 256000,
     remoteCompactionMode: "disabled",
+    codexTransport: null,
     supportsToolLazyLoading: false,
     supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
     reasoningParamFormat: "openai_chat_reasoning_effort",
@@ -336,6 +337,38 @@ describe("custom provider persistence", () => {
         models: [expect.objectContaining({ remoteCompactionMode: "codex_v2" })],
       }),
     ]);
+  });
+
+  it("persists a Codex gateway transport, enables compaction, and tests the selected route", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    state.startAddCustomProvider();
+    const draft = state.editingCustomProvider.value!;
+    draft.name = "CPA";
+    draft.endpoint = "http://192.168.0.2:8317/v1";
+    draft.apiFormat = "openai_responses";
+    draft.models[0].apiModel = "gpt-6-luna";
+    draft.models[0].codexTransport = "websocket";
+    modelServiceMocks.testCustomEndpoint.mockResolvedValueOnce("OK");
+    await state.testCustomProvider();
+    expect(modelServiceMocks.testCustomEndpoint).toHaveBeenCalledWith(
+      expect.objectContaining({ apiModel: "gpt-6-luna" }), "websocket",
+    );
+    await state.saveCustomProvider();
+    expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledWith([
+      expect.objectContaining({ models: [expect.objectContaining({
+        codexTransport: "websocket", remoteCompactionMode: "codex_v2",
+      })] }),
+    ]);
+  });
+
+  it("keeps legacy endpoints on generic HTTP and clears Codex transport on other formats", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({ id: "legacy", name: "Legacy", apiFormat: "openai_responses", models: [providerModel({ codexTransport: undefined })] }),
+      provider({ id: "chat", name: "Chat", apiFormat: "openai_chat", models: [providerModel({ codexTransport: "websocket" })] }),
+    ]);
+    await state.loadCustomProviders();
+    expect(state.customProviders.value.map((p) => p.models[0].codexTransport)).toEqual([null, null]);
   });
 
   it("normalizes legacy OpenAI Chat models to replay reasoning content", async () => {

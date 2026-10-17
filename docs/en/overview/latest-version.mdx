@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.8.4 (2026-09-23)"
+description: "Locus v0.9.0 (2026-10-18)"
 sidebarTitle: "Latest Version"
-version: "0.8.4"
-releasedAt: "2026-09-23"
+version: "0.9.0"
+releasedAt: "2026-10-18"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,57 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.0/locus_0.9.0_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.9.0/locus_0.9.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.9.0 (Added)
+
+- Right-click a workspace in the workspace selector to open it in a separate window.
+- Views can have their own name and icon (a built-in icon or your own SVG), and you can choose whether each View opens in a tab or a new window.
+- Right-click a View to change its settings, export it, open it in Unity and more. Views that come with a plugin show where they come from and are protected from accidental deletion.
+- You can `@` mention a View in the chat input, and global search now finds Views too.
+- Views can read and update the properties and text of Markdown documents, which makes it easy to build tables, boards and similar tools on top of your documents.
+- Building Unity settings pages in a View is simpler: add a field component and it shows and edits that property for you. Prefab fields show whether a value is inherited or overridden.
+- Views can open as windows inside Unity or be embedded in the Inspector, and can show live Unity rendering in a Locus panel.
+- Unity lists in the property editor support paging, search, drag-to-reorder, insert, duplicate and setting the item count. Common Odin list and group settings are respected.
+- Claude Code can run on this computer or on a remote server over SSH, while tools still run locally. Set it up under Experimental settings.
+- Any folder can be added as a workspace. Knowledge and Unity test tools can be turned on per workspace, and a new General Agent works for non-Unity projects. New chats remember the Agent and model you last used in each workspace.
+- You can choose which Agents a knowledge document is shared with. New documents are shared with all Agents.
+- In the chat input you can `@` reference earlier chats or objects in your open scenes, switch chats, and see or stop background tasks.
+- The file explorer supports drag-to-reorder and move, creating, renaming, dropping files from your computer and hiding files. You can view a file's Git history and restore an older version.
+- The document editor adds a properties panel, `@` mentions, image pasting and automatic draft recovery. Quotes and brackets are closed automatically while typing.
+- `Ctrl+F` searches the current document or list, and global search can find files and Views.
+- If Unity stops responding for 30 seconds, Locus works out what it is stuck on and where, and you can restart Unity with one click.
+- `/capture-scene` and `/capture-game` take a screenshot together with object and position data, so the Agent can tell which objects are in the picture and where they are.
+- Unity tests show their progress while running, and you can exclude specific tests.
+- Profiling Unity has less overhead while collecting data.
+- Custom providers can connect to Codex-compatible services, and Locus can automatically follow the latest Codex version.
+- CSV tables have a right-click menu and `Ctrl+F` search.
+
+### v0.9.0 (Fixed)
+
+- Editing Unity properties is more reliable: Undo restores the exact previous value, typing in a field no longer reloads the whole page, and only the changed field is refreshed.
+- Views and property panels load faster, and reading Unity assets in large projects is quicker.
+- Views update automatically when properties change in Unity, without constant refreshing while objects move in Play Mode.
+- Restored View tabs show the right icon and title, and renaming a View or changing its icon updates its tab right away.
+- Locus windows inside Unity are more reliable: they keep their content when Unity recompiles scripts, recover automatically after a crash with your drafts kept, offer a retry if loading takes too long, and step aside when Unity pop-ups such as the Color Picker open.
+- With Claude Code, tools are no longer listed twice, and a tool result Claude cannot use is shown as failed instead of successful.
+- Skill packages stored in a project can be selected and used again instead of reporting that the Skill was not found.
+- File paths used by Agent tools are always relative to the current workspace.
+- Skill scripts run in the current workspace folder.
+- Modified scenes are saved automatically before Unity tests run.
+- The Rename and More buttons in the workspace tree show proper labels again.
+- Right-click menus and dropdowns appear in the right place when several windows are open.
+- The chat navigation bar no longer fades in again when switching chats.
+- Image previews fill the available space.
+
+### v0.9.0 (Removed)
+
+- The old way of showing Locus inside Unity has been replaced by the new native windows.
+- The old Claude Code connection has been replaced by the new built-in runtime. The Claude Code switch moved from Model Defaults to Experimental settings.
 
 ### v0.8.4 (Added)
 

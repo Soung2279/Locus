@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.8.4 (2026-09-23)"
+description: "Locus v0.9.0 (2026-10-18)"
 sidebarTitle: "当前版本"
-version: "0.8.4"
-releasedAt: "2026-09-23"
+version: "0.9.0"
+releasedAt: "2026-10-18"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,57 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.0/locus_0.9.0_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.9.0/locus_0.9.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.9.0（新增）
+
+- 在工作区选择器上右键工作区，可以在独立窗口内打开该工作区。
+- View 可以设置自己的名称和图标（内置图标或自己的 SVG），并可选择每个 View 在标签页还是新窗口中打开。
+- 右键 View 即可修改设置、导出、在 Unity 中打开等。插件自带的 View 会标明来源，避免被误删。
+- 聊天输入框可以 `@` 提及 View，全局搜索也能找到 View。
+- View 可以读取和修改 Markdown 文档的属性和正文，方便基于文档制作表格、看板等工具。
+- 在 View 中制作 Unity 配置页面更简单：放上字段组件，就能显示并编辑对应的属性；预制体字段会标出数值是继承的还是被覆盖的。
+- View 可以作为窗口在 Unity 中打开，也可以嵌入 Inspector；还能在 Locus 面板中显示 Unity 的实时渲染画面。
+- 属性编辑器中的 Unity 列表支持翻页、搜索、拖动排序、插入、复制和设置数量，并支持 Odin 常用的列表与分组设置。
+- Claude Code 可以在本机或通过 SSH 在远程服务器上运行，工具仍在本机执行。可在“实验性设置”中配置。
+- 任意文件夹都可以添加为工作区，知识库和 Unity 测试工具可按工作区开关；新增适合非 Unity 项目的 General Agent。新会话会记住你在每个工作区上次使用的 Agent 和模型。
+- 可以选择知识文档要提供给哪些 Agent，新文档默认提供给所有 Agent。
+- 聊天输入框可以 `@` 引用之前的会话或已打开场景中的物体，也可以切换会话、查看并停止后台任务。
+- 文件管理支持拖动排序和移动、新建、重命名、从电脑拖入文件和隐藏文件；可以查看文件的 Git 历史并恢复旧版本。
+- 文档编辑器新增属性面板、`@` 提及、粘贴图片和草稿自动恢复；输入时会自动补全引号和括号。
+- `Ctrl+F` 可以在当前文档或列表中查找，全局搜索可以找到文件和 View。
+- Unity 无响应 30 秒后，Locus 会自动分析卡在哪里、为什么卡住，并可一键重启 Unity。
+- 新增 `/capture-scene` 和 `/capture-game`，截图时一并记录物体和位置信息，Agent 能知道画面里有哪些物体、它们在哪里。
+- Unity 测试运行时会显示进度，并可排除指定的测试。
+- 采集 Unity 性能数据时开销更小。
+- 自定义提供方可以接入兼容 Codex 的服务，Locus 也可以自动跟随最新的 Codex 版本。
+- CSV 表格新增右键菜单和 `Ctrl+F` 查找。
+
+### v0.9.0（修复）
+
+- 编辑 Unity 属性更可靠：撤销能准确恢复修改前的值，在字段中连续输入不会重新加载整个页面，只刷新改动的字段。
+- View 和属性面板加载更快，大型项目中读取 Unity 资产也更快。
+- Unity 中的属性发生变化时，View 会自动更新；播放模式下物体移动不会导致频繁刷新。
+- 重启后恢复的 View 标签能正确显示图标和标题；修改 View 名称或图标后，标签会立即更新。
+- Unity 中的 Locus 窗口更可靠：Unity 重新编译脚本后内容保持不变，崩溃后会自动恢复并保留草稿，加载太久时可以重试，打开拾色器等 Unity 弹窗时会自动让开。
+- 使用 Claude Code 时，同一个工具不再重复出现；工具结果无法被 Claude 使用时会显示为失败，而不是成功。
+- 项目中的 Skill 包可以正常选用，不再提示找不到 Skill。
+- Agent 工具使用的文件路径统一以当前工作区为准。
+- Skill 的脚本在当前工作区目录中运行。
+- 运行 Unity 测试前会自动保存修改过的场景。
+- 工作区树中的“重命名”和“更多”按钮恢复正常显示。
+- 打开多个窗口时，右键菜单和下拉框显示在正确的位置。
+- 切换会话时，对话导航条不再重新淡入。
+- 图片预览会填满可用区域。
+
+### v0.9.0（移除）
+
+- Unity 中显示 Locus 的旧方式已由新的原生窗口取代。
+- Claude Code 的旧连接方式已由新的内置运行方式取代，Claude Code 开关从“模型默认值”移到了“实验性设置”。
 
 ### v0.8.4（新增）
 

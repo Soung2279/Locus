@@ -20,8 +20,10 @@ const props = withDefaults(defineProps<{
   targetLoading: boolean;
   loadTarget: (previewKey: string, targetId: string) => Promise<SemanticTargetInspector | null>;
   showClose?: boolean;
+  showIdentity?: boolean;
 }>(), {
   showClose: true,
+  showIdentity: true,
   focusLine: null,
 });
 
@@ -77,9 +79,9 @@ async function onTreeSelect(targetId: string) {
 
 <template>
   <div class="aph-root">
-    <div class="aph-header">
-      <span class="aph-name">{{ selectedName }}</span>
-      <span class="aph-path">{{ selectedPath }}</span>
+    <div v-if="showIdentity || payload?.kind === 'structured'" class="aph-header">
+      <span v-if="showIdentity" class="aph-name">{{ selectedName }}</span>
+      <span v-if="showIdentity" class="aph-path">{{ selectedPath }}</span>
       <span class="aph-spacer" />
       <BaseButton
         v-if="canSelectInUnity"

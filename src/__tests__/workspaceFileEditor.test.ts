@@ -178,7 +178,7 @@ describe("workspace file editor", () => {
     const editor = host.querySelector<HTMLElement>(".workspace-file-editor-test-change");
     expect(editor?.dataset.contentPath).toBe("F:\\Game\\Docs\\combat.md");
     expect(editor?.dataset.viewMode).toBe("rendered");
-    expect(host.querySelector(".document-page .document-title")?.textContent).toBe("combat");
+    expect(host.querySelector<HTMLInputElement>(".document-page .document-title-input")?.value).toBe("combat");
     expect(host.querySelector(".document-outline-item")?.textContent).toBe("Combat rules");
     expect(host.querySelector(".document-properties")).toBeNull();
     editor?.click();
@@ -509,7 +509,7 @@ describe("workspace file editor", () => {
     const after = markdownPreview("# Version 5\n", "hash-v5");
     workspaceExplorerMocks.workspacePreview
       .mockResolvedValueOnce(before)
-      .mockResolvedValueOnce(after);
+      .mockResolvedValue(after);
     workspaceExplorerMocks.workspaceRevision.mockResolvedValue(after.revision);
     const host = document.createElement("div");
     document.body.appendChild(host);
@@ -530,13 +530,13 @@ describe("workspace file editor", () => {
     emitWorkspaceFileChange("Assets/Docs/combat.md");
     await new Promise((resolve) => setTimeout(resolve, 160));
     await flush();
-    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(1);
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(2);
     const conflict = host.querySelector<HTMLElement>(".workspace-file-preview-conflict");
     expect(conflict).not.toBeNull();
 
     conflict?.querySelector<HTMLButtonElement>("button")?.click();
     await flush();
-    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(2);
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(3);
     expect(host.querySelector(".workspace-file-preview-conflict")).toBeNull();
     expect(
       host.querySelector<HTMLElement>(".workspace-file-editor-test-change")?.dataset.modelValue,

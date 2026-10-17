@@ -78,19 +78,12 @@ const fitScale = computed(() => {
   const source = rasterSource.value;
   if (!source || !stageWidth.value || !stageHeight.value) return 1;
 
-  const gutter = 48;
-  const availableWidth = Math.max(stageWidth.value - gutter * 2, 120);
-  const availableHeight = Math.max(stageHeight.value - gutter * 2, 120);
+  const availableWidth = Math.max(stageWidth.value, 1);
+  const availableHeight = Math.max(stageHeight.value, 1);
   const sourceWidth = Math.max(source.width, 1);
   const sourceHeight = Math.max(source.height, 1);
-  const viewportFit = Math.min(availableWidth / sourceWidth, availableHeight / sourceHeight);
-  const targetLongEdge = Math.min(
-    Math.max(Math.min(availableWidth, availableHeight) * 0.6, 220),
-    420,
-  );
-  const normalizedScale = targetLongEdge / Math.max(sourceWidth, sourceHeight);
 
-  return Math.max(0.1, Math.min(6, Math.min(viewportFit, normalizedScale)));
+  return Math.min(availableWidth / sourceWidth, availableHeight / sourceHeight);
 });
 const effectiveScale = computed(() => (props.compact ? 1 : fitScale.value * zoomScale.value));
 const zoomLabel = computed(() => `${Math.round(effectiveScale.value * 100)}%`);
@@ -187,9 +180,17 @@ function showActualSize() {
 }
 
 function updateStageSize() {
-  if (!stageRef.value) return;
-  stageWidth.value = stageRef.value.clientWidth;
-  stageHeight.value = stageRef.value.clientHeight;
+  const stage = stageRef.value;
+  if (!stage) return;
+  const style = getComputedStyle(stage);
+  stageWidth.value = Math.max(
+    0,
+    stage.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+  );
+  stageHeight.value = Math.max(
+    0,
+    stage.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom),
+  );
 }
 
 function renderRaster() {
@@ -509,10 +510,13 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .raster-preview {
+  flex: 1;
   display: flex;
   flex-direction: column;
   width: 100%;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .raster-preview.compact {
@@ -521,6 +525,7 @@ onBeforeUnmount(() => {
 
 .preview-controls {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
@@ -641,13 +646,17 @@ onBeforeUnmount(() => {
 }
 
 .canvas-stage canvas {
-  max-width: 100%;
-  max-height: 100%;
+  /* Scale the source pixels once, without flex or CSS shrinking the canvas first. */
+  flex-shrink: 0;
+  max-width: none;
+  max-height: none;
   transform-origin: center center;
   user-select: none;
 }
 
 .compact .canvas-stage canvas {
+  flex-shrink: 1;
+  max-width: 100%;
   max-height: 200px;
 }
 

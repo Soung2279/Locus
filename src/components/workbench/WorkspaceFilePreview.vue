@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { EditorView } from "@codemirror/view";
-import { computed, nextTick, ref, watch } from "vue";
+import { Text } from "@codemirror/state";
+import { markdownEditorTextFromString } from "../ui/markdown-editor/markdownEditorDocumentChange";
+import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { AlertTriangle } from "lucide";
 import { t } from "../../i18n";
 import { useDocumentFileSession } from "../../composables/useDocumentFileSession";
 import { documentSessionKey } from "../../document/documentIdentity";
+import { rebaseDocumentText } from "../../document/documentText";
 import {
   detectTextDocumentLineEnding,
   normalizeTextDocumentLineEndings,
@@ -21,6 +24,7 @@ import {
   type ToolFilePreviewHighlight,
 } from "../../services/toolFilePreviewWindow";
 import {
+  explorerFileAction,
   projectExplorerPreviewFile,
   projectExplorerFileRevision,
   projectExplorerWriteFile,
@@ -42,6 +46,8 @@ import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import WorkspaceCsvEditor from "../csv/WorkspaceCsvEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
 import type { MarkdownEditorViewMode } from "../ui/markdownEditorViewMode";
+import { validResourceName } from "../explorer/explorerResourceActions";
+import { WORKSPACE_FILE_PREVIEW_CACHE } from "./workspaceFilePreviewCache";
 
 const props = defineProps<{
   projectId?: string;
@@ -53,7 +59,13 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: "dirtyChange", dirty: boolean): void;
   (event: "pathChange", path: string): void;
+  (event: "ready"): void;
 }>();
+
+const previewCache = inject(WORKSPACE_FILE_PREVIEW_CACHE, null);
+let cachedPreview: ProjectExplorerFilePreview | undefined;
+let disposed = false;
+onBeforeUnmount(() => { disposed = true; });
 
 const isCsv = computed(() => /\.csv$/i.test(props.path));
 const csvEditor = ref<InstanceType<typeof WorkspaceCsvEditor> | null>(null);
@@ -64,37 +76,50 @@ interface FileDocument {
 }
 
 interface FileDocumentDraft {
-  text: string;
+  text: Text;
   lineEnding: TextDocumentLineEnding;
 }
 
+const filePath = ref(props.path);
+const scopeKey = computed(() => documentSessionKey(props.workspaceRef, ["workspaceFile", props.projectId ?? ""]));
 const resourceKey = computed(() => documentSessionKey(props.workspaceRef, [
-  "workspaceFile", props.projectId ?? "", props.path,
+  "workspaceFile", props.projectId ?? "", filePath.value,
 ]));
+const normalizePath = (path: string) => {
+  const normalized = path.replace(/\\/g, "/");
+  return /^(?:[a-z]:\/|\/\/)/i.test(normalized) ? normalized.toLowerCase() : normalized;
+};
+let localRename: { scope: string; paths: Set<string>; nextPath?: string } | null = null;
+let renameRevision = 0;
+const diskChanged = ref(false);
 const fileSession = useDocumentFileSession<FileDocument, FileDocumentDraft>({
   key: () => resourceKey.value,
-  emptyDraft: () => ({ text: "", lineEnding: "\n" }),
+  emptyDraft: () => ({ text: Text.empty, lineEnding: "\n" }),
   read: readDocument,
   write: async (current, draft) => {
-    const text = serializeTextDocumentLineEndings(draft.text, draft.lineEnding);
+    const text = serializeTextDocumentLineEndings(draft.text.toString(), draft.lineEnding);
     const hash = current.preview.contentHash!;
     const next = props.workspaceRef
-      ? await workspaceFileWrite(props.path, text, hash, props.workspaceRef)
-      : await projectExplorerWriteFile(props.projectId ?? "", props.path, text, hash);
+      ? await workspaceFileWrite(filePath.value, text, hash, props.workspaceRef)
+      : await projectExplorerWriteFile(props.projectId ?? "", filePath.value, text, hash);
     return { preview: next, assetPayload: null };
   },
   toDraft: ({ preview }) => ({
-    text: normalizeTextDocumentLineEndings(preview.text ?? ""),
+    text: markdownEditorTextFromString(normalizeTextDocumentLineEndings(preview.text ?? "")),
     lineEnding: detectTextDocumentLineEnding(preview.text ?? ""),
   }),
-  equals: (left, right) => left.text === right.text && left.lineEnding === right.lineEnding,
+  equals: (left, right) => left.text.eq(right.text) && left.lineEnding === right.lineEnding,
+  autoSave: () => /\.(md|markdown)$/i.test(props.path) && !diskChanged.value,
+  mergeDrafts: (base, local, remote) => {
+    const merged = rebaseDocumentText(base.text.toString(), local.text.toString(), remote.text.toString());
+    return merged.conflicts.length ? null : { text: markdownEditorTextFromString(merged.text), lineEnding: local.lineEnding };
+  },
   canSave: ({ preview }) => preview.kind === "text" && preview.editable && !!preview.contentHash,
   errorMessage: (cause) => normalizeAppError(cause).message,
 });
-const { loading, error, dirty, saving } = fileSession;
+const { loading, error, dirty, saving, relocating: renaming } = fileSession;
 const preview = computed(() => fileSession.document.value?.preview ?? null);
 const assetPayload = computed(() => fileSession.document.value?.assetPayload ?? null);
-const diskChanged = ref(false);
 const observedDiskRevision = ref<ProjectExplorerFileRevision | null>(null);
 const sourceEditor = ref<InstanceType<typeof BaseMarkdownEditor> | null>(null);
 const documentScrollerRef = ref<HTMLElement | null>(null);
@@ -105,10 +130,11 @@ const pendingPosition = ref<{
   column: number;
   highlight?: ToolFilePreviewHighlight;
 } | null>(null);
-const normalizedSourceText = computed(() => fileSession.modelDraft.value.text);
-const editorContentKey = computed(() => JSON.stringify([
-  resourceKey.value, preview.value?.contentHash ?? "unloaded",
-]));
+const normalizedSourceText = computed(() => fileSession.modelDraft.value.text.toString());
+const savedSourceText = computed(() => fileSession.baseDraft.value.text.toString());
+// A save or disk refresh changes the revision, not the editing session. Keep
+// selection, history and scroll attached to the resource's workspace lifetime.
+const editorContentKey = ref(resourceKey.value);
 const language = computed(() => {
   const extension = preview.value?.extension ?? "";
   return ({
@@ -134,6 +160,79 @@ const isMarkdownDocument = computed(() => (
   preview.value?.kind === "text" && preview.value.editable && editorViewMode.value === "rendered"
 ));
 const documentTitle = computed(() => preview.value?.name.replace(/\.(?:md|markdown)$/iu, "") ?? "");
+const titleDraft = ref("");
+const titleError = ref("");
+const canRename = computed(() => !!props.projectId && isMarkdownDocument.value);
+const titleDirty = computed(() => canRename.value
+  && titleDraft.value.trim().replace(/\.(?:md|markdown)$/iu, "") !== documentTitle.value);
+watch(documentTitle, (title) => { titleDraft.value = title; }, { immediate: true });
+
+async function renameDocument(): Promise<void> {
+  if (!canRename.value || renaming.value || !preview.value) return;
+  const stem = titleDraft.value.trim().replace(/\.(?:md|markdown)$/iu, "");
+  const extension = preview.value.name.match(/\.(?:md|markdown)$/iu)?.[0] ?? ".md";
+  const name = `${stem}${extension}`;
+  if (!stem || !validResourceName(stem) || !validResourceName(name)) {
+    titleError.value = t(stem ? "development.invalidFileName" : "knowledge.preview.titleRequired");
+    return;
+  }
+  titleError.value = "";
+  if (name === preview.value.name) { titleDraft.value = documentTitle.value; return; }
+  const projectId = props.projectId!;
+  const workspaceRef = props.workspaceRef ? { ...props.workspaceRef } : null;
+  const sourcePath = filePath.value;
+  const sourceKey = resourceKey.value;
+  const rename = {
+    scope: scopeKey.value,
+    paths: new Set([sourcePath, preview.value.path].flatMap((path) => [
+      normalizePath(path), normalizePath(path.replace(/[^/\\]+$/, () => name)),
+    ])),
+    nextPath: undefined as string | undefined,
+  };
+  localRename = rename;
+  renameRevision += 1;
+  let renamed = false;
+  try {
+    renamed = await fileSession.relocate(async (current) => {
+      const nextPath = await explorerFileAction(projectId, sourcePath, name, workspaceRef);
+      if (!nextPath) throw new Error(t("development.invalidFileName"));
+      previewCache?.delete(sourceKey);
+      // A navigation or workspace switch may have happened while IPC was pending.
+      if (localRename !== rename || scopeKey.value !== rename.scope) return current;
+      // The command returns an absolute display path, while scoped file APIs
+      // accept only workspace-relative paths (including symlinked workspaces).
+      const nextFilePath = workspaceRef ? sourcePath.replace(/[^/\\]+$/, () => name) : nextPath;
+      rename.nextPath = nextFilePath;
+      rename.paths.add(normalizePath(nextPath));
+      filePath.value = nextFilePath;
+      emit("pathChange", nextFilePath);
+      await nextTick();
+      return {
+        ...current,
+        preview: {
+          ...current.preview, path: nextPath, name,
+          workspaceRelativePath: current.preview.workspaceRelativePath?.replace(/[^/\\]+$/, () => name),
+        },
+      };
+    });
+  } catch (cause) {
+    if (localRename === rename) titleError.value = normalizeAppError(cause).message;
+  }
+  if (localRename !== rename) return;
+  if (renamed) titleDraft.value = stem;
+  else localRename = null;
+}
+
+function onTitleKeydown(event: KeyboardEvent): void {
+  if (event.isComposing || event.keyCode === 229) return;
+  if (event.key === "Enter") { event.preventDefault(); void renameDocument(); }
+  else if (event.key === "Escape") {
+    event.preventDefault();
+    titleDraft.value = documentTitle.value;
+    titleError.value = "";
+    (event.target as HTMLInputElement).blur();
+  }
+}
 const {
   documentOutlineItems,
   activeOutlineId,
@@ -143,7 +242,7 @@ const {
   scrollToDocumentOutlineItem,
   scheduleDocumentOutlineActiveUpdate,
 } = useMarkdownDocumentOutline({
-  documentKey: () => editorContentKey.value,
+  documentKey: () => preview.value ? editorContentKey.value : "",
   source: () => isMarkdownDocument.value
     ? fileSession.draft.value.text
     : "",
@@ -151,6 +250,7 @@ const {
   scroller: documentScrollerRef,
   page: documentPageRef,
   body: documentBodyRef,
+  bodyStart: () => sourceEditor.value?.getBodyElement?.() ?? null,
   editor: sourceEditor,
 });
 
@@ -163,11 +263,15 @@ function formatSize(bytes: number): string {
 
 async function readPreview(): Promise<ProjectExplorerFilePreview> {
   return props.workspaceRef
-    ? await workspaceFilePreview(props.path, props.workspaceRef)
-    : await projectExplorerPreviewFile(props.projectId ?? "", props.path);
+    ? await workspaceFilePreview(filePath.value, props.workspaceRef)
+    : await projectExplorerPreviewFile(props.projectId ?? "", filePath.value);
 }
 
 async function readDocument(): Promise<FileDocument> {
+  // Only the initial load may use a snapshot. Refreshes always read from disk.
+  const cached = cachedPreview;
+  cachedPreview = undefined;
+  if (cached) return { preview: cached, assetPayload: null };
   const next = await readPreview();
   const payload = next.kind === "unity" && next.checkoutId && next.workspaceRelativePath
     ? await previewWorkspaceAsset(next.workspaceRelativePath, undefined, {
@@ -179,11 +283,13 @@ async function readDocument(): Promise<FileDocument> {
   return { preview: next, assetPayload: payload };
 }
 
-async function loadPreview(options: { keepCurrent?: boolean; keepDraft?: boolean } = {}): Promise<boolean> {
+async function loadPreview(options: { keepCurrent?: boolean; keepDraft?: boolean; mergeDraft?: boolean } = {}): Promise<boolean> {
+  if (renaming.value && options.keepCurrent) return false;
   const key = resourceKey.value;
+  const requestRenameRevision = renameRevision;
   const before = fileSession.document.value;
   const loaded = await fileSession.load(options);
-  if (key !== resourceKey.value) return false;
+  if (key !== resourceKey.value || requestRenameRevision !== renameRevision) return false;
   if (loaded) {
     diskChanged.value = false;
     observedDiskRevision.value = null;
@@ -196,23 +302,24 @@ async function loadPreview(options: { keepCurrent?: boolean; keepDraft?: boolean
 
 async function probeFileRevision(): Promise<ProjectExplorerFileRevision> {
   return props.workspaceRef
-    ? await workspaceFileRevision(props.path, props.workspaceRef)
-    : await projectExplorerFileRevision(props.projectId ?? "", props.path);
+    ? await workspaceFileRevision(filePath.value, props.workspaceRef)
+    : await projectExplorerFileRevision(props.projectId ?? "", filePath.value);
 }
 
 const { checkNow: refreshIfChanged } = useFileChangeRevalidation({
-  active: () => props.active !== false && !isCsv.value,
+  active: () => props.active !== false && !isCsv.value && !renaming.value,
   currentRevision: () => observedDiskRevision.value ?? preview.value?.revision ?? null,
   probe: probeFileRevision,
   workspaceRef: () => props.workspaceRef,
-  workspacePath: () => props.workspaceRef ? props.path : null,
+  workspacePath: () => props.workspaceRef ? filePath.value : null,
   onChanged: async (revision) => {
+    previewCache?.delete(resourceKey.value);
     observedDiskRevision.value = revision;
-    if (dirty.value || saving.value) {
+    if (saving.value) {
       diskChanged.value = true;
       return;
     }
-    await loadPreview({ keepCurrent: true });
+    await loadPreview({ keepCurrent: true, mergeDraft: true });
   },
 });
 
@@ -221,24 +328,9 @@ async function useDiskVersion(): Promise<void> {
 }
 
 async function keepLocalVersion(): Promise<void> {
-  const viewBefore = sourceEditor.value?.getEditorView();
-  const selection = viewBefore ? {
-    anchor: viewBefore.state.selection.main.anchor,
-    head: viewBefore.state.selection.main.head,
-  } : null;
-  const loaded = await loadPreview({ keepCurrent: true, keepDraft: true });
-  if (!loaded || preview.value?.kind !== "text" || !preview.value.editable) return;
-  await nextTick();
-  const view = sourceEditor.value?.getEditorView();
-  if (!view) return;
-  const normalized = fileSession.draft.value.text;
-  view.dispatch({
-    changes: { from: 0, to: view.state.doc.length, insert: normalized },
-    selection: selection ? {
-      anchor: Math.min(normalized.length, selection.anchor),
-      head: Math.min(normalized.length, selection.head),
-    } : undefined,
-  });
+  // Only advance the disk baseline. Replacing the unchanged editor contents
+  // would add a spurious undo step and discard secondary selections.
+  await loadPreview({ keepCurrent: true, keepDraft: true });
 }
 
 async function applyPendingPosition(): Promise<boolean> {
@@ -279,24 +371,32 @@ async function revealToolFileHighlight(highlight?: ToolFilePreviewHighlight): Pr
 }
 
 function onEditorDocumentChange(change: MarkdownEditorDocumentChange): void {
-  fileSession.updateDraft({ ...fileSession.draft.value, text: change.doc.toString() });
+  fileSession.updateDraft({ ...fileSession.draft.value, text: change.doc });
 }
 
 function serializedEditorText(): string {
   const draft = fileSession.draft.value;
-  return serializeTextDocumentLineEndings(draft.text, draft.lineEnding);
+  return serializeTextDocumentLineEndings(draft.text.toString(), draft.lineEnding);
 }
 
 async function saveFile(): Promise<boolean> {
   if (isCsv.value) return await csvEditor.value?.saveFile() ?? false;
+  if (renaming.value) return false;
+  if (titleDirty.value) {
+    await renameDocument();
+    if (titleDirty.value) return false;
+  }
   return fileSession.save();
 }
 
 function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
   if (isCsv.value && csvEditor.value) return csvEditor.value.exportTransferSnapshot();
+  if (!preview.value || loading.value) return { kind: "resource" };
   const view = sourceEditor.value?.getEditorView();
   return {
     kind: "workspaceFile",
+    dirty: dirty.value,
+    conflicted: diskChanged.value,
     text: serializedEditorText(),
     contentHash: preview.value?.contentHash ?? "",
     originalLineEnding: fileSession.draft.value.lineEnding,
@@ -308,10 +408,10 @@ function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
   };
 }
 
-async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot): Promise<boolean> {
+async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot, recovering = false): Promise<boolean> {
   if (isCsv.value) {
     await nextTick();
-    return await csvEditor.value?.applyTransferSnapshot(snapshot) ?? false;
+    return await csvEditor.value?.applyTransferSnapshot(snapshot, recovering) ?? false;
   }
   if (snapshot.kind !== "workspaceFile") return false;
   const deadline = Date.now() + 4_000;
@@ -320,12 +420,15 @@ async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot):
   }
   const view = sourceEditor.value?.getEditorView();
   if (!view || preview.value?.kind !== "text" || !preview.value.editable) return false;
-  if (snapshot.contentHash && preview.value.contentHash !== snapshot.contentHash) {
+  const changedOnDisk = !!snapshot.contentHash && preview.value.contentHash !== snapshot.contentHash;
+  if (changedOnDisk && !recovering) {
     error.value = t("development.editor.transferConflict");
     return false;
   }
-  const normalized = normalizeTextDocumentLineEndings(snapshot.text);
-  fileSession.updateDraft({ text: normalized, lineEnding: snapshot.originalLineEnding });
+  if (recovering && (snapshot.conflicted || (changedOnDisk && snapshot.dirty))) diskChanged.value = true;
+  const normalized = normalizeTextDocumentLineEndings(recovering && changedOnDisk && !snapshot.dirty
+    ? preview.value.text ?? "" : snapshot.text);
+  fileSession.updateDraft({ text: markdownEditorTextFromString(normalized), lineEnding: snapshot.originalLineEnding });
   const selection = snapshot.selection
     ? {
         anchor: Math.min(normalized.length, Math.max(0, snapshot.selection.anchor)),
@@ -344,34 +447,65 @@ async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot):
   return true;
 }
 
-watch(dirty, (value) => emit("dirtyChange", value));
-watch(fileSession.document, () => {
+watch(() => dirty.value || titleDirty.value || renaming.value, (value) => emit("dirtyChange", value));
+watch(saving, (value, previous) => {
+  if (!value && previous && diskChanged.value) void loadPreview({ keepCurrent: true, mergeDraft: true });
+});
+watch(fileSession.document, (document) => {
+  if (document) previewCache?.set(resourceKey.value, document.preview);
+  if (renaming.value) return;
   diskChanged.value = false;
   observedDiskRevision.value = null;
 }, { flush: "sync" });
-watch(resourceKey, () => {
+watch([scopeKey, () => props.path], ([scope, path]) => {
+  if (localRename?.scope === scope && localRename.paths.has(normalizePath(path))) {
+    // Backend events can reach the parent before the rename command resolves.
+    // The command owns this transition; never reload the removed source path.
+    if (!renaming.value && localRename.nextPath && normalizePath(path) === normalizePath(localRename.nextPath)) {
+      localRename = null;
+    }
+    return;
+  }
+  localRename = null;
+  filePath.value = path;
+}, { flush: "sync" });
+watch(resourceKey, async (key) => {
+  if (renaming.value && localRename?.scope === scopeKey.value) return;
   diskChanged.value = false;
   observedDiskRevision.value = null;
-  if (!isCsv.value) void loadPreview();
+  titleError.value = "";
+  editorContentKey.value = resourceKey.value;
+  if (isCsv.value) return;
+  cachedPreview = previewCache?.get(key);
+  const revalidate = !!cachedPreview;
+  const loaded = await loadPreview();
+  // Let the document and CodeMirror mount while the previous surface is still
+  // visible. Failed loads also settle presentation, so navigation never hangs.
+  await nextTick();
+  if (disposed || key !== resourceKey.value) return;
+  emit("ready");
+  if (revalidate && loaded) void refreshIfChanged();
 }, { immediate: true });
 watch(() => props.active, (active) => {
   if (active) void applyPendingPosition();
 });
 
 defineExpose({
+  isRenaming: () => renaming.value,
   discardChanges: () => csvEditor.value?.discardChanges(),
   saveFile,
   revealPosition,
   revealToolFileHighlight,
-  refreshIfChanged: () => isCsv.value ? csvEditor.value?.refreshIfChanged() : refreshIfChanged(),
+  refreshIfChanged: () => isCsv.value ? csvEditor.value?.refreshIfChanged() : renaming.value ? Promise.resolve() : refreshIfChanged(),
   exportTransferSnapshot,
   applyTransferSnapshot,
+  restoreWorkState: (snapshot: WorkbenchEditorTransferSnapshot) => applyTransferSnapshot(snapshot, true),
 });
 </script>
 
 <template>
-  <WorkspaceCsvEditor v-if="isCsv" ref="csvEditor" :path="path" :project-id="projectId" :workspace-ref="workspaceRef" :active="active" @dirty-change="emit('dirtyChange', $event)" @path-change="emit('pathChange', $event)" />
-  <section v-else class="workspace-file-preview">
+  <WorkspaceCsvEditor v-if="isCsv" ref="csvEditor" :path="path" :project-id="projectId" :workspace-ref="workspaceRef" :active="active" @ready="emit('ready')" @dirty-change="emit('dirtyChange', $event)" @path-change="emit('pathChange', $event)" />
+  <section v-else class="workspace-file-preview" data-search-surface>
     <div v-if="loading && !preview" class="workspace-file-preview-state">
       {{ t("development.preview.loading") }}
     </div>
@@ -445,14 +579,31 @@ defineExpose({
             </aside>
             <article ref="documentPageRef" class="document-page">
               <header class="document-heading">
-                <h1 class="document-title">{{ documentTitle }}</h1>
+                <span v-if="canRename" class="document-title-input-shell" :data-value="titleDraft || ' '">
+                  <input
+                    v-model="titleDraft"
+                    class="document-title-input"
+                    type="text"
+                    :disabled="renaming"
+                    :placeholder="t('knowledge.preview.titlePlaceholder')"
+                    :aria-label="t('knowledge.preview.titleLabel')"
+                    :aria-invalid="!!titleError"
+                    @input="titleError = ''"
+                    @blur="renameDocument"
+                    @keydown="onTitleKeydown"
+                  />
+                </span>
+                <h1 v-else class="document-title">{{ documentTitle }}</h1>
+                <div v-if="titleError" class="document-title-error" role="alert">{{ titleError }}</div>
               </header>
-              <section ref="documentBodyRef" class="document-body">
+              <section ref="documentBodyRef" class="document-body document-body-with-properties">
                 <BaseMarkdownEditor
                   ref="sourceEditor"
                   :model-value="normalizedSourceText"
+                  :saved-value="savedSourceText"
                   :content-key="editorContentKey"
                   :content-path="preview.path"
+                  show-properties
                   :workspace-ref="workspaceRef"
                   :active="active !== false"
                   :view-mode="editorViewMode"
@@ -461,6 +612,7 @@ defineExpose({
                   transaction-model
                   @document-change="onEditorDocumentChange"
                   @shortcut-save="saveFile"
+                  @external-change="!renaming && refreshIfChanged()"
                 />
               </section>
             </article>
@@ -470,14 +622,17 @@ defineExpose({
           v-else-if="preview.kind === 'text' && preview.editable"
           ref="sourceEditor"
           :model-value="normalizedSourceText"
+          :saved-value="savedSourceText"
           :content-key="editorContentKey"
           :content-path="preview.path"
+          show-properties
           :workspace-ref="workspaceRef"
           :active="active !== false"
           :view-mode="editorViewMode"
           transaction-model
           @document-change="onEditorDocumentChange"
           @shortcut-save="saveFile"
+          @external-change="refreshIfChanged()"
         />
         <AssetTextViewer
           v-else-if="preview.kind === 'text'"

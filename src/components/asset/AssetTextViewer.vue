@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from "vue";
 import { useTextViewerZoom } from "../../composables/useTextViewerZoom";
 import { t } from "../../i18n";
 import hljs from "../../hljs";
+import SearchableContent from "../ui/SearchableContent.vue";
 
 const props = defineProps<{
   snippet: string;
@@ -64,8 +65,9 @@ function escapeHtml(source: string): string {
 </script>
 
 <template>
-  <div
+  <SearchableContent
     class="atv-root"
+    text-selector=".atv-text"
     :style="textViewerZoomStyle"
   >
     <div ref="bodyRef" class="atv-body" @wheel="handleTextViewerZoomWheel">
@@ -84,7 +86,7 @@ function escapeHtml(source: string): string {
     <div v-if="truncated" class="atv-footer">
       {{ t("asset.preview.truncated", shownLines) }}
     </div>
-  </div>
+  </SearchableContent>
 </template>
 
 <style scoped>

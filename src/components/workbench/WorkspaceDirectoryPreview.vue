@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { useListSearch } from "../../composables/useListSearch";
+import FindBar from "../ui/FloatingFindBar.vue";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
 import { useWorkspaceExplorerStore } from "../../stores/workspaceExplorer";
@@ -43,6 +45,17 @@ const entries = computed(() => {
   });
 });
 
+const searchRoot = ref<HTMLElement | null>(null);
+const listSearch = useListSearch({
+  root: searchRoot,
+  items: () => entries.value,
+  text: (entry) => entry.name,
+  reveal: (index) => searchRoot.value?.querySelectorAll<HTMLElement>('.workspace-directory-preview-row')[index]?.scrollIntoView({ block: 'nearest' }),
+});
+const { visible: searchVisible, query: searchQuery, matches: searchMatches,
+  currentIndex: searchIndex, current: searchCurrent, close: closeSearch, move: moveSearch } = listSearch;
+const searchBar = listSearch.bar;
+
 async function loadDirectory(): Promise<void> {
   const epoch = ++requestEpoch;
   loading.value = true;
@@ -64,7 +77,9 @@ watch(
 </script>
 
 <template>
-  <section class="workspace-directory-preview">
+  <section ref="searchRoot" class="workspace-directory-preview" tabindex="-1">
+    <FindBar v-if="searchVisible" :anchor="searchRoot" :ref="(value) => { searchBar = value as InstanceType<typeof FindBar> | null; }" v-model:query="searchQuery" :count="searchMatches.length"
+      :current="searchCurrent" :placeholder="t('search.listPlaceholder')" @next="moveSearch(1)" @previous="moveSearch(-1)" @close="closeSearch" />
     <header class="workspace-directory-preview-header">
       <span>{{ title }}</span>
       <span :title="path">{{ path }}</span>
@@ -77,10 +92,11 @@ watch(
     </div>
     <div v-else-if="entries.length" class="workspace-directory-preview-list">
       <button
-        v-for="entry in entries"
+        v-for="(entry, index) in entries"
         :key="entry.relativePath"
         type="button"
         class="workspace-directory-preview-row"
+        :class="{ 'is-search-current': searchVisible && searchIndex === index }"
         :title="entry.absolutePath"
         @click="emit('activate', entry)"
       >
@@ -112,6 +128,7 @@ watch(
 </template>
 
 <style scoped>
+.workspace-directory-preview-row.is-search-current { background: var(--accent-soft); outline: 1px solid var(--border-strong); outline-offset: -1px; }
 .workspace-directory-preview {
   flex: 1;
   min-width: 0;

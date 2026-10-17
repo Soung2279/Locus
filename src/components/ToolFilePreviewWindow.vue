@@ -25,6 +25,7 @@ import type { ProjectExplorerFileRevision } from "../types/workbench";
 import AssetTextViewer from "./asset/AssetTextViewer.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
+import SearchableContent from "./ui/SearchableContent.vue";
 
 const appWindow = getCurrentWindow();
 const filePath = ref("");
@@ -144,7 +145,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="tool-file-preview-window">
+  <main class="tool-file-preview-window" data-search-boundary>
     <header class="tool-file-preview-titlebar" data-tauri-drag-region>
       <div class="tool-file-preview-heading" data-tauri-drag-region>
         <span class="tool-file-preview-name">{{ fileName }}</span>
@@ -193,9 +194,9 @@ onUnmounted(() => {
       <div v-else-if="preview.kind === 'text' && !preview.snippet" class="tool-file-preview-state">
         {{ t("tool.filePreview.empty") }}
       </div>
-      <div v-else-if="isMarkdownPreview" class="tool-file-preview-markdown">
+      <SearchableContent v-else-if="isMarkdownPreview" class="tool-file-preview-markdown">
         <MarkdownRenderer :content="preview.snippet || ''" text-zoom />
-      </div>
+      </SearchableContent>
       <AssetTextViewer
         v-else-if="preview.kind === 'text' && preview.snippet !== undefined"
         :snippet="preview.snippet"
@@ -304,9 +305,10 @@ onUnmounted(() => {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
-  padding: 18px 22px;
+  overflow: hidden;
 }
+
+.tool-file-preview-markdown :deep(.searchable-content-body) { padding: 18px 22px; }
 
 .tool-file-preview-markdown :deep(.markdown-body) {
   max-width: 860px;

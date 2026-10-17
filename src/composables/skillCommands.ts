@@ -17,6 +17,8 @@ export const BUILTIN_COMMAND_NAMES = [
   "/review-context",
   "/unity-console",
   "/console-error",
+  "/capture-scene",
+  "/capture-game",
   "/plan",
 ] as const;
 export const SKILL_COMMAND_NOTICE_OPERATION = "knowledgeSkillCommandTrigger";

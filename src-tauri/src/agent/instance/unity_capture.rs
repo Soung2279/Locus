@@ -204,7 +204,7 @@ impl AgentInstance {
         } else {
             capture.mime_type.clone()
         };
-        let image = ImageData {
+        let image = ImageData { capture: None,
             data: base64::engine::general_purpose::STANDARD.encode(image_bytes),
             mime_type: mime_type.clone(),
         };

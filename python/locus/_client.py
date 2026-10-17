@@ -82,6 +82,11 @@ class Client:
         return Assets(self)
 
     @property
+    def captures(self) -> "Captures":
+        from ._captures import Captures
+        return Captures(self)
+
+    @property
     def csv(self) -> "Csv":
         from ._csv import Csv
         return Csv(self)
@@ -589,7 +594,7 @@ class Client:
         next_cursor continues without rescanning previous text. A page may be
         empty while has_more is true when the scan budget was reached.
         """
-        from ._sessions import SessionSearchPage, positive_int
+        from ._sessions import SessionSearchPage, normalize_session_reference, positive_int
 
         if not isinstance(query, str) or not query.strip() or len(query) > 1000 or "\0" in query:
             raise ValueError("query must contain 1..1000 characters and no NUL")
@@ -597,9 +602,7 @@ class Client:
         if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 4096):
             raise ValueError("cursor must be a nonempty search cursor of at most 4096 characters")
         if session_id is not None:
-            session_id = session_id.strip()
-            if not session_id:
-                raise ValueError("session_id cannot be empty")
+            session_id = normalize_session_reference(session_id)
         payload = await self.rpc("sessions.search", {
             "workspaceRef": workspace_payload(workspace_ref, worktree),
             "query": query, "archived": archived, "sessionId": session_id,
@@ -620,12 +623,11 @@ class Client:
 
         Supports both archived and unarchived sessions in the selected checkout.
         Each page is chronological and keeps tool rounds together.
+        session_id accepts an ID or a locus://session/<id> reference URL.
         """
-        from ._sessions import SessionMessagePage, positive_int
+        from ._sessions import SessionMessagePage, normalize_session_reference, positive_int
 
-        session_id = session_id.strip()
-        if not session_id:
-            raise ValueError("session_id cannot be empty")
+        session_id = normalize_session_reference(session_id)
         positive_int(limit, "limit", 1000)
         if before_row_id is not None:
             positive_int(before_row_id, "before_row_id", 2**63 - 1)

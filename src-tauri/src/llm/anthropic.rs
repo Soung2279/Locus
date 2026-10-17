@@ -3426,7 +3426,7 @@ mod tests {
                 thinking_order: None,
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
-                images: Some(vec![ImageData {
+                images: Some(vec![ImageData { capture: None,
                     data: "YWJj".to_string(),
                     mime_type: "image/png".to_string(),
                 }]),

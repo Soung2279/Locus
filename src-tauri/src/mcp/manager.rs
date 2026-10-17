@@ -604,7 +604,7 @@ fn render_tool_call_result(result: &Value) -> Result<McpCallOutcome, String> {
                             .filter(|m| !m.trim().is_empty())
                             .unwrap_or("image/png")
                             .to_string();
-                        images.push(crate::session::models::ImageData {
+                        images.push(crate::session::models::ImageData { capture: None,
                             data: data.to_string(),
                             mime_type,
                         });
@@ -1036,7 +1036,7 @@ mod tests {
     fn image_placeholder_swaps_markers_for_visionless_backends() {
         let outcome = McpCallOutcome {
             text: "before\n[image 1 attached]".to_string(),
-            images: vec![crate::session::models::ImageData {
+            images: vec![crate::session::models::ImageData { capture: None,
                 data: "aGk=".to_string(),
                 mime_type: "image/png".to_string(),
             }],

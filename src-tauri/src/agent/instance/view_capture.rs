@@ -10,7 +10,7 @@ impl AgentInstance {
         match crate::view::request_frontend_execution(app, &self.working_dir, code, label, timeout).await {
             Ok(mut result) => {
                 let images = result.get("images").and_then(|value| value.as_array()).map(|values| values.iter().filter_map(|value| {
-                    Some(ImageData { data: value.get("data")?.as_str()?.to_string(), mime_type: value.get("mimeType")?.as_str()?.to_string() })
+                    Some(ImageData { capture: None, data: value.get("data")?.as_str()?.to_string(), mime_type: value.get("mimeType")?.as_str()?.to_string() })
                 }).collect::<Vec<_>>()).unwrap_or_default();
                 if let Some(object) = result.as_object_mut() { object.insert("images".to_string(), serde_json::json!({ "attached": images.len() })); }
                 ExecutedToolResult::from_tool_result(ToolResult { output: result.to_string(), is_error: false }).with_images(images)

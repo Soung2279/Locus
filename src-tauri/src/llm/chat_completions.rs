@@ -1711,7 +1711,7 @@ mod tests {
             &[
                 user_message(
                     "Describe this",
-                    Some(vec![ImageData {
+                    Some(vec![ImageData { capture: None,
                         data: "YWJj".to_string(),
                         mime_type: "image/png".to_string(),
                     }]),
@@ -1894,7 +1894,7 @@ mod tests {
             "system",
             &[user_message(
                 "Describe this",
-                Some(vec![ImageData {
+                Some(vec![ImageData { capture: None,
                     data: "YWJj".to_string(),
                     mime_type: "image/png".to_string(),
                 }]),
@@ -1919,7 +1919,7 @@ mod tests {
                 tool_message_with_images(
                     "call_2",
                     "screenshot",
-                    vec![ImageData {
+                    vec![ImageData { capture: None,
                         data: "YWJj".to_string(),
                         mime_type: "image/png".to_string(),
                     }],

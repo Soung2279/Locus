@@ -50,8 +50,10 @@ from ._csv import Csv, CsvColumnView, CsvViewSnapshot
 from ._merges import MergeAssets, MergeJob, MergePlan, MergeResult, Merges
 from ._worktrees import Worktree, Worktrees, PoolAcquisition
 from ._sessions import SessionMessagePage, SessionSearchMatch, SessionSearchPage
+from ._captures import Capture, Captures
 
 __all__ = [
+    "captures", "Capture", "Captures",
     "csv", "Csv", "CsvColumnView", "CsvViewSnapshot",
     "assets", "AssetBackend", "AssetResult", "Assets", "asset_integer", "asset_unsigned_integer",
     "worktrees", "Worktree", "Worktrees", "PoolAcquisition",
@@ -144,6 +146,14 @@ class _DefaultAssets:
 
 
 assets = _DefaultAssets()
+
+
+class _DefaultCaptures:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_client().captures, name)
+
+
+captures = _DefaultCaptures()
 
 
 class _DefaultCsv:

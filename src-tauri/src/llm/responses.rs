@@ -1162,7 +1162,7 @@ mod tests {
     fn builds_user_input_blocks_with_images() {
         let input = build_input_messages(&[user_message_with_images(
             "Describe this image",
-            vec![ImageData {
+            vec![ImageData { capture: None,
                 data: "YWJj".to_string(),
                 mime_type: "image/png".to_string(),
             }],
@@ -1198,7 +1198,7 @@ mod tests {
             "tool-1",
             "call_1",
             "Unity screenshot captured.",
-            vec![ImageData {
+            vec![ImageData { capture: None,
                 data: "YWJj".to_string(),
                 mime_type: "image/png".to_string(),
             }],

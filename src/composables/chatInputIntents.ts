@@ -12,6 +12,8 @@ export type IntentCommandType =
   | "export-context"
   | "garbage-collection"
   | "review-context"
+  | "capture-scene"
+  | "capture-game"
   | "unity-console"
   | "unity-console-error";
 

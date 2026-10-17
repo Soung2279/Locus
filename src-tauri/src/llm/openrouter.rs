@@ -1145,7 +1145,7 @@ mod tests {
                     "screenshot",
                     None,
                     Some("tool_2"),
-                    vec![ImageData {
+                    vec![ImageData { capture: None,
                         data: "YWJj".to_string(),
                         mime_type: "image/png".to_string(),
                     }],

@@ -83,6 +83,8 @@ pub struct SessionDetail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionViewSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_sync_warning: Option<String>,
     pub session: SessionDetail,
     #[serde(default)]
     pub user_message_ids: Vec<String>,
@@ -674,7 +676,12 @@ pub enum AssistantRenderPart {
 pub struct ImageData {
     pub data: String,
     pub mime_type: String,
+    #[serde(default)]
+    pub capture: Option<CaptureReference>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureReference { pub id: String }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -752,6 +759,8 @@ pub struct TodoItem {
 pub struct TodoSnapshot {
     pub items: Vec<TodoItem>,
     pub latest_run_id: Option<String>,
+    #[serde(default)]
+    pub session_scoped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

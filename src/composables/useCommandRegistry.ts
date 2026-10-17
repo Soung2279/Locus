@@ -80,6 +80,18 @@ export function useCommandRegistry(
         commandType: "plan",
         agentOnly: "unity",
       },
+      {
+        name: "/capture-scene",
+        description: t("chat.command.captureSceneDesc"),
+        commandKind: "action",
+        commandType: "capture-scene",
+      },
+      {
+        name: "/capture-game",
+        description: t("chat.command.captureGameDesc"),
+        commandKind: "action",
+        commandType: "capture-game",
+      },
     ];
 
     const skillCommands: CommandDef[] = (skills.value || [])

@@ -4,10 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectExplorerFilePreview } from "../types/workbench";
 import WorkspaceCsvEditor from "../components/csv/WorkspaceCsvEditor.vue";
 import { csvEditorSessions } from "../components/csv/csvEditorSessions";
-import { parseCsvView, serializeCsvView } from "../document/csv/csvView";
+import { defaultCsvView, parseCsvView, reconcileCsvView, serializeCsvView, type CsvView } from "../document/csv/csvView";
+import { parseCsvDocument } from "../document/csv/csvDocument";
+import { resolveCsvCellStyle } from "../document/csv/csvStyles";
+import { t } from "../i18n";
 
 const mocks = vi.hoisted(() => ({ read: vi.fn(), write: vi.fn(), revision: vi.fn(), readView: vi.fn(), writeView: vi.fn(),
-  fileListeners: new Set<(event: never) => void>() }));
+  rows: [1], fileListeners: new Set<(event: never) => void>() }));
 vi.mock("../services/workspaceExplorer", () => ({
   projectExplorerPreviewFile: mocks.read, workspaceFilePreview: mocks.read,
   projectExplorerWriteFile: mocks.write, workspaceFileWrite: mocks.write,
@@ -20,11 +23,14 @@ vi.mock("../services/csvDocument", () => ({ readCsvViewFile: mocks.readView, wri
 vi.mock("../components/csv/CsvGrid.vue", async () => {
   const { defineComponent, h } = await import("vue");
   return { default: defineComponent({
-    props: ["document", "view", "readOnly"], emits: ["edit", "viewChange"],
+    props: ["document", "view", "readOnly"], emits: ["edit", "viewChange", "contextMenu", "selectionChange"],
     setup(props, { emit, expose }) {
       expose({ getSnapshot: () => ({ row: 1, column: 0, scrollTop: 0, scrollLeft: 0 }),
-        applySnapshot: async () => {}, selectedRows: () => [1], focus: () => {} });
-      return () => h("div", { class: "test-grid", "data-text": props.document.records[1]?.fields[1]?.value }, [
+        applySnapshot: async () => {}, selectedRows: () => mocks.rows, selectedColumns: () => [0], mergeSelection: () => null, focus: () => {} });
+      return () => h("div", { class: "test-grid", "data-text": props.document.records[1]?.fields[1]?.value,
+        onContextmenu: (event: MouseEvent) => {
+          event.preventDefault(); emit("selectionChange", { row: mocks.rows[0] ?? 0, column: 0 }); emit("contextMenu", event);
+        } }, [
         h("button", { class: "edit-cell", onClick: () => emit("edit", [{ row: 1, column: 1, value: "changed" }]) }, "edit"),
         h("button", { class: "extend-cell", onClick: () => emit("edit", [{ row: 8, column: 6, value: "extended" }]) }, "extend"),
         h("button", { class: "resize-column", onClick: () => {
@@ -62,9 +68,12 @@ async function mount(onReady?: () => void) {
     onReady,
   }) });
   apps.push(app); app.mount(host); await flush();
+  // Vue ignores bubbling events timestamped in the same millisecond as listener attachment.
+  if (!vi.isFakeTimers()) await new Promise((resolve) => setTimeout(resolve, 1));
   return { host, editor, changes, app };
 }
 beforeEach(() => {
+  mocks.rows = [1];
   mocks.read.mockResolvedValue(preview('\ufeffid,name,\r\n001,"original",\r\n\r\n'));
   mocks.write.mockImplementation(async (_path: string, text: string) => preview(text, "v2"));
   mocks.readView.mockResolvedValue({ text: null, contentHash: null });
@@ -78,6 +87,112 @@ afterEach(() => {
 });
 
 describe("CSV file editor", () => {
+  it.each([
+    { name: "above the first body row", rows: [1], after: false, at: 1, source: 1 },
+    { name: "below a body row", rows: [1], after: true, at: 2, source: 1 },
+    { name: "above another styled section", rows: [2], after: false, at: 2, source: 2 },
+    { name: "below the last row", rows: [2], after: true, at: 3, source: 2 },
+    { name: "below the header", rows: [0], after: true, at: 1, source: 1 },
+    { name: "above the header", rows: [0], after: false, at: 0, source: 0 },
+    { name: "in the virtual blank margin", rows: [50], after: false, at: 3, source: 2 },
+    { name: "above a multi-row selection", rows: [2, 1], after: false, at: 1, source: 1 },
+    { name: "below a multi-row selection", rows: [1, 2], after: true, at: 3, source: 2 },
+    { name: "below the first row without a header", rows: [0], after: true, at: 1, source: 0, headerRows: 0 },
+    { name: "below a header-only file", rows: [0], after: true, at: 1, source: null, text: "id,name\r\n" },
+    { name: "in an empty file", rows: [0], after: false, at: 0, source: null, text: "" },
+  ])("inherits row formatting $name and preserves it through undo, redo and save", async ({ rows, after, at, source, text, headerRows }) => {
+    const original = text ?? '\ufeffid,name\r\n001,"original"\r\n002,second\r\n';
+    const documentBefore = parseCsvDocument(original);
+    const view: CsvView = { ...reconcileCsvView(defaultCsvView(), documentBefore), schema: "locus.csv-view.v4",
+      headerRows: headerRows ?? (original ? 1 : 0), styles: [{ id: "base", style: { font: "mono" } }], rowDimensions: {} };
+    documentBefore.records.forEach((_, row) => {
+      view.styles!.push({ id: `row-${row}`, rows: [row, row], style: {
+        background: ["accent", "subtle", "accent-soft"][row]!, bold: row === 0, border: { color: "border", width: 2 },
+        excel: { alignment: { horizontal: "center", vertical: "center", wrapText: true, shrinkToFit: false, textRotation: 0, indent: 0, readingOrder: 0 } },
+      } });
+      view.rowDimensions![row] = { height: 30 + row * 10, hidden: false };
+    });
+    if (documentBefore.records.length > 1) view.styles!.push({ id: "cell", rows: [1, 1], columns: [view.columnOrder[1]!], style: { bold: true, excel: { numberFormat: "0.00" } } });
+    mocks.rows = rows;
+    mocks.read.mockResolvedValue(preview(original));
+    mocks.readView.mockResolvedValue({ text: serializeCsvView(view), contentHash: "view-v1" });
+    const { host, editor } = await mount();
+    const snapshot = () => {
+      const value = editor.value!.exportTransferSnapshot();
+      if (value.kind !== "workspaceFile" || !value.csv) throw new Error("Expected CSV snapshot");
+      return { text: value.text, view: parseCsvView(value.csv.view) };
+    };
+    const initial = snapshot();
+    async function action(label: string, group?: string) {
+      host.querySelector(".test-grid")!.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })); await flush();
+      const item = (key: string, nested = false) => Array.from(document.querySelectorAll<HTMLButtonElement>(`${nested ? ".csv-context-submenu" : ".csv-context-menu"} button`))
+        .find((button) => button.firstElementChild?.textContent === t(key))!;
+      if (group) { item(group).click(); await flush(); }
+      item(label, !!group).click(); await flush();
+    }
+    await action(after ? "editor.table.row-after" : "editor.table.row-before", "csv.menu.insert");
+    const inserted = snapshot();
+    const documentAfter = parseCsvDocument(inserted.text);
+    expect(documentAfter.records).toHaveLength(documentBefore.records.length + 1);
+    expect(documentAfter.records[at]!.fields.every((field) => !field.value)).toBe(true);
+    for (const id of view.columnOrder) {
+      expect(resolveCsvCellStyle(documentAfter, inserted.view, at, id)).toEqual(resolveCsvCellStyle(documentBefore, view, source ?? 99, id));
+      documentBefore.records.forEach((record, row) => {
+        const movedRow = row < at ? row : row + 1;
+        expect(documentAfter.records[movedRow]!.fields).toEqual(record.fields);
+        expect(resolveCsvCellStyle(documentAfter, inserted.view, movedRow, id)).toEqual(resolveCsvCellStyle(documentBefore, view, row, id));
+      });
+    }
+    expect(inserted.view.rowDimensions?.[at]).toEqual(source === null ? undefined : view.rowDimensions![source]);
+    await action("csv.undo"); expect(snapshot()).toEqual(initial);
+    await action("csv.redo"); expect(snapshot()).toEqual(inserted);
+    await expect(editor.value!.saveFile()).resolves.toBe(true);
+    expect(mocks.write.mock.calls[0]![1]).toBe(inserted.text);
+    if (serializeCsvView(inserted.view) !== serializeCsvView(initial.view)) expect(parseCsvView(mocks.writeView.mock.calls[0]![1])).toEqual(inserted.view);
+    else expect(mocks.writeView).not.toHaveBeenCalled();
+  });
+
+  it("inserts and deletes through submenus while retaining undo and the selected row", async () => {
+    const { host, editor } = await mount();
+    const initial = (editor.value!.exportTransferSnapshot() as { text: string }).text;
+    async function openMenu() {
+      host.querySelector(".test-grid")!.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 80 }));
+      await flush();
+    }
+    function item(label: string, nested = false) {
+      return Array.from(document.querySelectorAll<HTMLButtonElement>(`${nested ? ".csv-context-submenu" : ".csv-context-menu"} button`))
+        .find((button) => button.firstElementChild?.textContent === t(label))!;
+    }
+    await openMenu();
+    expect(document.querySelectorAll(".csv-context-menu button")).toHaveLength(15);
+    expect(document.querySelector(".csv-context-submenu")).toBeNull();
+    item("csv.menu.insert").dispatchEvent(new MouseEvent("mouseenter")); await flush();
+    item("editor.table.row-after", true).click(); await flush();
+    const inserted = parseCsvDocument((editor.value!.exportTransferSnapshot() as { text: string }).text);
+    expect(inserted.records).toHaveLength(parseCsvDocument(initial).records.length + 1);
+    expect(inserted.records[1]!.fields[1]!.value).toBe("original");
+    expect(inserted.records[2]!.fields.every((field) => !field.value)).toBe(true);
+    await openMenu(); item("csv.undo").click(); await flush();
+    expect(editor.value!.exportTransferSnapshot()).toMatchObject({ text: initial });
+    await openMenu(); item("csv.menu.delete").click(); await flush();
+    item("csv.deleteRows", true).click(); await flush();
+    expect((editor.value!.exportTransferSnapshot() as { text: string }).text).not.toContain("original");
+    expect(mocks.write).not.toHaveBeenCalled();
+  });
+
+  it("keeps editing groups disabled in a read-only CSV", async () => {
+    mocks.read.mockResolvedValueOnce({ ...preview("id,name\n001,original\n"), editable: false });
+    const { host } = await mount();
+    host.querySelector(".test-grid")!.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })); await flush();
+    const groups = Array.from(document.querySelectorAll<HTMLButtonElement>('.csv-context-menu button[aria-haspopup="menu"]'));
+    expect(groups).toHaveLength(5);
+    for (const group of groups) {
+      expect(group.disabled).toBe(true);
+      group.dispatchEvent(new MouseEvent("mouseenter")); await flush();
+      expect(document.querySelector(".csv-context-submenu")).toBeNull();
+    }
+  });
+
   it("waits for both file content and the saved view before reporting ready", async () => {
     let finishView!: (value: { text: null; contentHash: null }) => void;
     mocks.readView.mockReturnValueOnce(new Promise((resolve) => { finishView = resolve; }));

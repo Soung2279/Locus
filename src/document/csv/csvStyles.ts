@@ -90,13 +90,18 @@ export function reconcileCsvStyles(rules: CsvStyleRule[] | undefined, columns: R
   });
 }
 
-/** Follow source-record edits without expanding ranges into individual cells. */
-export function adjustCsvStyleRows(rules: CsvStyleRule[] | undefined, insertion: number | null, removed: number[] = []): CsvStyleRule[] | undefined {
+/** Follow source-record edits and optionally inherit an adjacent source row's rules without expanding them into cells. */
+export function adjustCsvStyleRows(rules: CsvStyleRule[] | undefined, insertion: number | null, removed: number[] = [], inheritFrom: number | null = null): CsvStyleRule[] | undefined {
   const deleted = [...new Set(removed)].sort((a, b) => a - b);
   return rules?.flatMap((rule) => {
     if (!rule.rows) return [rule];
     let [start, end] = rule.rows;
-    if (insertion !== null) { if (insertion <= start) start++; if (insertion <= end) end++; }
+    if (insertion !== null) {
+      const inherit = inheritFrom !== null && inheritFrom >= start && inheritFrom <= end;
+      if (insertion <= start) start++;
+      if (insertion <= end) end++;
+      if (inherit) { start = Math.min(start, insertion); end = Math.max(end, insertion); }
+    }
     else {
       const before = deleted.filter((row) => row < start).length;
       const inside = deleted.filter((row) => row >= start && row <= end).length;
@@ -125,15 +130,18 @@ function matches(value: string, when: CsvStyleCondition): boolean {
   }
 }
 
-export function adjustCsvRowDimensions(dimensions: CsvView["rowDimensions"], insertion: number | null, removed: number[] = []): CsvView["rowDimensions"] {
+export function adjustCsvRowDimensions(dimensions: CsvView["rowDimensions"], insertion: number | null, removed: number[] = [], inheritFrom: number | null = null): CsvView["rowDimensions"] {
   if (!dimensions) return dimensions;
   const deleted = [...new Set(removed)].sort((a, b) => a - b);
-  return Object.fromEntries(Object.entries(dimensions).flatMap(([key, value]) => {
+  const adjusted = Object.fromEntries(Object.entries(dimensions).flatMap(([key, value]) => {
     const row = Number(key);
     if (insertion !== null) return [[String(row >= insertion ? row + 1 : row), value]];
     if (deleted.includes(row)) return [];
     return [[String(row - deleted.filter((n) => n < row).length), value]];
   }));
+  const source = inheritFrom !== null ? dimensions[inheritFrom] : undefined;
+  if (insertion !== null && source) adjusted[insertion] = { height: source.height, hidden: false };
+  return adjusted;
 }
 
 export interface ResolvedCsvCellStyle extends Omit<CsvCellStyle, "border"> { borders?: Partial<Record<CsvBorderEdge, string>> }

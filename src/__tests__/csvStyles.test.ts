@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import fixtures from "./fixtures/csvViewContract.json";
-import { parseCsvDocument } from "../document/csv/csvDocument";
+import { editCsvCells, insertCsvRow, parseCsvDocument } from "../document/csv/csvDocument";
 import { defaultCsvView, parseCsvView, reconcileCsvView, serializeCsvView } from "../document/csv/csvView";
 import { adjustCsvStyleRows, applyCsvCellStyle, migrateCsvViewToV2, reconcileCsvStyles, resolveCsvCellStyle, type CsvStyleRule } from "../document/csv/csvStyles";
 
@@ -101,6 +101,43 @@ describe("CSV sparse styles", () => {
       { id: "row", rows: [1, 1], style: { size: 15 } }];
     const columns = { [ids[0]!]: view.columns[ids[0]!]! };
     expect(reconcileCsvStyles(rules, columns)).toEqual([rules[2]]);
+  });
+
+  it.each([1, 2])("inherits the adjacent source row %i at a formatting boundary without adding rules", (source) => {
+    const { document, view, ids } = table();
+    view.styles = [
+      { id: "base", style: { font: "mono", border: { color: "border" } } },
+      { id: "upper", rows: [1, 1], style: { background: "subtle", bold: true } },
+      { id: "lower", rows: [2, 2], style: { background: "accent-soft", size: 16 } },
+      { id: "cell", rows: [source, source], columns: [ids[2]!], style: { bold: false, border: { edges: ["bottom"], width: 2 }, excel: { numberFormat: "0.00" } } },
+    ];
+    view.schema = "locus.csv-view.v4";
+    const original = serializeCsvView(view);
+    const inserted = parseCsvDocument(insertCsvRow(document, 2));
+    const next = { ...view, styles: adjustCsvStyleRows(view.styles, 2, [], source) };
+    for (const id of ids) {
+      expect(resolveCsvCellStyle(inserted, next, 2, id)).toEqual(resolveCsvCellStyle(document, view, source, id));
+      for (let row = 0; row < document.records.length; row++) {
+        expect(resolveCsvCellStyle(inserted, next, row < 2 ? row : row + 1, id)).toEqual(resolveCsvCellStyle(document, view, row, id));
+      }
+    }
+    expect(next.styles).toHaveLength(view.styles.length);
+    expect(parseCsvView(serializeCsvView(next)).styles).toEqual(next.styles);
+    expect(serializeCsvView(view)).toBe(original);
+  });
+
+  it("inherits conditional rules while evaluating the new row's own values", () => {
+    const { document, view, ids } = table();
+    view.styles = [
+      { id: "row", rows: [1, 1], style: { background: "subtle" } },
+      { id: "pending", rows: [1, 1], when: { columnId: ids[1]!, op: "eq", value: "待确认" }, style: { color: "warning" } },
+    ];
+    const inserted = parseCsvDocument(insertCsvRow(document, 1));
+    const next = { ...view, styles: adjustCsvStyleRows(view.styles, 1, [], 1) };
+    expect(resolveCsvCellStyle(inserted, next, 1, ids[0]!)).toEqual({ background: "subtle" });
+    expect(resolveCsvCellStyle(inserted, next, 2, ids[0]!)).toEqual({ background: "subtle", color: "warning" });
+    const edited = parseCsvDocument(editCsvCells(inserted, [{ row: 1, column: 1, value: "待确认" }]));
+    expect(resolveCsvCellStyle(edited, next, 1, ids[0]!)).toEqual({ background: "subtle", color: "warning" });
   });
 
   it("rejects invalid style fields, CSS values, coordinates and dangling references", () => {

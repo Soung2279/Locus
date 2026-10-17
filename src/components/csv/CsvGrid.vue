@@ -3,6 +3,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { TabulatorFull as Tabulator, type CellComponent, type ColumnDefinition, type RowComponent } from "tabulator-tables";
 import "tabulator-tables/dist/css/tabulator.css";
 import { t } from "../../i18n";
+import { matchesShortcut, useKeyboardShortcuts } from "../../composables/useKeyboardShortcuts";
 import { csvDocumentChangedRows, parseCsvClipboard, serializeCsvClipboard,
   type CsvCellEdit, type CsvDocument } from "../../document/csv/csvDocument";
 import type { CsvView } from "../../document/csv/csvView";
@@ -28,6 +29,7 @@ const emit = defineEmits<{
 export interface CsvGridSnapshot { row: number; column: number; endRow?: number; endColumn?: number; scrollTop: number; scrollLeft: number; zoom?: number }
 type Position = { row: number; column: number };
 const host = ref<HTMLElement | null>(null);
+const { state: shortcuts } = useKeyboardShortcuts();
 const zoom = ref(1);
 let contentSizer: ReturnType<typeof createCsvContentSizer> | null = null;
 let zoomFrame: number | null = null;
@@ -541,12 +543,13 @@ function beginEdit(seed?: string, point?: CsvCellEditPoint): void {
   if (input && seed !== undefined) seedCsvCellInput(input, seed);
 }
 function onKeydown(event: KeyboardEvent): void {
+  if (event.isComposing || event.keyCode === 229) return;
   const modifier = event.ctrlKey || event.metaKey;
   if (modifier && event.key.toLowerCase() === "s") { event.preventDefault(); event.stopPropagation(); emit("save"); return; }
   if (isInput(event.target)) return;
   const stop = () => { event.preventDefault(); event.stopImmediatePropagation(); };
   if (modifier && ["z", "y"].includes(event.key.toLowerCase())) { stop(); event.shiftKey || event.key.toLowerCase() === "y" ? emit("redo") : emit("undo"); }
-  else if (modifier && event.key.toLowerCase() === "f") { stop(); emit("find"); }
+  else if (matchesShortcut(event, shortcuts.findInContext)) { stop(); emit("find"); }
   else if (modifier && event.key.toLowerCase() === "a") {
     stop(); const visible = projected.filter((column) => !column.hidden);
     const last = [...visible].reverse().find((column) => column.sourceIndex < props.document.columnCount) ?? visible[0];

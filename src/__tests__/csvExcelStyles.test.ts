@@ -69,4 +69,15 @@ describe("CSV openpyxl display", () => {
       expect(() => parseCsvView(serializeCsvView({ ...view, styles: [{ id: "invalid", style: { excel: value as CsvExcelStyle } }] }))).toThrow();
     }
   });
+
+  it("inherits custom row heights, keeps inserted rows visible and leaves source dimensions untouched", () => {
+    const { view } = fixture();
+    const before = JSON.stringify(view.rowDimensions);
+    const above = adjustCsvRowDimensions(view.rowDimensions, 1, [], 1)!;
+    expect(above).toEqual({ "1": { height: 32.5, hidden: false }, "2": view.rowDimensions!["1"], "3": view.rowDimensions!["2"] });
+    expect(above["1"]).not.toBe(view.rowDimensions!["1"]);
+    expect(adjustCsvRowDimensions(view.rowDimensions, 3, [], 2)!["3"]).toEqual({ height: 21, hidden: false });
+    expect(adjustCsvRowDimensions(view.rowDimensions, 1, [], 0)).not.toHaveProperty("1");
+    expect(JSON.stringify(view.rowDimensions)).toBe(before);
+  });
 });

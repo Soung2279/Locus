@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { t } from "../../i18n";
+import { formatShortcut, useKeyboardShortcuts } from "../../composables/useKeyboardShortcuts";
+import { useSearchScope } from "../../composables/useSearchScope";
 import { useDocumentFileSession } from "../../composables/useDocumentFileSession";
 import { useFileChangeRevalidation } from "../../composables/useFileChangeRevalidation";
 import { documentSessionKey } from "../../document/documentIdentity";
@@ -22,10 +24,10 @@ import { normalizeTextDocumentLineEndings } from "../../document/textDocumentFor
 import { csvEditorSessions } from "./csvEditorSessions";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseCheckbox from "../ui/BaseCheckbox.vue";
-import BaseContextMenu from "../ui/BaseContextMenu.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
 import CsvGrid, { type CsvGridSnapshot } from "./CsvGrid.vue";
+import CsvContextMenu, { type CsvMenuEntry } from "./CsvContextMenu.vue";
 
 const props = withDefaults(defineProps<{ path: string; projectId?: string; workspaceRef?: WorkspaceRef | null;
   active?: boolean; readOnly?: boolean; content?: string; fileActions?: boolean }>(), { active: true });
@@ -55,6 +57,15 @@ let gridSnapshot: CsvGridSnapshot | undefined;
 const search = ref("");
 const replacement = ref("");
 const showFind = ref(false);
+const { state: shortcuts } = useKeyboardShortcuts();
+async function openFind() {
+  showFind.value = true;
+  await nextTick();
+  const input = editorRoot.value?.querySelector<HTMLInputElement>(".csv-find input");
+  input?.focus();
+  input?.select();
+}
+useSearchScope(editorRoot, () => { void openFind(); }, { enabled: () => props.active !== false && mode.value === "table" });
 const settingsOpen = ref(false);
 const headerDraft = ref("");
 const targetPath = ref("");
@@ -390,11 +401,15 @@ function rowAction(remove: boolean, after = false): void {
   const selected = grid.value?.selectedRows() ?? [];
   const rows = selected.length ? selected : [selection.value.row];
   const index = Math.min(parsed.value.records.length, after ? rows.reduce((maximum, row) => Math.max(maximum, row), 0) + 1 : rows.reduce((minimum, row) => Math.min(minimum, row), selection.value.row));
+  // Match the selected side of the insertion, using body formatting below a header.
+  const firstSource = index >= view.value.headerRows ? view.value.headerRows : 0;
+  const sourceRow = Math.max(firstSource, Math.min(parsed.value.records.length - 1, after ? index - 1 : index));
+  const inheritFrom = !remove && sourceRow < parsed.value.records.length ? sourceRow : null;
   commit(remove ? deleteCsvRows(parsed.value, rows) : insertCsvRow(parsed.value, index),
-    { ...view.value, ...(view.value.rowDimensions ? { rowDimensions: adjustCsvRowDimensions(view.value.rowDimensions, remove ? null : index, remove ? rows : []) } : {}),
+    { ...view.value, ...(view.value.rowDimensions ? { rowDimensions: adjustCsvRowDimensions(view.value.rowDimensions, remove ? null : index, remove ? rows : [], inheritFrom) } : {}),
       ...(view.value.merges ? { merges: adjustCsvMerges(view.value.merges, "rows", remove ? null : index, remove ? rows : []) } : {}),
       ...(view.value.styles ? { styles: adjustCsvStyleRows(view.value.styles, remove ? null : index,
-      remove ? rows.filter((row) => row < parsed.value!.records.length) : []) } : {}) });
+      remove ? rows.filter((row) => row < parsed.value!.records.length) : [], inheritFrom) } : {}) });
 }
 function columnAction(remove: boolean, after = false): void {
   if (!parsed.value) return;
@@ -426,6 +441,11 @@ function mergeAction(remove = false): void {
   }
 }
 function openContextMenu(event: MouseEvent): void { contextMenu.value = { x: event.clientX, y: event.clientY }; }
+function closeContextMenu(): void {
+  contextMenu.value = null;
+  if (mode.value === "table") grid.value?.focus();
+  else source.value?.getEditorView()?.focus();
+}
 async function menuAction(action: () => unknown): Promise<void> {
   contextMenu.value = null;
   try { await action(); } catch (error) { actionError.value = message(error); }
@@ -445,7 +465,7 @@ function filterColumn(value: string): void {
   if (value) filters.push({ columnId: selectedColumn.value, value });
   updateView({ ...view.value, filters });
 }
-const menuItems = computed(() => {
+const menuItems = computed<CsvMenuEntry[]>(() => {
   const blocked = readOnly.value || !parsed.value || parsing.value;
   const mergeRange = contextMenu.value ? grid.value?.mergeSelection() : null;
   const mergeRows = contextMenu.value ? grid.value?.selectedRows() ?? [] : [];
@@ -457,29 +477,38 @@ const menuItems = computed(() => {
     { label: t("csv.undo"), shortcut: "Ctrl+Z", disabled: readOnly.value || historyIndex.value <= 0, action: () => undo() },
     { label: t("csv.redo"), shortcut: "Ctrl+Y", disabled: readOnly.value || historyIndex.value >= history.value.length - 1, action: () => undo(true) },
     ...(mode.value === "table" ? [
-      { separator: true },
+      { separator: true as const },
       { label: t("editor.cut"), shortcut: "Ctrl+X", disabled: blocked, action: () => grid.value?.clipboardAction("cut") },
       { label: t("editor.copy"), shortcut: "Ctrl+C", action: () => grid.value?.clipboardAction("copy") },
       { label: t("editor.paste"), shortcut: "Ctrl+V", disabled: blocked, action: () => grid.value?.clipboardAction("paste") },
       { label: t("csv.clearCells"), shortcut: "Delete", disabled: blocked, action: () => grid.value?.clearSelection() },
-      { separator: true },
-      { label: t("csv.mergeCells"), disabled: blocked || !!viewError.value || viewChanged.value || !mergeRange, action: () => mergeAction() },
-      { label: t("csv.unmergeCells"), disabled: blocked || !!viewError.value || viewChanged.value || !canUnmerge, action: () => mergeAction(true) },
-      { separator: true },
-      { label: t("csv.autoFitColumns"), disabled: blocked || !!viewError.value || viewChanged.value, action: () => grid.value?.autoFitColumns() },
-      { label: t("csv.autoFitRows"), disabled: blocked || !!viewError.value || viewChanged.value, action: () => grid.value?.autoFitRows() },
-      { separator: true },
-      { label: t("editor.table.row-before"), disabled: blocked, action: () => rowAction(false) },
-      { label: t("editor.table.row-after"), disabled: blocked, action: () => rowAction(false, true) },
-      { label: t("csv.deleteRows"), disabled: blocked, action: () => rowAction(true) },
-      { label: t("editor.table.column-before"), disabled: blocked, action: () => columnAction(false) },
-      { label: t("editor.table.column-after"), disabled: blocked, action: () => columnAction(false, true) },
-      { label: t("csv.deleteColumn"), disabled: blocked, action: () => columnAction(true) },
-      { separator: true },
-      { label: t("csv.sortAsc"), disabled: blocked || !selectedColumn.value, action: () => sortColumn("asc") },
-      { label: t("csv.sortDesc"), disabled: blocked || !selectedColumn.value, action: () => sortColumn("desc") },
-      { label: t("csv.resetOrder"), disabled: !view.value.sort?.length && !view.value.filters?.length, action: () => updateView({ ...view.value, sort: [], filters: [] }) },
-      { label: t("csv.find"), shortcut: "Ctrl+F", action: () => { showFind.value = !showFind.value; } },
+      { separator: true as const },
+      { label: t("csv.menu.insert"), disabled: blocked, children: [
+        { label: t("editor.table.row-before"), action: () => rowAction(false) },
+        { label: t("editor.table.row-after"), action: () => rowAction(false, true) },
+        { separator: true as const },
+        { label: t("editor.table.column-before"), action: () => columnAction(false) },
+        { label: t("editor.table.column-after"), action: () => columnAction(false, true) },
+      ] },
+      { label: t("csv.menu.delete"), disabled: blocked, children: [
+        { label: t("csv.deleteRows"), action: () => rowAction(true) },
+        { label: t("csv.deleteColumn"), action: () => columnAction(true) },
+      ] },
+      { label: t("csv.menu.merge"), disabled: blocked || !!viewError.value || viewChanged.value, children: [
+        { label: t("csv.mergeCells"), disabled: !mergeRange, action: () => mergeAction() },
+        { label: t("csv.unmergeCells"), disabled: !canUnmerge, action: () => mergeAction(true) },
+      ] },
+      { label: t("csv.menu.autoFit"), disabled: blocked || !!viewError.value || viewChanged.value, children: [
+        { label: t("csv.autoFitColumns"), action: () => grid.value?.autoFitColumns() },
+        { label: t("csv.autoFitRows"), action: () => grid.value?.autoFitRows() },
+      ] },
+      { label: t("csv.menu.sort"), disabled: blocked || !!viewError.value || viewChanged.value, children: [
+        { label: t("csv.sortAsc"), disabled: !selectedColumn.value, action: () => sortColumn("asc") },
+        { label: t("csv.sortDesc"), disabled: !selectedColumn.value, action: () => sortColumn("desc") },
+        { label: t("csv.resetOrder"), disabled: !view.value.sort?.length && !view.value.filters?.length, action: () => updateView({ ...view.value, sort: [], filters: [] }) },
+      ] },
+      { separator: true as const },
+      { label: t("csv.find"), shortcut: formatShortcut(shortcuts.findInContext), action: () => { void openFind(); } },
     ] : []),
     { separator: true },
     { label: t(mode.value === "table" ? "csv.source" : "csv.table"), disabled: mode.value === "source" && (!parsed.value || parsing.value), action: () => { mode.value = mode.value === "table" ? "source" : "table"; } },
@@ -509,20 +538,25 @@ async function findNext(replaceAll = false): Promise<void> {
   await grid.value?.applySnapshot({ ...next, scrollTop: Math.max(0, (next.row - view.value.headerRows) * view.value.rowHeight), scrollLeft: 0 });
 }
 function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
-  return { kind: "workspaceFile", text: session.draft.value, contentHash: session.document.value?.contentHash ?? "",
+  return { kind: "workspaceFile", dirty: dirty.value, conflicted: diskChanged.value, text: session.draft.value, contentHash: session.document.value?.contentHash ?? "",
     originalLineEnding: "\n", csv: { view: viewText.value, viewBaseline: viewBaseline.value,
       viewHash: viewFile.value.contentHash ?? null, mode: mode.value, grid: grid.value?.getSnapshot() } };
 }
-async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot): Promise<boolean> {
+async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot, recovering = false): Promise<boolean> {
   if (snapshot.kind !== "workspaceFile") return false;
   const deadline = Date.now() + 5000;
   while (session.loading.value && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 16));
-  if (snapshot.contentHash !== session.document.value?.contentHash) { diskChanged.value = true; return false; }
-  session.updateDraft(snapshot.text); session.modelDraft.value = snapshot.text;
-  if (snapshot.csv) {
+  const changedOnDisk = snapshot.contentHash !== session.document.value?.contentHash;
+  if (changedOnDisk && !recovering) { diskChanged.value = true; return false; }
+  if ((recovering && snapshot.conflicted) || (changedOnDisk && snapshot.dirty)) diskChanged.value = true;
+  if (!changedOnDisk || snapshot.dirty) {
+    session.updateDraft(snapshot.text); session.modelDraft.value = snapshot.text;
+  }
+  if (snapshot.csv && (!recovering || snapshot.csv.viewHash === (viewFile.value.contentHash ?? null))) {
     view.value = parseCsvView(snapshot.csv.view); viewBaseline.value = snapshot.csv.viewBaseline;
     viewFile.value = { contentHash: snapshot.csv.viewHash }; mode.value = snapshot.csv.mode;
   }
+  if (snapshot.csv && recovering) mode.value = snapshot.csv.mode;
   parseText(); remember();
   await nextTick();
   if (snapshot.csv?.grid) await grid.value?.applySnapshot(snapshot.csv.grid);
@@ -580,12 +614,7 @@ defineExpose({ saveFile, refreshIfChanged, exportTransferSnapshot, applyTransfer
 
 <template>
   <section ref="editorRoot" class="csv-editor" @keydown.ctrl.s.prevent="saveFile" @focusout="resumeExternalRefresh">
-    <BaseContextMenu v-if="contextMenu" :x="contextMenu.x" :y="contextMenu.y" :aria-label="t('editor.contextMenu')" @close="contextMenu = null">
-      <template v-for="(item, index) in menuItems" :key="index">
-        <div v-if="item.separator" class="base-context-menu-separator" role="separator" />
-        <button v-else type="button" role="menuitem" :disabled="item.disabled" @click="menuAction(item.action!)"><span>{{ item.label }}</span><span class="csv-menu-shortcut">{{ item.shortcut }}</span></button>
-      </template>
-    </BaseContextMenu>
+    <CsvContextMenu v-if="contextMenu" :x="contextMenu.x" :y="contextMenu.y" :items="menuItems" @close="closeContextMenu" @action="menuAction" />
     <div v-if="diskChanged" class="csv-message" role="status">
       <span>{{ t('development.editor.diskChanged') }}</span>
       <BaseButton size="sm" @click="load(false, true)">{{ t('development.editor.useDisk') }}</BaseButton>
@@ -623,7 +652,7 @@ defineExpose({ saveFile, refreshIfChanged, exportTransferSnapshot, applyTransfer
     <div v-if="session.loading.value && !session.document.value" class="csv-empty">{{ t('development.preview.loading') }}</div>
     <div v-else class="csv-body" @contextmenu.capture="sourceContextMenu">
       <CsvGrid v-if="mode === 'table' && parsed" ref="grid" :document="parsed" :view="view" :read-only="readOnly || parsing" :active="active"
-        @edit="edit" @view-change="updateView" @selection-change="selection = $event" @zoom-change="zoom = $event" @context-menu="openContextMenu" @find="showFind = true" @error="actionError = message($event)" @undo="undo()" @redo="undo(true)" @save="saveFile" />
+        @edit="edit" @view-change="updateView" @selection-change="selection = $event" @zoom-change="zoom = $event" @context-menu="openContextMenu" @find="openFind" @error="actionError = message($event)" @undo="undo()" @redo="undo(true)" @save="saveFile" />
       <BaseMarkdownEditor v-else ref="source" :model-value="sourceModel" :content-key="key" :content-path="path" :workspace-ref="workspaceRef"
         :disabled="readOnly" :active="active !== false" view-mode="native" transaction-model @document-change="sourceChange" @shortcut-save="saveFile" />
     </div>
@@ -632,9 +661,9 @@ defineExpose({ saveFile, refreshIfChanged, exportTransferSnapshot, applyTransfer
 </template>
 
 <style scoped>
-.csv-editor { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel-bg); color: var(--text-color); }
+.csv-editor { position: relative; display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel-bg); color: var(--text-color); }
 .csv-find, .csv-options { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--border-color); flex-shrink: 0; }
-.csv-menu-shortcut { margin-left: auto; padding-left: 24px; color: var(--text-secondary); font-size: 11px; }
+.csv-find { position: absolute; z-index: 100; top: 6px; right: 8px; max-width: calc(100% - 16px); flex-wrap: wrap; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--panel-bg); box-shadow: 0 4px 14px color-mix(in srgb, var(--text-color) 10%, transparent); }
 .csv-options { flex-wrap: wrap; max-height: 180px; overflow-y: auto; align-items: center; }
 .csv-options label { display: inline-flex; align-items: center; gap: 6px; margin-right: 8px; font-size: 12px; }
 .csv-options input, .csv-find input { min-width: 0; width: 140px; padding: 4px 6px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-color); color: var(--text-color); font: 12px var(--font-ui); }

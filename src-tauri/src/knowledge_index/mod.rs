@@ -902,7 +902,33 @@ struct EmbeddingVectorBackfillReport {
 }
 
 pub fn library_dir_for_working_dir(working_dir: &str) -> PathBuf {
-    Path::new(working_dir).join("Library").join("Locus")
+    if crate::unity_bridge::is_unity_project(working_dir) {
+        Path::new(working_dir).join("Library").join("Locus")
+    } else {
+        Path::new(working_dir).join("Locus")
+    }
+}
+
+/// Preserve settings and migration state; derived SQLite/Tantivy caches are
+/// rebuilt from documents. Never move a database that another Locus may own.
+pub fn migrate_legacy_non_unity_storage(working_dir: &str) -> Result<(), String> {
+    crate::workspace::require_knowledge_enabled(working_dir)?;
+    if crate::unity_bridge::is_unity_project(working_dir) { return Ok(()); }
+    let legacy = Path::new(working_dir).join("Library").join("Locus");
+    if !legacy.is_dir() { return Ok(()); }
+    let target = library_dir_for_working_dir(working_dir);
+    let marker = target.join("knowledge_storage_migration_version.txt");
+    if marker.is_file() { return Ok(()); }
+    fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+    for name in ["knowledge_config.json", "knowledge_embedding_config.json", "memory_builtin_seed_version.txt", "knowledge_unified_tree_version.txt"] {
+        let source = legacy.join(name);
+        let destination = target.join(name);
+        if source.is_file() && !destination.exists() {
+            let data = fs::read(&source).map_err(|error| error.to_string())?;
+            crate::config::atomic_write_config(&destination, &data)?;
+        }
+    }
+    crate::config::atomic_write_config(&marker, b"1")
 }
 
 pub fn no_workspace_library_dir() -> PathBuf {
@@ -1448,6 +1474,7 @@ pub async fn reconcile_workspace(
     app_knowledge_dir: Option<&std::path::PathBuf>,
     state: Arc<KnowledgeIndexState>,
 ) -> Result<ReconcileReport, String> {
+    crate::workspace::require_knowledge_enabled(working_dir)?;
     let timer_started_at = Instant::now();
     eprintln!(
         "[KnowledgeIndex] reconcile start workspace={} app_root={}",
@@ -4783,7 +4810,7 @@ fn build_list_item(
     access: Option<DirectorySearchAccess>,
 ) -> KnowledgeListItem {
     KnowledgeListItem {
-        inject_agents: crate::knowledge_store::default_inject_agents(),
+        inject_agents: document.inject_agents.clone(),
         id: document.id.clone(),
         doc_type: document.doc_type,
         path: document.path.clone(),
@@ -6626,7 +6653,8 @@ mod tests {
         save_document(
             working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: id.to_string(),
                 doc_type: KnowledgeType::Design,
                 path: path.to_string(),
@@ -6689,7 +6717,8 @@ mod tests {
         save_document(
             working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: id.to_string(),
                 doc_type: KnowledgeType::Skill,
                 path: path.to_string(),
@@ -6736,7 +6765,8 @@ mod tests {
 
     fn memory_document(index: usize, body: String, updated_at: i64) -> KnowledgeDocument {
         KnowledgeDocument {
-            inject_agents: crate::knowledge_store::default_inject_agents(),
+            properties_yaml: String::new(),
+            inject_agents: crate::knowledge_store::legacy_inject_agents(),
             id: format!("kd_test_memory_doc_{:03}", index),
             doc_type: KnowledgeType::Memory,
             path: format!("project/doc-{:03}.md", index),
@@ -6796,7 +6826,8 @@ mod tests {
         crate::unity_docs::seed_managed_documents_for_tests(
             working_dir,
             &[KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_unity_execution_order".to_string(),
                 doc_type: KnowledgeType::Reference,
                 path: "unity-official-docs/manual/ExecutionOrder.md".to_string(),
@@ -6889,7 +6920,8 @@ mod tests {
     fn seed_unity_reference_documents(working_dir: &str, document_count: usize) {
         let documents = (0..document_count)
             .map(|index| KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: format!("kd_unity_ref_{:03}", index),
                 doc_type: KnowledgeType::Reference,
                 path: format!(
@@ -7918,7 +7950,8 @@ mod tests {
         save_document(
             &working_dir,
             KnowledgeDocument {
-                inject_agents: crate::knowledge_store::default_inject_agents(),
+                properties_yaml: String::new(),
+                inject_agents: crate::knowledge_store::legacy_inject_agents(),
                 id: "kd_test_design_doc_2".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/hit-stop.md".to_string(),

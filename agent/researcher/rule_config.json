@@ -1,0 +1,10 @@
+{
+  "research_scope.md": {
+    "enabled": true,
+    "order": 0
+  },
+  "output_rules.md": {
+    "enabled": true,
+    "order": 1
+  }
+}

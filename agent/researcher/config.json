@@ -1,0 +1,10 @@
+{
+  "name": "Researcher",
+  "description": "Read-only research across workspace files, project knowledge, and web sources.",
+  "project_types": ["generic"],
+  "tools": ["read", "list", "grep", "knowledge_query", "web_fetch"],
+  "sub_agents": [],
+  "default": false,
+  "default_effort": "none",
+  "model_recommendation": "small"
+}

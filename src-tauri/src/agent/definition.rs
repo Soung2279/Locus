@@ -4,9 +4,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_AGENT_ID: &str = "unity";
+/// Built-in general-purpose Agent for workspaces without a specialized Agent.
+pub const GENERAL_AGENT_ID: &str = "general";
 pub const USER_AGENTS_DIR_NAME: &str = "user-agents";
 pub const GENERIC_PROJECT_TYPE: &str = "generic";
 pub const UNITY_PROJECT_TYPE: &str = "unity";
+
+/// Project type reported for a workspace, based on whether a Unity project
+/// was detected in it.
+pub fn project_type_for_workspace(is_unity: bool) -> &'static str {
+    if is_unity {
+        UNITY_PROJECT_TYPE
+    } else {
+        GENERIC_PROJECT_TYPE
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
 
 pub fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
@@ -70,6 +86,13 @@ pub struct AgentDef {
     pub tools: Vec<String>,
     #[serde(default)]
     pub sub_agents: Vec<String>,
+    /// Whether other Agents may delegate to this Agent through `subagent`.
+    #[serde(default = "default_true")]
+    pub delegatable: bool,
+    /// Project types for which this Agent is the preferred new-session Agent
+    /// when the global default Agent does not support that project type.
+    #[serde(default)]
+    pub default_project_types: Vec<String>,
     #[serde(default)]
     pub default: bool,
     #[serde(default)]
@@ -86,6 +109,7 @@ pub struct AgentDef {
 pub struct AgentDefRegistry {
     defs: HashMap<String, AgentDef>,
     default_id: String,
+    workspace_default: bool,
 }
 
 impl AgentDefRegistry {
@@ -121,6 +145,7 @@ impl AgentDefRegistry {
             return AgentDefRegistry {
                 defs,
                 default_id: String::new(),
+                workspace_default: false,
             };
         }
 
@@ -132,7 +157,11 @@ impl AgentDefRegistry {
 
         println!("[Locus] default agent: '{}'", default_id);
 
-        AgentDefRegistry { defs, default_id }
+        AgentDefRegistry {
+            defs,
+            default_id,
+            workspace_default: false,
+        }
     }
 
     fn scan_plugin_agent_sources(
@@ -356,6 +385,7 @@ impl AgentDefRegistry {
 
         def.id = id.to_string();
         Self::normalize_project_types(&mut def.project_types);
+        Self::normalize_project_types(&mut def.default_project_types);
         Self::normalize_agent_tools(id, &mut def.tools);
 
         if let Some(prompt_path) = Self::system_prompt_path(dir) {
@@ -541,6 +571,21 @@ impl AgentDefRegistry {
                             .filter_map(|v| v.as_str().map(String::from))
                             .collect();
                     }
+                    if let Some(delegatable) =
+                        overlay.get("delegatable").and_then(|v| v.as_bool())
+                    {
+                        base.delegatable = delegatable;
+                    }
+                    if let Some(project_types) = overlay
+                        .get("default_project_types")
+                        .and_then(|v| v.as_array())
+                    {
+                        base.default_project_types = project_types
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                        Self::normalize_project_types(&mut base.default_project_types);
+                    }
                     if let Some(d) = overlay.get("default").and_then(|v| v.as_bool()) {
                         base.default = d;
                     }
@@ -662,11 +707,22 @@ impl AgentDefRegistry {
         self.defs.keys().map(|s| s.as_str()).collect()
     }
 
+    /// Delegation targets without a workspace project-type filter.
     pub fn list_subagent_descriptions(&self) -> Vec<(String, String)> {
+        self.list_subagent_descriptions_for_project_type(None)
+    }
+
+    /// Delegation targets offered by the `subagent` tool. Agents that opt out
+    /// of delegation are omitted, and a known workspace project type keeps
+    /// only Agents that support it.
+    pub fn list_subagent_descriptions_for_project_type(
+        &self,
+        project_type: Option<&str>,
+    ) -> Vec<(String, String)> {
         let mut defs: Vec<&AgentDef> = self
             .defs
             .values()
-            .filter(|def| !is_hidden_legacy_agent_id(&def.id))
+            .filter(|def| def.is_delegation_target_for_project_type(project_type))
             .collect();
         defs.sort_by(|a, b| {
             b.default
@@ -685,6 +741,28 @@ impl AgentDefRegistry {
 
     pub fn default_id(&self) -> &str {
         &self.default_id
+    }
+
+    pub fn workspace_default_id(&self) -> Option<&str> {
+        self.workspace_default.then_some(self.default_id.as_str())
+    }
+
+    /// Only Agents exposed as new-session choices can be workspace defaults.
+    pub fn set_workspace_default(&mut self, agent_id: &str) -> Result<(), String> {
+        if is_hidden_legacy_agent_id(agent_id)
+            || !self.defs.contains_key(agent_id)
+            || self
+                .defs
+                .values()
+                .any(|def| def.sub_agents.iter().any(|id| id == agent_id))
+        {
+            return Err(format!(
+                "Agent '{agent_id}' is not available as a workspace default"
+            ));
+        }
+        self.default_id = agent_id.to_string();
+        self.workspace_default = true;
+        Ok(())
     }
 }
 
@@ -706,6 +784,25 @@ impl AgentDef {
 
     pub fn supports_project_type(&self, project_type: &str) -> bool {
         self.project_type_match_score(project_type) > 0
+    }
+
+    /// Whether this Agent declares itself the preferred new-session Agent for
+    /// the project type.
+    pub fn is_default_for_project_type(&self, project_type: &str) -> bool {
+        let project_type = project_type.trim().to_ascii_lowercase();
+        self.supports_project_type(&project_type)
+            && self
+                .default_project_types
+                .iter()
+                .any(|value| value == &project_type)
+    }
+
+    /// Whether the `subagent` tool may offer and spawn this Agent. `None`
+    /// skips the project-type check when no workspace is known.
+    pub fn is_delegation_target_for_project_type(&self, project_type: Option<&str>) -> bool {
+        self.delegatable
+            && !is_hidden_legacy_agent_id(&self.id)
+            && project_type.map_or(true, |project_type| self.supports_project_type(project_type))
     }
 
     pub fn apply_tool_description_override(
@@ -743,7 +840,9 @@ impl AgentDef {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_agent_id, user_agent_dir, AgentDefRegistry, DEFAULT_AGENT_ID};
+    use super::{
+        canonical_agent_id, user_agent_dir, AgentDefRegistry, DEFAULT_AGENT_ID, GENERAL_AGENT_ID,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -908,6 +1007,231 @@ mod tests {
             .contains("general-purpose software development agent"));
         assert!(simple.supports_project_type("generic"));
         assert!(!simple.supports_project_type("unity"));
+    }
+
+    fn repo_rule_files(agent_id: &str) -> Vec<(String, String)> {
+        let rule_dir = repo_agent_dir().join(agent_id).join("rule");
+        let mut files = fs::read_dir(&rule_dir)
+            .unwrap_or_else(|error| panic!("read {rule_dir:?}: {error}"))
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("md"))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                let content = fs::read_to_string(&path).expect("rule content");
+                (name, content)
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    fn assert_rule_config_matches_files(agent_id: &str) {
+        let config_path = repo_agent_dir().join(agent_id).join("rule_config.json");
+        let config: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("rule config"))
+                .expect("rule config JSON");
+        let mut configured = config.keys().cloned().collect::<Vec<_>>();
+        configured.sort();
+        let files = repo_rule_files(agent_id)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(configured, files, "{agent_id} rule_config.json must match rule/*.md");
+        for (name, entry) in &config {
+            assert_eq!(
+                entry.get("enabled").and_then(serde_json::Value::as_bool),
+                Some(true),
+                "{agent_id} rule {name} should be enabled"
+            );
+        }
+    }
+
+    fn assert_project_neutral(label: &str, text: &str) {
+        let lower = text.to_ascii_lowercase();
+        for term in ["unity", "prefab", "scene", "monobehaviour", "play mode", "editor state"] {
+            assert!(!lower.contains(term), "{label} contains Unity-specific text: {term}");
+        }
+    }
+
+    #[test]
+    fn general_agent_covers_locus_features_without_unity_surface() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        let general = registry.get(GENERAL_AGENT_ID).expect("General Agent should load");
+        let tools = crate::tool::ToolRegistry::with_builtins();
+
+        assert_eq!(general.name, "General");
+        assert_eq!(general.project_types, vec!["generic"]);
+        assert_eq!(general.default_project_types, vec!["generic"]);
+        assert!(!general.default);
+        assert!(!general.delegatable);
+        assert_eq!(general.sub_agents, vec!["researcher"]);
+        assert!(general.is_default_for_project_type("generic"));
+        assert!(!general.is_default_for_project_type("unity"));
+        for project_type in [None, Some("generic"), Some("unity")] {
+            assert!(!general.is_delegation_target_for_project_type(project_type));
+        }
+
+        for tool in [
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "python",
+            "grep",
+            "list",
+            "subagent",
+            "todowrite",
+            "ask_user_question",
+            "web_fetch",
+            "knowledge_query",
+            "skill_list",
+            "execute_typescript",
+        ] {
+            assert!(general.tools.iter().any(|name| name == tool), "General should expose {tool}");
+        }
+        for tool in &general.tools {
+            assert!(
+                !tool.starts_with("unity_") && !tool.starts_with("code_"),
+                "General should not expose {tool}"
+            );
+            assert!(
+                crate::workspace_service::owner_service_for_tool(tool).is_none(),
+                "General should not depend on a workspace service for {tool}"
+            );
+            if tool != "subagent" {
+                assert!(tools.get(tool).is_some(), "General tool {tool} should be built in");
+            }
+        }
+        assert!(general.tool_description_overrides.is_empty());
+
+        for block in ["{{#git}}", "{{#knowledge}}", "{{#knowledge_index}}", "{{#knowledge_memory}}"] {
+            assert!(general.env_template.contains(block), "General env should include {block}");
+        }
+        assert!(!general.env_template.contains("{{#unity}}"));
+        assert!(general.system_prompt.contains("general-purpose software development agent"));
+        assert_project_neutral("General soul", &general.system_prompt);
+        assert_project_neutral("General env", &general.env_template);
+
+        assert_rule_config_matches_files(GENERAL_AGENT_ID);
+        for (name, content) in repo_rule_files(GENERAL_AGENT_ID) {
+            assert_project_neutral(&format!("General rule {name}"), &content);
+        }
+        for shared in ["knowledge_maintenance.md", "output_principles.md"] {
+            assert_eq!(
+                fs::read_to_string(repo_agent_dir().join("general/rule").join(shared)).unwrap(),
+                fs::read_to_string(repo_agent_dir().join("unity/rule").join(shared)).unwrap(),
+                "General should share the Unity {shared} rule"
+            );
+        }
+    }
+
+    #[test]
+    fn researcher_is_a_read_only_generic_subagent() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        let researcher = registry.get("researcher").expect("Researcher should load");
+        let tools = crate::tool::ToolRegistry::with_builtins();
+
+        assert_eq!(researcher.project_types, vec!["generic"]);
+        assert!(researcher.default_project_types.is_empty());
+        assert!(researcher.delegatable);
+        assert!(!researcher.default);
+        assert!(researcher.sub_agents.is_empty());
+        assert_eq!(
+            researcher.tools,
+            ["read", "list", "grep", "knowledge_query", "web_fetch"]
+        );
+        for tool in &researcher.tools {
+            assert!(tools.get(tool).is_some(), "Researcher tool {tool} should be built in");
+            assert!(!tools.mutates_workspace(tool), "Researcher tool {tool} must be read-only");
+        }
+        assert!(researcher.is_delegation_target_for_project_type(Some("generic")));
+        assert!(!researcher.is_delegation_target_for_project_type(Some("unity")));
+        assert!(!researcher.env_template.contains("{{#unity}}"));
+        assert_project_neutral("Researcher soul", &researcher.system_prompt);
+        assert_rule_config_matches_files("researcher");
+        for (name, content) in repo_rule_files("researcher") {
+            assert_project_neutral(&format!("Researcher rule {name}"), &content);
+        }
+    }
+
+    #[test]
+    fn subagent_descriptions_follow_delegation_and_project_type() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        let ids = |project_type: Option<&str>| {
+            registry
+                .list_subagent_descriptions_for_project_type(project_type)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
+
+        let unscoped = ids(None);
+        assert_eq!(
+            registry
+                .list_subagent_descriptions()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            unscoped
+        );
+        for id in ["unity", "explorer", "simple", "researcher"] {
+            assert!(unscoped.iter().any(|listed| listed == id), "{id} missing from {unscoped:?}");
+        }
+
+        let generic = ids(Some("generic"));
+        for id in ["simple", "researcher"] {
+            assert!(generic.iter().any(|listed| listed == id), "{id} missing from {generic:?}");
+        }
+        let unity = ids(Some("unity"));
+        for id in ["unity", "explorer"] {
+            assert!(unity.iter().any(|listed| listed == id), "{id} missing from {unity:?}");
+        }
+        for (listed, hidden) in [
+            (&unscoped, &["general"][..]),
+            (&generic, &["general", "unity", "explorer"][..]),
+            (&unity, &["general", "simple", "researcher"][..]),
+        ] {
+            for id in hidden {
+                assert!(!listed.iter().any(|value| value == id), "{id} in {listed:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlays_can_change_delegation_and_project_defaults() {
+        let root = tempfile::tempdir().expect("temp root");
+        let bundled_root = root.path().join("agent");
+        let bundled = bundled_root.join("helper");
+        fs::create_dir_all(&bundled).expect("bundled Agent dir");
+        fs::write(
+            bundled.join("config.json"),
+            r#"{"name":"Helper","project_types":["Generic"],"tools":["read"]}"#,
+        )
+        .expect("bundled config");
+        fs::write(bundled.join("soul.md"), "Help.").expect("bundled soul");
+
+        let registry = AgentDefRegistry::load(Some(&bundled_root), None);
+        let helper = registry.get("helper").expect("bundled Agent");
+        assert!(helper.delegatable);
+        assert!(helper.default_project_types.is_empty());
+
+        let project_root = root.path().join("workspace/Locus/agent");
+        let overlay = project_root.join("helper");
+        fs::create_dir_all(&overlay).expect("project overlay dir");
+        fs::write(
+            overlay.join("config.json"),
+            r#"{"delegatable":false,"default_project_types":[" GENERIC ","generic"]}"#,
+        )
+        .expect("overlay config");
+
+        let registry = AgentDefRegistry::load(Some(&bundled_root), Some(&project_root));
+        let helper = registry.get("helper").expect("merged Agent");
+        assert_eq!(helper.source, "both");
+        assert!(!helper.delegatable);
+        assert_eq!(helper.default_project_types, vec!["generic"]);
+        assert!(helper.is_default_for_project_type("generic"));
+        assert!(registry.list_subagent_descriptions().is_empty());
     }
 
     #[test]

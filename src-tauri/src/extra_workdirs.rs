@@ -51,7 +51,11 @@ pub fn load_entries(workspace_dir: &str) -> Vec<ExtraWorkdirEntry> {
     if workspace_dir.trim().is_empty() {
         return Vec::new();
     }
-    let Ok(data) = std::fs::read_to_string(config_path(workspace_dir)) else {
+    let path = config_path(workspace_dir);
+    let path = if path.exists() { path } else {
+        std::path::Path::new(workspace_dir).join("Library").join("Locus").join(EXTRA_WORKDIRS_FILE)
+    };
+    let Ok(data) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     serde_json::from_str::<ExtraWorkdirsConfig>(&data)

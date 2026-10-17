@@ -1,5 +1,6 @@
 
 <script setup lang="ts">
+import { requestWorkspaceSetup } from "../composables/useWorkspaceSetup";
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
 import { confirm, open } from "@tauri-apps/plugin-dialog";
@@ -184,6 +185,7 @@ async function browseProject() {
   try {
     const selected = await open({ directory: true, multiple: false });
     if (selected && typeof selected === "string") {
+      if (!await requestWorkspaceSetup(selected)) return;
       projectError.value = "";
       projectPath.value = selected;
       projectValid.value = false;

@@ -1,7 +1,7 @@
 Delegate a bounded research or implementation task to an available agent:
 {agent_list}
 
-Set subagent_type and provide the question, scope, and expected result. Use explorer for multi-file research; use a writable agent for authorized implementation. For simple directed searches or a few known files, use direct tools. Independent read-only research may overlap other safe reads when the active interface supports it.
+Set subagent_type and provide the question, scope, and expected result. Use a read-only research agent for multi-file research; use a writable agent for authorized implementation. For simple directed searches or a few known files, use direct tools. Independent read-only research may overlap other safe reads when the active interface supports it.
 
 Nesting and concurrency follow Locus settings (defaults: depth 1, concurrency 3). Depth-capped agents do not receive this tool; concurrency errors report the current limit. Plan-mode children are forced read-only. Treat child findings as evidence to verify and integrate into the requested result.
 

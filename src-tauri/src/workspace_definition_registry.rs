@@ -304,17 +304,22 @@ fn load_agent_registry(
     let project_agent_dir = workspace_root.join("Locus").join("agent");
     let project_agent_dir = project_agent_dir.is_dir().then_some(project_agent_dir);
     let plugin_sources = crate::plugin::installed_agent_sources(&working_dir);
-    AgentDefRegistry::load_with_plugins(
+    let mut registry = AgentDefRegistry::load_with_plugins(
         app_agent_dir.as_deref(),
         project_agent_dir.as_deref(),
         &plugin_sources,
-    )
+    );
+    if let Some(agent_id) = crate::workspace::default_agent_id(&working_dir) {
+        // Removed/disabled Agents fall back to the normal project-type default.
+        let _ = registry.set_workspace_default(&agent_id);
+    }
+    registry
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
@@ -346,6 +351,43 @@ mod tests {
             .get("unity")
             .expect("workspace Unity Agent")
             .system_prompt
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn workspace_default_persists_and_invalidates_only_its_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        let runtime_a = runtime(&root_a, 1);
+        let runtime_b = runtime(&root_b, 1);
+        let app_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../agent");
+        let definitions = WorkspaceDefinitionRegistry::new(Some(app_dir.clone()));
+        let a = definitions.snapshot(&runtime_a).await.unwrap();
+        let b = definitions.snapshot(&runtime_b).await.unwrap();
+        assert_eq!(a.workspace_default_id(), None);
+
+        crate::workspace::set_default_agent_id(&root_a.to_string_lossy(), "simple").unwrap();
+        definitions
+            .invalidate_checkout(runtime_a.checkout_id())
+            .unwrap();
+        let updated = definitions.snapshot(&runtime_a).await.unwrap();
+        assert_eq!(updated.workspace_default_id(), Some("simple"));
+        assert_eq!(updated.default_def().unwrap().id, "simple");
+        assert_eq!(a.workspace_default_id(), None);
+        assert!(Arc::ptr_eq(
+            &b,
+            &definitions.snapshot(&runtime_b).await.unwrap()
+        ));
+        let reloaded = load_agent_registry(Some(app_dir.clone()), root_a.clone());
+        assert_eq!(reloaded.workspace_default_id(), Some("simple"));
+
+        for unavailable in ["removed-agent", "explorer"] {
+            crate::workspace::set_default_agent_id(&root_a.to_string_lossy(), unavailable).unwrap();
+            let fallback = load_agent_registry(Some(app_dir.clone()), root_a.clone());
+            assert_eq!(fallback.workspace_default_id(), None);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

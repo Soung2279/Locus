@@ -51,7 +51,9 @@ impl ProjectKnowledgeCatalog {
         checkouts.sort_by(|left, right| left.checkout_id.cmp(&right.checkout_id));
         let mut selected = HashMap::<String, ProjectKnowledgeDocument>::new();
 
-        for (checkout_index, checkout) in checkouts.into_iter().enumerate() {
+        for (checkout_index, checkout) in checkouts.into_iter()
+            .filter(|checkout| crate::workspace::knowledge_enabled(&checkout.root.to_string_lossy()))
+            .enumerate() {
             let root = checkout.root.to_string_lossy().into_owned();
             let items = crate::knowledge_store::list_documents_with_app_root(
                 &root,

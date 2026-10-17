@@ -1,0 +1,27 @@
+{
+  "name": "General",
+  "description": "General software development with Locus knowledge, skills, planning, and extensions.",
+  "project_types": ["generic"],
+  "default_project_types": ["generic"],
+  "delegatable": false,
+  "tools": [
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "python",
+    "grep",
+    "list",
+    "subagent",
+    "todowrite",
+    "ask_user_question",
+    "web_fetch",
+    "knowledge_query",
+    "skill_list",
+    "execute_typescript"
+  ],
+  "sub_agents": ["researcher"],
+  "default": false,
+  "default_effort": "medium",
+  "model_recommendation": "large"
+}

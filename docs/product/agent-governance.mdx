@@ -17,9 +17,19 @@ Locus 面向的不是一次性问答，而是可持续使用的开发代理。�
 - Agent system prompt、env、规则、运行时注入、tool schema 的可视化仪表盘
 - 工作区规则可由 Agent 通过 Python SDK 自行添加、更新和启停，无需手动打开设置
 
+## 内置 Agent
+
+| Agent | 用途 | 默认场景 |
+|---|---|---|
+| Unity（`unity`） | Unity 项目开发、调试与优化，包含 Editor、资产、测试和 C# 代码工具 | Unity 工作区 |
+| General（`general`） | 通用软件开发，包含知识库、Skill、待办、提问、网页读取、View/Workbench 控制和 Python SDK，不含 Unity 工具与规则 | 非 Unity 工作区 |
+| Simple（`simple`） | 只保留文件、Shell、Python 与搜索工具的精简 Agent | 手动选择 |
+
+子 Agent 不出现在新建会话的 Agent 列表中：Unity 使用 Explorer（`explorer`）调查代码、资产和实时 Unity 数据；General 使用 Researcher（`researcher`）只读调查工作区文件、项目知识和外部文档。`subagent` 工具只列出支持当前工作区类型的 Agent，General 不作为子 Agent 被调用。
+
 ## 工作区规则
 
-通过 `await locus.get_agent("unity")` 获取内置 Agent 后，使用 `list_rules()` 查询规则，`read_rule(key)` 读取内容，`save_rule(file_name, content)` 新增或更新规则，`set_rule_enabled(key, False)` 停用规则，传入 `True` 可重新启用。
+通过 `await locus.get_agent("unity")`（通用工作区可用 `"general"`）获取内置 Agent 后，使用 `list_rules()` 查询规则，`read_rule(key)` 读取内容，`save_rule(file_name, content)` 新增或更新规则，`set_rule_enabled(key, False)` 停用规则，传入 `True` 可重新启用。
 
 SDK 默认使用 Python 会话所在的工作区，也可传入 `workspace_ref=` 或 `worktree=`。内容和启停选择保存在该工作区的 `Locus/agent/<agent-id>/` 下。应用默认规则可以在该工作区停用；编辑其内容时会创建工作区覆盖，应用默认文件和其他工作区保持不变。更新会反映到现有 Agent 规则列表，并在下一次模型请求中生效，包括当前运行的下一轮工具调用之后。
 

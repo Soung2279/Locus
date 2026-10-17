@@ -4,6 +4,12 @@ import { t } from "../../i18n";
 import type { AgentInfo } from "../../types";
 import type { WorkspaceRef } from "../../services/project";
 import { listAgents, listSubagentDefs, listWorkspaceAgents, listWorkspaceSubagentDefs } from "../../services/agent";
+import {
+  ALL_AGENTS_INJECT_PATTERN,
+  injectAgentPatternMatches,
+  isInjectAgentPattern,
+  legacyKnowledgeInjectAgents,
+} from "../../config/knowledgeInjection";
 import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import BaseButton from "../ui/BaseButton.vue";
 
@@ -17,15 +23,37 @@ const agents = ref<AgentInfo[]>([]);
 const loading = ref(false);
 const failed = ref(false);
 let requestId = 0;
-const selected = computed(() => props.modelValue ?? ["unity"]);
-// Preserve unavailable custom Agents when another selection is changed.
+const selected = computed(() => props.modelValue ?? legacyKnowledgeInjectAgents());
+const allSelected = computed(() => selected.value.includes(ALL_AGENTS_INJECT_PATTERN));
+// Preserve unavailable custom Agents and patterns when another selection is changed.
 const options = computed(() => {
   const result = agents.value.map(({ id, name }) => ({ id, name }));
   for (const id of selected.value) {
-    if (!result.some((agent) => agent.id === id)) result.push({ id, name: id });
+    if (id !== ALL_AGENTS_INJECT_PATTERN && !result.some((agent) => agent.id === id)) {
+      result.push({ id, name: id });
+    }
   }
   return result;
 });
+
+/** A row matched only by another wildcard entry cannot be toggled on its own. */
+function coveredByPattern(id: string): boolean {
+  return selected.value.some((entry) => entry !== id
+    && isInjectAgentPattern(entry)
+    && injectAgentPatternMatches(entry, id));
+}
+
+function isChecked(id: string): boolean {
+  return selected.value.includes(id) || coveredByPattern(id);
+}
+
+function toggleAll(enabled: boolean) {
+  if (props.disabled || loading.value || failed.value) return;
+  // Turning the wildcard off keeps every listed Agent explicitly selected.
+  emit("update:modelValue", enabled
+    ? [ALL_AGENTS_INJECT_PATTERN]
+    : [...new Set(options.value.map((agent) => agent.id))]);
+}
 
 async function loadAgents() {
   const current = ++requestId;
@@ -47,7 +75,7 @@ async function loadAgents() {
 }
 
 function toggle(id: string, enabled: boolean) {
-  if (props.disabled || loading.value || failed.value) return;
+  if (props.disabled || loading.value || failed.value || coveredByPattern(id)) return;
   emit("update:modelValue", enabled
     ? [...new Set([...selected.value, id])]
     : selected.value.filter((agent) => agent !== id));
@@ -66,10 +94,19 @@ onUnmounted(() => { requestId += 1; });
       <BaseButton @click="loadAgents">{{ t("knowledge.meta.injectAgentsRetry") }}</BaseButton>
     </template>
     <template v-else>
+      <label class="injection-agent-row injection-agent-all" :title="t('knowledge.meta.injectAgentsAllHint')">
+        <BaseCheckbox
+          :model-value="allSelected"
+          :disabled="disabled"
+          :aria-label="t('knowledge.meta.injectAgentsAll')"
+          @update:model-value="toggleAll($event)"
+        />
+        <span>{{ t("knowledge.meta.injectAgentsAll") }}</span>
+      </label>
       <label v-for="agent in options" :key="agent.id" class="injection-agent-row" :title="agent.id">
         <BaseCheckbox
-          :model-value="selected.includes(agent.id)"
-          :disabled="disabled"
+          :model-value="isChecked(agent.id)"
+          :disabled="disabled || coveredByPattern(agent.id)"
           :aria-label="agent.name"
           @update:model-value="toggle(agent.id, $event)"
         />
@@ -99,6 +136,11 @@ onUnmounted(() => { requestId += 1; });
   cursor: pointer;
 }
 .injection-agent-row:hover { background: var(--hover-bg); }
+.injection-agent-all {
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--border-color);
+  border-radius: 4px 4px 0 0;
+}
 .injection-agent-row span {
   min-width: 0;
   overflow: hidden;

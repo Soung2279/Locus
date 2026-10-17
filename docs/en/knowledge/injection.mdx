@@ -25,6 +25,17 @@ Defaults differ by type: Design and Plan documents default to `L0 - Path Injecti
 
 What `L1 - Summary Injection` actually injects is the document's `Summary` field, falling back to the opening of the body when the field is empty. Openings tend to be background rather than conclusions, so for key always-on documents, write the summary by hand: two or three sentences on what the document covers and when the full text is worth opening. The summary is also used in search result previews.
 
+## Injection targets
+
+`L2 - Full Injection` and `L3 - Full Rule Injection` reach only the selected Agents. Choose them in the `Inject into Agents` panel beside the inject mode menu; the choice is stored in the `injectAgents` frontmatter field:
+
+- New documents default to `All Agents`, saved as `injectAgents: ["*"]`, which also covers Agents added later.
+- `*` is a wildcard that matches any characters: `"*"` selects every Agent and `"team-*"` selects Agents whose id starts with `team-`. Quote `*` in YAML, or write the scalar form `injectAgents: "*"`.
+- Documents without an `injectAgents` field keep their previous behavior and inject only into the Unity Agent. Explicit lists apply as written, and `[]` injects into no Agent.
+- CSV tables have no frontmatter and always behave as documents without the field.
+
+Path, summary, and search-only levels are not limited by `injectAgents`.
+
 ## Folder-level config and inheritance
 
 Right-click a folder and choose `Folder Config` to set an injection mode for the whole folder (`Search Only` / `L0` / `L1`; L1 attaches the folder description after the folder path). Documents and subfolders default to `Inherit Parent`, and top-level folders follow the type default. The `Effective` line in the config panel states whether the active config comes from the local config, a parent folder, or the type default. When organizing documents in bulk, configure at the folder level first, then override individual documents.

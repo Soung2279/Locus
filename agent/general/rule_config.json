@@ -1,0 +1,18 @@
+{
+  "execution.md": {
+    "enabled": true,
+    "order": 0
+  },
+  "knowledge_maintenance.md": {
+    "enabled": true,
+    "order": 1
+  },
+  "output_principles.md": {
+    "enabled": true,
+    "order": 2
+  },
+  "references.md": {
+    "enabled": true,
+    "order": 3
+  }
+}

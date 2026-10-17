@@ -28,10 +28,10 @@ Write all model-facing prompts in English, including the soul, rules, environmen
    - Use `userAgentRoot` only when the user explicitly requests an installation-level Agent shared across projects. It is the user-owned `user-agents/` directory beside the installed resources; it is outside the project repository.
    - Set `<agentRoot>` to the returned root for the chosen scope and use absolute paths under it for every file operation. Never substitute the process working directory or the Locus installation directory for the project root. If `projectAgentRoot` cannot be resolved, ask for the target project; do not fall back to `userAgentRoot`.
    - When editing an existing Agent, honor the requested scope. If neither the request nor the existing files identify it unambiguously, ask which scope to edit before writing.
-2. Inspect `<agentRoot>/<agent-id>/` when it exists. Preserve useful files and apply the requested changes. Reject ids already owned by another Agent unless the user explicitly asked to edit or create a project copy of that Agent. Keep `unity`, `simple`, `dev`, `explorer`, `doc`, `wiki`, `git`, `knowledge`, and `runtime_debugger` reserved for new Agents.
+2. Inspect `<agentRoot>/<agent-id>/` when it exists. Preserve useful files and apply the requested changes. Reject ids already owned by another Agent unless the user explicitly asked to edit or create a project copy of that Agent. Keep `unity`, `general`, `simple`, `explorer`, `researcher`, `dev`, `doc`, `wiki`, `git`, `knowledge`, and `runtime_debugger` reserved for new Agents.
 3. Create `<agentRoot>/<agent-id>/config.json`, `soul.md`, and the focused Markdown rules the workflow needs under `rule/`, with their defaults in `rule_config.json`. Add `env.md`, `injection_config.json`, or `tools/` only when needed.
    - A project Agent must be usable from the repository on a teammate's machine: keep its definition, prompts, rules, and tool-description overrides together under `<projectAgentRoot>/<agent-id>/`, without depending on a same-id Agent in the local installation or machine-specific absolute paths in its content. When explicitly copying an existing Agent into the project, include all required files; leave the original files intact.
-   - Use the current Unity and Simple structure as the reference: Unity has a short role prompt in `system.md` with detailed injected rules; Simple has a compact `soul.md` and essential tools. Match that restraint and include only behavior relevant to the new Agent, without copying Unity-specific constraints into unrelated workflows.
+   - Use the current Unity, General, and Simple structure as the reference: Unity has a short role prompt in `system.md` with detailed injected rules; General has a short `soul.md` with project-neutral injected rules and knowledge context; Simple has a compact `soul.md` and essential tools. Match that restraint and include only behavior relevant to the new Agent, without copying Unity-specific constraints into unrelated workflows.
    - `soul.md` takes precedence over the legacy `system.md`. New Agents use `soul.md`. For an existing Agent, edit its effective prompt, or deliberately move its role into `soul.md` while preserving required behavior in rules; do not maintain competing prompt copies.
 4. Write `config.json` with this schema:
 
@@ -48,7 +48,8 @@ Write all model-facing prompts in English, including the soul, rules, environmen
 ```
 
    - Choose only tools required by the workflow. Use real Locus tool names already visible in the current tool surface.
-   - Keep `default` false to preserve the current default Agent.
+   - Keep `default` false to preserve the current default Agent, and leave `default_project_types` unset so the built-in project defaults remain in place.
+   - Agents are available to the `subagent` tool by default. Add `"delegatable": false` only when other Agents must not spawn this Agent as a child.
    - Use `default_effort` from `none`, `low`, `medium`, `high`, `xhigh`, or `max`.
    - Use `model_recommendation` as `small` or `large`. The model selector remembers the exact model and reasoning effort chosen for each Agent.
 5. Keep the soul concise and put most behavioral instructions in injected rules.

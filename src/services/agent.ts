@@ -35,6 +35,10 @@ export function listWorkspaceAgents(workspaceRef: WorkspaceRef): Promise<AgentIn
   return ipcInvoke<AgentInfo[]>("list_workspace_agents", { workspaceRef });
 }
 
+export function setWorkspaceDefaultAgent(workspaceRef: WorkspaceRef, agentId: string): Promise<void> {
+  return ipcInvoke("set_workspace_default_agent", { workspaceRef, agentId });
+}
+
 export function listWorkspaceSubagentDefs(workspaceRef: WorkspaceRef): Promise<AgentInfo[]> {
   return ipcInvoke<AgentInfo[]>("list_workspace_subagent_defs", { workspaceRef });
 }

@@ -26,7 +26,7 @@ print(result.text)
 
 ## Workspace rules for installed Agents
 
-Use the installed Agent object to manage rules without opening the Agent page:
+Use the installed Agent object to manage rules without opening the Agent page. Select the Agent whose rules should change: the built-in top-level Agents are `unity` for Unity workspaces, `general` for other workspaces, and the minimal `simple`.
 
 ```python
 agent = await locus.get_agent("unity")

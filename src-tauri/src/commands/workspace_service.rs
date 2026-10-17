@@ -221,6 +221,7 @@ pub struct WorkspaceRuntimeDescriptor {
     pub materialization_epoch: u64,
     pub lease_count: usize,
     pub detected_services: Vec<String>,
+    pub knowledge_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -232,6 +233,7 @@ pub struct WorkspaceCheckoutDescriptor {
     pub normalized_root: String,
     pub last_opened_at: i64,
     pub available: bool,
+    pub knowledge_enabled: bool,
     pub runtime: Option<WorkspaceRuntimeDescriptor>,
 }
 
@@ -341,6 +343,7 @@ fn runtime_descriptor(runtime: &WorkspaceRuntime) -> WorkspaceRuntimeDescriptor 
         materialization_epoch: runtime.materialization_epoch(),
         lease_count: runtime.lease_count(),
         detected_services,
+        knowledge_enabled: crate::workspace::knowledge_enabled(&runtime.root().to_string_lossy()),
     }
 }
 
@@ -444,6 +447,7 @@ pub fn list_project_contexts(
             .entry(checkout.project_id.clone())
             .or_default()
             .push(WorkspaceCheckoutDescriptor {
+                knowledge_enabled: crate::workspace::knowledge_enabled(&checkout.root_path),
                 checkout_id: checkout.checkout_id,
                 project_id: checkout.project_id.clone(),
                 root: checkout.root_path,
@@ -486,6 +490,37 @@ pub fn list_project_contexts(
             .then_with(|| left.project_id.cmp(&right.project_id))
     });
     Ok(descriptors)
+}
+
+#[tauri::command]
+pub fn inspect_workspace_setup(path: String) -> Result<crate::workspace::WorkspaceSetup, AppError> {
+    crate::workspace::inspect_workspace_setup(&path).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn save_workspace_setup(
+    path: String,
+    setup: crate::workspace::WorkspaceSetup,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_handle: tauri::AppHandle,
+) -> Result<crate::workspace::WorkspaceSetup, AppError> {
+    let identity = crate::workspace_service::identity::ProjectIdResolver::resolve(&path)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    crate::workspace::save_workspace_setup(&path, &setup)?;
+    if !setup.knowledge_enabled {
+        if let Some(runtime) = registry.runtime(&identity.checkout_id) {
+            runtime.core().stop_knowledge_watchers();
+        }
+    }
+    if let Some(runtime) = registry.runtime(&identity.checkout_id) {
+        crate::workspace_service::event::emit_for_workspace_scope(
+            &app_handle,
+            &crate::workspace_service::event::WorkspaceEventScope::for_runtime(&runtime),
+            "workspace-setup-changed",
+            serde_json::json!({ "knowledgeEnabled": setup.knowledge_enabled }),
+        );
+    }
+    crate::workspace::inspect_workspace_setup(&path).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -876,6 +911,7 @@ mod tests {
             .expect("ProjectSettings directory");
         let checkouts = vec![WorkspaceCheckoutDescriptor {
             checkout_id: "checkout-unity".to_string(),
+            knowledge_enabled: true,
             project_id: "project-unity".to_string(),
             root: unity_root.display().to_string(),
             normalized_root: unity_root.display().to_string(),

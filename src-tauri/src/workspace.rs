@@ -33,6 +33,170 @@ pub fn workspace_config_path(dir: &str) -> std::path::PathBuf {
     Path::new(dir).join("Locus").join("config.json")
 }
 
+pub fn default_agent_id(dir: &str) -> Option<String> {
+    read_json_object(&workspace_config_path(dir))?
+        .get("default_agent_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+pub fn set_default_agent_id(dir: &str, agent_id: &str) -> Result<(), String> {
+    let identity = ProjectIdResolver::resolve(dir).map_err(|error| error.to_string())?;
+    let path = workspace_config_path(&identity.root.to_string_lossy());
+    let mut config = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|error| error.to_string())?
+            .as_object()
+            .cloned()
+            .ok_or("Workspace config must be a JSON object")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    config.insert(
+        "workspace_id".into(),
+        serde_json::json!(identity.project_id.as_str()),
+    );
+    config.remove("workspaceId");
+    config.insert("default_agent_id".into(), serde_json::json!(agent_id));
+    std::fs::create_dir_all(path.parent().ok_or("Invalid workspace config path")?)
+        .map_err(|error| error.to_string())?;
+    crate::config::atomic_write_config(
+        &path,
+        &serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?,
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSetup {
+    pub is_unity_project: bool,
+    pub knowledge_enabled: bool,
+    pub unity_test_tools_enabled: bool,
+    #[serde(default)]
+    pub extra_workdirs: Option<Vec<crate::extra_workdirs::ExtraWorkdirStatus>>,
+}
+
+/// Unconfigured, existing workspaces retain their knowledge behavior. New
+/// workspaces explicitly save the project-type defaults before registration.
+pub fn knowledge_enabled(dir: &str) -> bool {
+    if dir.trim().is_empty() {
+        return false;
+    }
+    read_json_object(&workspace_config_path(dir))
+        .and_then(|value| {
+            value
+                .get("knowledge_enabled")
+                .or_else(|| value.get("knowledgeEnabled"))
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(true)
+}
+
+pub fn require_knowledge_enabled(dir: &str) -> Result<(), String> {
+    if knowledge_enabled(dir) {
+        Ok(())
+    } else {
+        Err("Locus knowledge is disabled for this workspace.".to_string())
+    }
+}
+
+/// CLI/startup paths bypass the add-workspace panel. Persist the same defaults
+/// there, retaining knowledge that older versions have already initialized.
+pub fn initialize_workspace_setup(dir: &str) -> Result<(), String> {
+    let config = read_json_object(&workspace_config_path(dir)).unwrap_or_default();
+    if config
+        .get("knowledge_enabled")
+        .or_else(|| config.get("knowledgeEnabled"))
+        .and_then(|value| value.as_bool())
+        .is_some()
+    {
+        return Ok(());
+    }
+    let mut setup = inspect_workspace_setup(dir)?;
+    setup.knowledge_enabled |= crate::knowledge_store::knowledge_root(dir).is_dir();
+    save_workspace_setup(dir, &setup)
+}
+
+pub fn inspect_workspace_setup(dir: &str) -> Result<WorkspaceSetup, String> {
+    let identity = ProjectIdResolver::resolve(dir).map_err(|error| error.to_string())?;
+    let dir = identity.root.to_string_lossy();
+    let is_unity_project = crate::unity_bridge::is_unity_project(&dir);
+    let config = read_json_object(&workspace_config_path(&dir)).unwrap_or_default();
+    Ok(WorkspaceSetup {
+        is_unity_project,
+        knowledge_enabled: config
+            .get("knowledge_enabled")
+            .or_else(|| config.get("knowledgeEnabled"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(is_unity_project),
+        unity_test_tools_enabled: config
+            .get("unity_test_tools_enabled")
+            .or_else(|| config.get("unityTestToolsEnabled"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            && is_unity_project,
+        extra_workdirs: Some(crate::extra_workdirs::load_statuses(&dir)),
+    })
+}
+
+pub fn save_workspace_setup(dir: &str, setup: &WorkspaceSetup) -> Result<(), String> {
+    let identity = ProjectIdResolver::resolve(dir).map_err(|error| error.to_string())?;
+    let path = workspace_config_path(&identity.root.to_string_lossy());
+    let mut config = if path.exists() {
+        let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|error| error.to_string())?
+            .as_object()
+            .cloned()
+            .ok_or("Workspace config must be a JSON object")?
+    } else {
+        serde_json::Map::new()
+    };
+    // Preserve the resolved project identity and all unrelated settings.
+    config.insert(
+        "workspace_id".into(),
+        serde_json::json!(identity.project_id.as_str()),
+    );
+    config.remove("workspaceId");
+    config.remove("knowledgeEnabled");
+    config.remove("unityTestToolsEnabled");
+    config.insert(
+        "knowledge_enabled".into(),
+        serde_json::json!(setup.knowledge_enabled),
+    );
+    config.insert(
+        "unity_test_tools_enabled".into(),
+        serde_json::json!(
+            setup.unity_test_tools_enabled
+                && crate::unity_bridge::is_unity_project(&identity.root.to_string_lossy())
+        ),
+    );
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|error| error.to_string())?;
+    crate::config::atomic_write_config(
+        &path,
+        &serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?,
+    )?;
+    if let Some(entries) = &setup.extra_workdirs {
+        let root = identity.root.to_string_lossy();
+        let entries = crate::extra_workdirs::normalize_entries(
+            &root,
+            entries.iter().map(|entry| crate::extra_workdirs::ExtraWorkdirEntry {
+                path: entry.path.clone(),
+                comment: entry.comment.clone(),
+                read_only: entry.read_only,
+            }).collect(),
+        );
+        // Keep attachments in their existing machine-local file. Avoid creating
+        // an empty attachment file when only the basic settings were changed.
+        if entries != crate::extra_workdirs::load_entries(&root) {
+            crate::extra_workdirs::save_entries(&root, &entries)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn read_workspace_config(dir: &str) -> Result<WorkspaceConfig, String> {
     let config_path = workspace_config_path(dir);
     let content = std::fs::read_to_string(&config_path)
@@ -307,10 +471,180 @@ mod tests {
         unity_test_tools_workspace_status, WorkspaceConfig,
     };
 
+    #[test]
+    fn workspace_setup_defaults_are_read_only_and_follow_project_type() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_string_lossy();
+        let setup = super::inspect_workspace_setup(&dir).unwrap();
+        assert!(!setup.is_unity_project);
+        assert!(!setup.knowledge_enabled);
+        assert!(!root.path().join("Locus").exists());
+        assert!(!root.path().join("Library").exists());
+        fs::create_dir(root.path().join("Assets")).unwrap();
+        fs::create_dir(root.path().join("ProjectSettings")).unwrap();
+        let setup = super::inspect_workspace_setup(&dir).unwrap();
+        assert!(setup.is_unity_project);
+        assert!(setup.knowledge_enabled);
+        assert!(!setup.unity_test_tools_enabled);
+        assert!(!root.path().join("Locus").exists());
+    }
+
+    #[test]
+    fn workspace_setup_round_trips_additional_directories_without_changing_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let dir = root.path().to_string_lossy();
+        let extra_path = extra.path().to_string_lossy().to_string();
+        let mut setup = super::inspect_workspace_setup(&dir).unwrap();
+        assert!(setup.extra_workdirs.as_ref().unwrap().is_empty());
+        setup.extra_workdirs = Some(vec![crate::extra_workdirs::ExtraWorkdirStatus {
+            path: extra_path.clone(),
+            comment: " Reference source ".into(),
+            read_only: true,
+            exists: false,
+        }]);
+        super::save_workspace_setup(&dir, &setup).unwrap();
+        let saved = super::inspect_workspace_setup(&dir).unwrap();
+        let entries = saved.extra_workdirs.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, extra_path);
+        assert_eq!(entries[0].comment, "Reference source");
+        assert!(entries[0].read_only);
+        assert!(entries[0].exists);
+        let config = super::read_json_object(&super::workspace_config_path(&dir)).unwrap();
+        assert!(!config.contains_key("extraWorkdirs"));
+        assert_eq!(crate::extra_workdirs::load_entries(&dir).len(), 1);
+
+        // Callers that only edit basic options must preserve attachments.
+        setup.extra_workdirs = None;
+        super::save_workspace_setup(&dir, &setup).unwrap();
+        assert_eq!(crate::extra_workdirs::load_entries(&dir).len(), 1);
+        setup.extra_workdirs = Some(vec![]);
+        super::save_workspace_setup(&dir, &setup).unwrap();
+        assert!(crate::extra_workdirs::load_entries(&dir).is_empty());
+    }
+
+    #[test]
+    fn disabled_workspace_does_not_create_knowledge_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_string_lossy();
+        let setup = super::inspect_workspace_setup(&dir).unwrap();
+        super::save_workspace_setup(&dir, &setup).unwrap();
+        assert!(!super::knowledge_enabled(&dir));
+        assert!(crate::knowledge_store::ensure_workspace_knowledge_layout(&dir).is_err());
+        assert!(crate::knowledge_index::migrate_legacy_non_unity_storage(&dir).is_err());
+        assert!(!root.path().join("Library").exists());
+        let files = fs::read_dir(root.path().join("Locus"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec![std::ffi::OsString::from("config.json")]);
+    }
+
+    #[test]
+    fn workspace_setup_preserves_identity_and_unrelated_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_string_lossy();
+        fs::create_dir(root.path().join("Locus")).unwrap();
+        fs::write(
+            super::workspace_config_path(&dir),
+            r#"{"workspace_id":"stable-id","custom":{"value":42},"knowledgeEnabled":true}"#,
+        )
+        .unwrap();
+        let mut setup = super::inspect_workspace_setup(&dir).unwrap();
+        setup.knowledge_enabled = false;
+        setup.unity_test_tools_enabled = true;
+        super::save_workspace_setup(&dir, &setup).unwrap();
+        let config = super::read_json_object(&super::workspace_config_path(&dir)).unwrap();
+        assert_eq!(config["workspace_id"], "stable-id");
+        assert_eq!(config["custom"]["value"], 42);
+        assert_eq!(config["knowledge_enabled"], false);
+        assert_eq!(config["unity_test_tools_enabled"], false);
+        assert!(!config.contains_key("knowledgeEnabled"));
+    }
+
+    #[test]
+    fn workspace_setup_initialization_is_repeatable_and_retains_existing_knowledge() {
+        let fresh = tempfile::tempdir().unwrap();
+        let dir = fresh.path().to_string_lossy();
+        super::initialize_workspace_setup(&dir).unwrap();
+        assert!(!super::knowledge_enabled(&dir));
+        super::initialize_workspace_setup(&dir).unwrap();
+        assert!(!fresh.path().join("Locus/knowledge").exists());
+        let legacy = tempfile::tempdir().unwrap();
+        let dir = legacy.path().to_string_lossy();
+        fs::create_dir_all(legacy.path().join("Locus/knowledge")).unwrap();
+        super::initialize_workspace_setup(&dir).unwrap();
+        assert!(super::knowledge_enabled(&dir));
+        let mut setup = super::inspect_workspace_setup(&dir).unwrap();
+        setup.knowledge_enabled = false;
+        super::save_workspace_setup(&dir, &setup).unwrap();
+        super::initialize_workspace_setup(&dir).unwrap();
+        assert!(!super::knowledge_enabled(&dir));
+    }
+
+    #[test]
+    fn workspace_knowledge_storage_follows_project_type_and_migrates_once() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_string_lossy();
+        let target = crate::knowledge_index::library_dir_for_working_dir(&dir);
+        assert_eq!(target, root.path().join("Locus"));
+        let legacy = root.path().join("Library/Locus");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(
+            legacy.join("knowledge_config.json"),
+            r#"{"enabled":true,"lexicalSearchEnabled":true,"semanticSearchEnabled":false}"#,
+        )
+        .unwrap();
+        fs::write(legacy.join("memory_builtin_seed_version.txt"), "10").unwrap();
+        // The old index could still be open in another process; do not move it.
+        fs::write(legacy.join("knowledge_index.db"), "old-cache").unwrap();
+        crate::knowledge_index::migrate_legacy_non_unity_storage(&dir).unwrap();
+        assert!(crate::knowledge_index::load_general_config(&target).lexical_search_enabled);
+        assert_eq!(
+            fs::read_to_string(target.join("memory_builtin_seed_version.txt")).unwrap(),
+            "10"
+        );
+        assert!(!target.join("knowledge_index.db").exists());
+        assert!(legacy.join("knowledge_index.db").exists());
+        fs::write(target.join("knowledge_config.json"), "new-settings").unwrap();
+        crate::knowledge_index::migrate_legacy_non_unity_storage(&dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("knowledge_config.json")).unwrap(),
+            "new-settings"
+        );
+        fs::create_dir(root.path().join("Assets")).unwrap();
+        fs::create_dir(root.path().join("ProjectSettings")).unwrap();
+        assert_eq!(
+            crate::knowledge_index::library_dir_for_working_dir(&dir),
+            legacy
+        );
+    }
+
     fn write_project_settings(root: &tempfile::TempDir, body: &str) {
         let settings_dir = root.path().join("ProjectSettings");
         fs::create_dir_all(&settings_dir).unwrap();
         fs::write(settings_dir.join("ProjectSettings.asset"), body).unwrap();
+    }
+
+    #[test]
+    fn workspace_default_preserves_existing_settings_and_rejects_malformed_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy();
+        let path = super::workspace_config_path(&root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"workspace_id":"custom-project","knowledge_enabled":false,"custom":{"keep":true}}"#).unwrap();
+        assert_eq!(super::default_agent_id(&root), None);
+        super::set_default_agent_id(&root, "simple").unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["workspace_id"], "custom-project");
+        assert_eq!(saved["knowledge_enabled"], false);
+        assert_eq!(saved["custom"]["keep"], true);
+        assert_eq!(super::default_agent_id(&root).as_deref(), Some("simple"));
+        fs::write(&path, "invalid json").unwrap();
+        assert!(super::set_default_agent_id(&root, "unity").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "invalid json");
     }
 
     #[test]

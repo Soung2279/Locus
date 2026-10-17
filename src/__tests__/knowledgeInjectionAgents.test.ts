@@ -7,6 +7,7 @@ import KnowledgePreview from "../components/knowledge/KnowledgePreview.vue";
 import BaseDropdown from "../components/ui/BaseDropdown.vue";
 import type { AgentInfo, KnowledgeDocument, KnowledgeDocumentPatch } from "../types";
 import * as agentService from "../services/agent";
+import { t } from "../i18n";
 
 vi.mock("../services/agent", () => ({
   listAgents: vi.fn(), listSubagentDefs: vi.fn(),
@@ -17,6 +18,7 @@ vi.mock("../components/ui/BaseMarkdownEditor.vue", () => ({
 }));
 
 const unity = { id: "unity", name: "Unity" } as AgentInfo;
+const general = { id: "general", name: "General" } as AgentInfo;
 const reviewer = { id: "reviewer", name: "Reviewer" } as AgentInfo;
 const workspaceRef = { checkoutId: "checkout-a", expectedGeneration: 1 };
 let app: App | undefined;
@@ -26,9 +28,9 @@ async function flush() { await Promise.resolve(); await Promise.resolve(); await
 beforeEach(() => {
   vi.resetAllMocks();
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
-  vi.mocked(agentService.listAgents).mockResolvedValue([unity]);
+  vi.mocked(agentService.listAgents).mockResolvedValue([unity, general]);
   vi.mocked(agentService.listSubagentDefs).mockResolvedValue([unity, reviewer]);
-  vi.mocked(agentService.listWorkspaceAgents).mockResolvedValue([unity]);
+  vi.mocked(agentService.listWorkspaceAgents).mockResolvedValue([unity, general]);
   vi.mocked(agentService.listWorkspaceSubagentDefs).mockResolvedValue([unity, reviewer]);
   host = document.createElement("div");
   document.body.append(host);
@@ -48,14 +50,58 @@ it("defaults to Unity and saves each Agent selection including an empty list", a
   app.mount(host);
   await flush();
   expect(agentService.listWorkspaceAgents).toHaveBeenCalledWith(workspaceRef);
-  expect(document.querySelectorAll('[role="checkbox"]')).toHaveLength(2);
+  expect(document.querySelectorAll('[role="checkbox"]')).toHaveLength(4);
+  expect(checkbox(t("knowledge.meta.injectAgentsAll")).getAttribute("aria-checked")).toBe("false");
   expect(checkbox("Unity").getAttribute("aria-checked")).toBe("true");
+  expect(checkbox("General").getAttribute("aria-checked")).toBe("false");
   expect(checkbox("Reviewer").getAttribute("aria-checked")).toBe("false");
   checkbox("Reviewer").click(); await nextTick();
   expect(selected.value).toEqual(["unity", "reviewer"]);
   checkbox("Unity").click(); await nextTick();
   expect(selected.value).toEqual(["reviewer"]);
   checkbox("Reviewer").click(); await nextTick();
+  expect(selected.value).toEqual([]);
+});
+
+it("selects every Agent with the wildcard and expands it when cleared", async () => {
+  const selected = ref<string[]>(["*"]);
+  app = createApp({ render: () => h(KnowledgeInjectionAgents, {
+    modelValue: selected.value, workspaceRef,
+    "onUpdate:modelValue": (value) => { selected.value = value; },
+  }) });
+  app.mount(host);
+  await flush();
+  expect(checkbox(t("knowledge.meta.injectAgentsAll")).getAttribute("aria-checked")).toBe("true");
+  expect(checkbox("*")).toBeNull();
+  for (const name of ["Unity", "General", "Reviewer"]) {
+    expect(checkbox(name).getAttribute("aria-checked")).toBe("true");
+    expect(checkbox(name).disabled).toBe(true);
+  }
+  checkbox("Unity").click(); await nextTick();
+  expect(selected.value).toEqual(["*"]);
+  checkbox(t("knowledge.meta.injectAgentsAll")).click(); await nextTick();
+  expect(selected.value).toEqual(["unity", "general", "reviewer"]);
+  expect(checkbox("Unity").disabled).toBe(false);
+  checkbox("General").click(); await nextTick();
+  expect(selected.value).toEqual(["unity", "reviewer"]);
+  checkbox(t("knowledge.meta.injectAgentsAll")).click(); await nextTick();
+  expect(selected.value).toEqual(["*"]);
+});
+
+it("keeps partial wildcard patterns editable and marks the Agents they cover", async () => {
+  const selected = ref<string[]>(["rev*"]);
+  app = createApp({ render: () => h(KnowledgeInjectionAgents, {
+    modelValue: selected.value, workspaceRef,
+    "onUpdate:modelValue": (value) => { selected.value = value; },
+  }) });
+  app.mount(host);
+  await flush();
+  expect(checkbox(t("knowledge.meta.injectAgentsAll")).getAttribute("aria-checked")).toBe("false");
+  expect(checkbox("Reviewer").getAttribute("aria-checked")).toBe("true");
+  expect(checkbox("Reviewer").disabled).toBe(true);
+  expect(checkbox("Unity").getAttribute("aria-checked")).toBe("false");
+  expect(checkbox("rev*").getAttribute("aria-checked")).toBe("true");
+  checkbox("rev*").click(); await nextTick();
   expect(selected.value).toEqual([]);
 });
 
@@ -110,6 +156,7 @@ it("connects the document editor's Agent panel to metadata updates", async () =>
   host.querySelector<HTMLButtonElement>('.meta-dropdown .base-dropdown-trigger')!.click();
   await flush();
   expect(checkbox("Unity").getAttribute("aria-checked")).toBe("true");
+  expect(checkbox("General").getAttribute("aria-checked")).toBe("false");
   checkbox("Reviewer").click(); await nextTick();
   expect(update).toHaveBeenLastCalledWith({ injectAgents: ["unity", "reviewer"] });
   expect(current.value.body).toBe("Knowledge body");

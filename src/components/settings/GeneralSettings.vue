@@ -37,6 +37,7 @@ import {
   scheduleAppStorageMigration,
 } from "../../services/storage";
 import type {
+  AgentInfo,
   AppStorageInfo,
   AppTempInfo,
   GitRuntimeInfo,
@@ -51,11 +52,14 @@ import { toggleTauriDevtools } from "../../services/tauriRuntime";
 import { useNotificationStore } from "../../stores/notification";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import { useSessionUndoSettings } from "../../composables/useSessionUndoSettings";
+import { useDocumentEditingSettings } from "../../composables/useDocumentEditingSettings";
+import { useNewSessionSettings } from "../../composables/useNewSessionSettings";
 
-defineProps<{
+const props = withDefaults(defineProps<{
   locale: string;
   resetConfirm: boolean;
-}>();
+  agents?: AgentInfo[];
+}>(), { agents: () => [] });
 
 const emit = defineEmits<{
   setLocale: [locale: Locale];
@@ -66,6 +70,32 @@ const emit = defineEmits<{
 
 const notificationStore = useNotificationStore();
 const workspaceContextStore = useWorkspaceContextStore();
+const { state: documentEditingSettings, setPunctuationPairing } = useDocumentEditingSettings();
+const { state: newSessionSettings, setAgentMode, setDefaultAgentId } = useNewSessionSettings();
+// Agent ids never start with "@", so the two modes share the dropdown with pinned Agents.
+const REMEMBER_AGENT_OPTION = "@remember";
+const WORKSPACE_AGENT_OPTION = "@workspace";
+const defaultAgentOptions = computed(() => [
+  { value: REMEMBER_AGENT_OPTION, label: t("settings.general.defaultAgentRemember") },
+  { value: WORKSPACE_AGENT_OPTION, label: t("settings.general.defaultAgentAuto") },
+  ...props.agents.map((agent) => ({
+    value: agent.id,
+    label: t("settings.general.defaultAgentFixed", agent.name),
+  })),
+]);
+const defaultAgentValue = computed(() => {
+  if (newSessionSettings.agentMode === "fixed") return newSessionSettings.defaultAgentId;
+  return newSessionSettings.agentMode === "workspace" ? WORKSPACE_AGENT_OPTION : REMEMBER_AGENT_OPTION;
+});
+const defaultAgentLabel = computed(() => (
+  defaultAgentOptions.value.find((option) => option.value === defaultAgentValue.value)?.label
+    ?? t("settings.general.defaultAgentFixed", newSessionSettings.defaultAgentId)
+));
+function updateDefaultAgent(value: string) {
+  if (value === REMEMBER_AGENT_OPTION) setAgentMode("remember");
+  else if (value === WORKSPACE_AGENT_OPTION) setAgentMode("workspace");
+  else setDefaultAgentId(value);
+}
 const {
   state: sessionUndoSettings,
   load: loadSessionUndoSettings,
@@ -908,6 +938,33 @@ async function selectPythonRuntime(selectedId: string) {
       :options="languageOptions"
       @update:model-value="emit('setLocale', $event as Locale)"
     />
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.defaultAgent") }}</div>
+    <p class="section-desc">{{ t("settings.general.defaultAgentDesc") }}</p>
+    <BaseDropdown
+      :model-value="defaultAgentValue"
+      :options="defaultAgentOptions"
+      :selected-label="defaultAgentLabel"
+      :aria-label="t('settings.general.defaultAgent')"
+      menu-align="start"
+      teleport
+      @update:model-value="updateDefaultAgent"
+    />
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.punctuationPairing") }}</div>
+    <p class="section-desc">{{ t("settings.general.punctuationPairingDesc") }}</p>
+    <label class="debug-toggle">
+      <BaseSwitch
+        :model-value="documentEditingSettings.punctuationPairing"
+        :aria-label="t('settings.general.punctuationPairing')"
+        @update:model-value="setPunctuationPairing"
+      />
+      <span class="debug-toggle-label">{{ t(documentEditingSettings.punctuationPairing ? "common.enabled" : "common.disabled") }}</span>
+    </label>
   </div>
 
   <div class="settings-section">

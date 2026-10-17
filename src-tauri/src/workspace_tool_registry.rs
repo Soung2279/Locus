@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::agent::definition::AgentDefRegistry;
+use crate::agent::definition::{project_type_for_workspace, AgentDefRegistry};
 use crate::tool::ToolRegistry;
-use crate::workspace_service::WorkspaceRuntime;
+use crate::workspace_service::{ServiceKind, WorkspaceRuntime};
 
 type ToolOverlayLoader =
     dyn Fn(&mut ToolRegistry, &Path) -> Result<(), String> + Send + Sync + 'static;
@@ -41,7 +41,14 @@ impl WorkspaceToolRegistry {
         let root = runtime.root().to_path_buf();
         let mut registry = self.app_base.as_ref().clone();
         let loader = Arc::clone(&self.overlay_loader);
-        let subagents = agent_definitions.list_subagent_descriptions();
+        let project_type = project_type_for_workspace(
+            runtime
+                .services()
+                .detected_kinds()
+                .contains(&ServiceKind::Unity),
+        );
+        let subagents =
+            agent_definitions.list_subagent_descriptions_for_project_type(Some(project_type));
 
         let registry = tokio::task::spawn_blocking(move || {
             loader(&mut registry, &root)?;

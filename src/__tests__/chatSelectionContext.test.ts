@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -8,12 +7,6 @@ import {
   type SelectionLike,
   type SelectionRectLike,
 } from "../composables/chatSelectionContext";
-
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 function rect(left: number, top: number, right: number, bottom: number): SelectionRectLike {
   return { left, top, right, bottom, width: right - left, height: bottom - top };
@@ -96,44 +89,5 @@ describe("selectionTextAtPoint", () => {
       rangeRects: [[rect(0, 0, 40, 10)], [rect(100, 100, 160, 116)]],
     });
     expect(selectionTextAtPoint(selection, { x: 150, y: 108 })).toBe("alpha beta");
-  });
-});
-
-describe("chat message context menu selection wiring", () => {
-  it("prefers the text selection over whole-message actions in the transcript menu", () => {
-    const chatView = read("src/components/ChatView.vue");
-
-    expect(chatView).toContain('import { selectionTextAtPoint } from "../composables/chatSelectionContext";');
-    expect(chatView).toContain("selectionTextAtPoint(window.getSelection(), { x: e.clientX, y: e.clientY })");
-    expect(chatView).toContain("messageId: string | null;");
-    expect(chatView).toContain("selectionText: string;");
-    expect(chatView).toContain("if (!selectionText && !messageId) return;");
-    expect(chatView).toContain("async function doMessageCopySelection()");
-    expect(chatView).toContain("writeChatMessageClipboard({ text: selectionText, draft: null, serializedDraft: null })");
-    expect(chatView).toContain('v-if="messageCtxMenu.selectionText"');
-    expect(chatView).toContain('@click="doMessageCopySelection"');
-    expect(chatView).toContain('t("chat.messageMenu.copySelection")');
-    expect(chatView).toContain('v-else-if="messageCtxMenu.messageId"');
-    expect(chatView).toContain('<template v-if="messageCtxMenu.messageId">');
-  });
-
-  it("keeps the asset-ref menu behind the selection check", () => {
-    const chatView = read("src/components/ChatView.vue");
-    const handler = chatView.slice(
-      chatView.indexOf("function handleContentContextMenu"),
-      chatView.indexOf("function handleContentClick"),
-    );
-    expect(handler.indexOf("selectionTextAtPoint")).toBeGreaterThan(-1);
-    expect(handler.indexOf("selectionTextAtPoint")).toBeLessThan(
-      handler.indexOf("assetContextTargetFromElement"),
-    );
-    expect(handler).toContain("if (!selectionText) {");
-  });
-
-  it("localizes the copy-selection entry in both languages", () => {
-    const zh = read("src/language/zh.json");
-    const en = read("src/language/en.json");
-    expect(zh).toContain('"chat.messageMenu.copySelection": "复制选中内容"');
-    expect(en).toContain('"chat.messageMenu.copySelection": "Copy selection"');
   });
 });

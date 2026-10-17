@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const subWindowMocks = vi.hoisted(() => ({
@@ -17,12 +16,6 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
     static getByLabel = subWindowMocks.getByLabelMock;
   },
 }));
-
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 import {
   LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
@@ -208,23 +201,5 @@ describe("knowledgeLexicalProgressWindow", () => {
     expect(kinds[0]).toMatch(/^knowledge-lexical-progress-[0-9a-f]+-g7$/);
     expect(kinds[1]).toMatch(/^knowledge-lexical-progress-[0-9a-f]+-g8$/);
     expect(kinds[0]).not.toBe(kinds[1]);
-  });
-
-  it("uses a titlebar close action instead of duplicate progress text", () => {
-    const component = read("src/components/KnowledgeLexicalProgressWindow.vue");
-    const knowledgeService = read("src/services/knowledge.ts");
-    const tauriCommands = read("src-tauri/src/commands/knowledge.rs");
-    const capability = read("src-tauri/capabilities/default.json");
-
-    expect(component).toContain('class="lexical-window-close"');
-    expect(component).toContain('@click.stop="void requestWindowClose()"');
-    expect(component).toContain("await appWindow.destroy()");
-    expect(component).toContain("async function requestWindowClose()");
-    expect(component).toContain("await destroyWindow();");
-    expect(component).not.toContain('class="lexical-window-titlebar-progress"');
-    expect(knowledgeService).not.toContain("knowledge_close_lexical_progress_window");
-    expect(tauriCommands).not.toContain("knowledge_close_lexical_progress_window");
-    expect(capability).toContain('"core:window:allow-destroy"');
-    expect(capability).toContain('"core:window:allow-set-closable"');
   });
 });

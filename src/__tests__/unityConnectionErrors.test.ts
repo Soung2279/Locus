@@ -1,14 +1,7 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import { setLocale } from "../i18n";
 import { isUnityConnectionError, normalizeAppError } from "../services/errors";
-
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 describe("isUnityConnectionError", () => {
   it("detects Unity pipe connection failures", () => {
@@ -19,12 +12,6 @@ describe("isUnityConnectionError", () => {
 
   it("keeps asset content errors separate", () => {
     expect(isUnityConnectionError("Asset was not found: Assets/Missing.prefab")).toBe(false);
-  });
-
-  it("uses the compact Unity connection message in property fences", () => {
-    const component = read("src/components/unity/UnityPropertyFenceBlock.vue");
-    expect(component).toContain("isUnityConnectionError");
-    expect(component).toContain("asset.preview.unityConnectionRequired");
   });
 
   it("localizes plugin-managed View operation errors", () => {

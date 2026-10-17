@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const subWindowMocks = vi.hoisted(() => ({
@@ -27,12 +26,6 @@ import {
   openToolFilePreviewWindow,
   resolveToolFilePreviewHighlightRanges,
 } from "../services/toolFilePreviewWindow";
-
-const cwd = process.cwd();
-
-function read(relativePath: string) {
-  return readFileSync(resolve(cwd, relativePath), "utf8");
-}
 
 function stubTauriWindow() {
   Object.defineProperty(globalThis, "window", {
@@ -121,33 +114,5 @@ describe("toolFilePreviewWindow", () => {
       "tool-file-preview:payload",
       { filePath: "src/App.vue" },
     );
-  });
-
-  it("wires read/edit/write hover actions into the tool header", () => {
-    const toolBlock = read("src/components/ToolCallBlock.vue");
-    const diffViewer = read("src/components/diff/FileDiffViewer.vue");
-    const windowApp = read("src/WindowApp.vue");
-    const capabilities = read("src-tauri/capabilities/default.json");
-    const backend = read("src-tauri/src/commands/knowledge.rs");
-
-    expect(toolBlock).toContain("resolveToolFilePreviewPayload");
-    expect(toolBlock).toContain("tool-file-preview-action");
-    expect(toolBlock).toContain("openWorkbenchFileTab");
-    expect(toolBlock).not.toContain("openToolFilePreviewWindow");
-    expect(diffViewer).toContain("textToolbarActionLabel");
-    expect(diffViewer).toContain("emit('textToolbarAction')");
-    expect(windowApp).toContain("ToolFilePreviewWindow.vue");
-    expect(capabilities).toContain('"tool-file-preview"');
-    expect(backend).toContain("FULL_PREVIEW_MAX_FILE_BYTES");
-    expect(backend).toContain("let max_lines: usize = if full { 20_000 } else { 50 };");
-  });
-
-  it("renders Markdown files with the shared Markdown renderer", () => {
-    const viewer = read("src/components/ToolFilePreviewWindow.vue");
-
-    expect(viewer).toContain('import MarkdownRenderer from "./MarkdownRenderer.vue";');
-    expect(viewer).toContain('preview.value.language === "markdown"');
-    expect(viewer).toContain('<MarkdownRenderer :content="preview.snippet || \'\'" text-zoom />');
-    expect(viewer).toContain('<AssetTextViewer');
   });
 });

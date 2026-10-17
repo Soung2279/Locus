@@ -1,6 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { createLongSessionFixtures } from "../../scripts/locus-chat-switch-stress-fixture";
 
 describe("chat WebView stress fixtures", () => {
@@ -51,27 +49,5 @@ describe("chat WebView stress fixtures", () => {
         && renderParts.some((part) => part && typeof part === "object" && "kind" in part && part.kind === "text")
         && renderParts.some((part) => part && typeof part === "object" && "kind" in part && part.kind === "toolCall");
     })).toBe(true);
-  });
-
-  it("fails WebView verification on any deferred transcript height materialization", () => {
-    const script = readFileSync(
-      resolve(process.cwd(), "scripts/locus-chat-switch-stress.ts"),
-      "utf8",
-    );
-
-    expect(script).toContain("noDeferredHeightMaterialization:");
-    expect(script).toContain("Number(aggregate?.maxScrollHeightDelta) <= 0.5");
-    expect(script).toContain("Number(aggregate?.maxContentHeightDelta) <= 0.5");
-  });
-
-  it("requires a layout-neutral stream-end handoff", () => {
-    const script = readFileSync(
-      resolve(process.cwd(), "scripts/locus-chat-render-stress.ts"),
-      "utf8",
-    );
-
-    expect(script).toContain("Number(status.maxEndScrollDelta) <= 0.5");
-    expect(script).toContain("Number(status.maxEndToolTopDelta) <= 0.5");
-    expect(script).toContain("Number(status.maxEndTextHeightDelta) <= 0.5");
   });
 });

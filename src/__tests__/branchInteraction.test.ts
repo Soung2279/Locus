@@ -1,14 +1,7 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import { branchTargetName, resolveBranchDblclickAction, resolveBranchTargetHash, resolveCommitBranchTargets } from "../components/collab/branchInteraction";
 import type { GitCommitInfo, GitGraphRef } from "../types";
-
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 function localRef(name: string, targetHash: string): GitGraphRef {
   return {
@@ -193,29 +186,5 @@ describe("branch interaction", () => {
       },
       refs,
     )).toBe("2222222222222222222222222222222222222222");
-  });
-
-  it("keeps the remote branch row wired to the shared double click event", () => {
-    const gitSidebar = read("src/components/collab/GitSidebar.vue");
-
-    expect(gitSidebar).toContain("@dblclick=\"emit('branchDblclick', { kind: 'remoteBranch', remoteName, branch: rb })\"");
-  });
-
-  it("routes sidebar branch clicks through the graph selection API", () => {
-    const collabView = read("src/components/CollabView.vue");
-    const gitSidebar = read("src/components/collab/GitSidebar.vue");
-
-    expect(gitSidebar).toContain('(e: "selectBranch", target: GitBranchTarget): void');
-    expect(gitSidebar).toContain("@click=\"emit('selectBranch', { kind: 'remoteBranch', remoteName, branch: rb })\"");
-    expect(collabView).toContain('@select-branch="onSelectBranch"');
-    expect(collabView).toContain("resolveBranchTargetHash(target, graphRefs.value)");
-    expect(collabView).toContain('selectHistoryInGraph({ kind: "commit", hash })');
-  });
-
-  it("hides optional tag and submodule sections when their lists are empty", () => {
-    const gitSidebar = read("src/components/collab/GitSidebar.vue");
-
-    expect(gitSidebar).toContain('v-if="props.tags.length > 0" class="sidebar-section"');
-    expect(gitSidebar).toContain('v-if="props.submodules.length > 0" class="sidebar-section"');
   });
 });

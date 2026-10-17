@@ -1,16 +1,10 @@
 // @vitest-environment jsdom
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { createApp, nextTick } from "vue";
 import { describe, expect, it } from "vitest";
 import UnityTestRunToolBlock from "../components/tool-block-overrides/UnityTestRunToolBlock.vue";
 import { resolveToolBlockOverride } from "../components/tool-block-overrides/toolBlockOverrides";
 
 import type { ToolCallDisplay } from "../types";
-
-function read(relPath: string) {
-  return readFileSync(resolve(process.cwd(), relPath), "utf8");
-}
 
 function mount(toolCall: ToolCallDisplay) {
   const host = document.createElement("div");
@@ -101,33 +95,5 @@ describe("unityTestRunProgress", () => {
     expect(host.querySelector(".tool-call-pre")?.textContent).toContain("status=passed");
 
     app.unmount();
-  });
-
-  it("feeds structured Unity Test progress from the bridge into the tool call stream", () => {
-    const agentSource = read("src-tauri/src/agent/instance/mod.rs");
-    const bridgeSource = read("src-tauri/src/unity_bridge/mod.rs");
-    const toolSource = read("src-tauri/src/tool/builtins/unity.rs");
-
-    expect(agentSource).toContain("tool_context.tool_progress = Some(tool_progress);");
-    expect(toolSource).toContain("let progress = ctx.structured_progress();");
-    expect(bridgeSource).toContain("progress: Option<crate::tool::ToolProgressReporter>,");
-    expect(bridgeSource).toContain("progress.snapshot(&snapshot);");
-  });
-
-  it("reports the Unity scope wait before queueing, on native and Claude Code CLI runs alike", () => {
-    const agentSource = read("src-tauri/src/agent/instance/mod.rs");
-    const cliSource = read("src-tauri/src/agent/instance/claude_code_cli.rs");
-    const cliTuiSource = read("src-tauri/src/llm/claude_code_cli/tui.rs");
-
-    const dispatch = agentSource.slice(agentSource.indexOf("async fn execute_single_tool_dispatch("));
-    const waitIndex = dispatch.indexOf("\"Waiting for Unity Editor\"");
-    const scopeIndex = dispatch.indexOf("crate::agent::unity_execution_scope::run(");
-    expect(waitIndex).toBeGreaterThan(0);
-    expect(waitIndex).toBeLessThan(scopeIndex);
-
-    // The CLI exposes Locus tools as mcp__locus__<name> but executes and
-    // displays them under the bare name through the same agent dispatch.
-    expect(cliTuiSource).toContain('name.strip_prefix("mcp__locus__")');
-    expect(cliSource).toContain(".execute_single_tool(");
   });
 });

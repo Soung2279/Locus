@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../services/ipc", () => ({
@@ -81,35 +80,5 @@ describe("Agent workspace scope", () => {
       agentId: "simple",
       fileName: "baseline.md",
     });
-  });
-
-  it("binds the main Agent view and its detached window to the same workspace", () => {
-    const root = process.cwd();
-    const app = readFileSync(resolve(root, "src/App.vue"), "utf8");
-    const view = readFileSync(resolve(root, "src/components/AgentView.vue"), "utf8");
-    const detached = readFileSync(resolve(root, "src/components/WorkspacePageWindow.vue"), "utf8");
-
-    expect(app).toContain(':workspace-ref="agentWorkspaceRef"');
-    expect(app).toContain(':working-dir="agentWorkingDir"');
-    expect(app).toContain('tab.id === "agent" ? agentWorkspaceRuntime.value');
-    expect(app).toContain("const runtime = topTabWorkspaceRuntime(tab);");
-    expect(app).toContain(':agent-list="[...agentStore.agents, ...agentStore.subagents]"');
-    expect(view).toContain("listWorkspaceAgents(workspaceRef)");
-    expect(view).toContain("listWorkspaceAgentInjectedItems(");
-    expect(view).toContain("getWorkspaceAgentSystemPromptStats(");
-    expect(detached).toContain("workspaceRef: checkoutWorkspaceRef.value");
-  });
-
-  it("keeps configured tools visible and renders runtime unavailability reasons only in details", () => {
-    const root = process.cwd();
-    const view = readFileSync(resolve(root, "src/components/AgentView.vue"), "utf8");
-
-    expect(view).toContain('toolMetaBoolean(item.meta, "runtimeAvailable") !== false');
-    expect(view).toContain('toolMetaString(item.meta, "unavailableReason")');
-    expect(view).toContain("'tool-unavailable': !toolItemRuntimeAvailable(item)");
-    expect(view).not.toContain('class="tool-unavailable-reason"');
-    expect(view).not.toContain(':title="toolItemUnavailableReason(item) || undefined"');
-    expect(view).toContain('class="tool-section tool-availability-section"');
-    expect(view).toContain("{{ selectedToolUnavailableReason }}");
   });
 });

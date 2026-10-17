@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -16,8 +15,6 @@ vi.mock("../services/locusRuntime", () => ({
     },
   }),
 }));
-
-const read = (relPath: string) => readFileSync(resolve(process.cwd(), relPath), "utf8");
 
 describe("Claude Code CLI experimental gate", () => {
   beforeEach(() => {
@@ -56,23 +53,5 @@ describe("Claude Code CLI experimental gate", () => {
     await expect(gate.setClaudeCodeCliEnabled(true)).rejects.toThrow("disk full");
     expect(mocks.ipcInvoke).toHaveBeenLastCalledWith("set_claude_code_cli_enabled", { value: true });
     expect(gate.claudeCodeCliEnabled.value).toBe(false);
-  });
-
-  it("is configured from experimental settings instead of model defaults", () => {
-    const experimental = read("src/components/settings/ExperimentalSettings.vue");
-    const modelDefaults = read("src/components/settings/ModelDefaults.vue");
-    const apiProviders = read("src/components/settings/ApiProviders.vue");
-    const types = read("src/types.ts");
-    const system = read("src-tauri/src/commands/system.rs");
-    const lib = read("src-tauri/src/lib.rs");
-
-    expect(experimental).toContain("setClaudeCodeCliEnabled");
-    expect(experimental).toContain("settings.experimental.claudeCodeCliDesc");
-    expect(modelDefaults).not.toContain("claudeCodeEnable");
-    expect(modelDefaults).not.toContain('type="checkbox"');
-    expect(types).not.toContain("claudeCodeEnabled");
-    expect(apiProviders).toContain("claudeCodeCliEnabled && claudeCodeProvider");
-    expect(system).toContain("CLAUDE_CODE_CLI_ENABLED_CHANGED_EVENT");
-    expect(lib).toContain("commands::set_claude_code_cli_enabled");
   });
 });

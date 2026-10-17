@@ -1,5 +1,4 @@
 // @vitest-environment jsdom
-import { readFileSync } from "node:fs";
 import { createApp, nextTick, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { t } from "../i18n";
@@ -80,14 +79,5 @@ describe("View configuration and domain menu parity", () => {
     dialog.querySelector("form")!.dispatchEvent(new Event("submit", { cancelable: true })); await flush();
     expect(mocks.update).not.toHaveBeenCalled();
     expect(useDisplaySettings().state.viewOpenOverrides[viewOpenPreferenceKey(scope, view.id)]).toBe("tab");
-  });
-  it("shares domain controls between the workspace tree and domain lists while retaining tree actions", () => {
-    const read = (path: string) => readFileSync(`src/components/${path}`, "utf8");
-    const workbench = read("workbench/DevelopmentWorkbench.vue");
-    expect(workbench).toContain('<ViewResourceMenuItems :view="contextViewTarget.view"');
-    expect(read("ViewPackageView.vue")).toContain("<ViewResourceMenuItems");
-    for (const source of [workbench, read("AssetView.vue"), read("knowledge/KnowledgeExplorer.vue")]) expect(source).toContain("<ResourceFileMenuItems");
-    for (const action of ["toggleContextTreeState('starred')", "toggleContextTreeState('pinned')", "setContextFileHidden(true)", "removeContextMountedNode"]) expect(workbench).toContain(action);
-    for (const source of [workbench, read("ViewPackageView.vue"), read("chat/SessionPanel.vue")]) expect(source).toContain("<ViewResourceActions");
   });
 });

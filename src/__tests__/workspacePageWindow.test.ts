@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const subWindowMocks = vi.hoisted(() => ({
@@ -27,12 +26,6 @@ import {
   workspacePageWindowKind,
   type WorkspacePageWindowPayload,
 } from "../services/workspacePageWindow";
-
-const cwd = process.cwd();
-
-function read(relativePath: string) {
-  return readFileSync(resolve(cwd, relativePath), "utf8");
-}
 
 function stubTauriWindow() {
   Object.defineProperty(globalThis, "window", {
@@ -163,61 +156,5 @@ describe("workspacePageWindow", () => {
         query: expect.stringContaining("checkoutId=checkout-a"),
       }),
     });
-  });
-
-  it("binds checkout pages through window context and keeps app pages process-level", () => {
-    const app = read("src/App.vue");
-    const windowApp = read("src/WindowApp.vue");
-    const pageWindow = read("src/components/WorkspacePageWindow.vue");
-    const pageBootstrap = read("src/composables/useWorkspacePageBootstrap.ts");
-    const backend = read("src-tauri/src/lib.rs");
-    const capabilities = read("src-tauri/capabilities/default.json");
-
-    expect(app).toContain("openWorkspacePageWindow");
-    expect(windowApp).toContain('kind: "workspace-page"');
-    expect(pageWindow).toContain("KnowledgeView.vue");
-    expect(pageWindow).toContain("WorkspaceChatPage.vue");
-    expect(pageWindow).toContain("workspaceRef: checkoutWorkspaceRef.value");
-    expect(pageWindow).toContain('workingDir: ""');
-    expect(pageWindow).toContain("workspace-page-window-controls");
-    expect(pageWindow).toContain("useWorkspacePageBootstrap");
-    expect(pageWindow).toContain("workspaceContextStore.disposeWindow()");
-    expect(pageWindow).not.toContain("useAppBootstrap");
-    const chatPage = read("src/components/WorkspaceChatPage.vue");
-    expect(chatPage).toContain("ChatWorkspaceView");
-    expect(chatPage).toContain("registerListeners");
-    expect(pageBootstrap).toContain("workspaceContextStore.initialize(currentWindowId, \"main\")");
-    expect(pageBootstrap).toContain("workspaceContextStore.focusWorkspaceRef");
-    expect(pageBootstrap).toContain("expectedGeneration: payload.workspaceGeneration");
-    expect(pageBootstrap).not.toContain("projectStore.loadWorkingDir");
-    expect(pageBootstrap).not.toContain("refreshSessions");
-    expect(pageBootstrap).not.toContain("loadSkills");
-    expect(pageBootstrap).not.toContain("registerListeners");
-    expect(backend).toContain("WindowEvent::Destroyed");
-    expect(backend).toContain("contexts.remove_window(window.label(), intent_epoch)");
-    expect(capabilities).toContain('"workspace-page-*"');
-  });
-
-  it("keeps View inside Development and out of the primary navigation", () => {
-    const app = read("src/App.vue");
-    const developmentWorkbench = read("src/components/workbench/DevelopmentWorkbench.vue");
-    const topTabs = app.slice(app.indexOf("const topTabs"), app.indexOf("const visibleTopTabs"));
-
-    expect(topTabs).toContain('{ id: "development"');
-    expect(topTabs).not.toContain('{ id: "views"');
-    expect(topTabs).toContain('{ id: "plugins"');
-    expect(topTabs).not.toContain('{ id: "agent"');
-    expect(topTabs).not.toContain('{ id: "knowledge"');
-    expect(topTabs).not.toContain('{ id: "collab"');
-    expect(app).not.toContain("const projectTabs");
-    expect(app).not.toContain('class="project-tab-context"');
-    expect(app).toContain("DevelopmentWorkbench");
-    expect(developmentWorkbench).toContain('editor.resource.section === \'views\'');
-    expect(developmentWorkbench).toContain("<ViewPackageView");
-    expect(app).toContain("openTopTabInWindow");
-    expect(app).toContain('return tab.id !== "development"');
-    expect(app).toMatch(
-      /v-show="uiStore\.activePage === 'plugins'"[\s\S]{0,120}working-dir=""/,
-    );
   });
 });

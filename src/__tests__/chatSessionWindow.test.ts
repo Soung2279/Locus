@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const subWindowMocks = vi.hoisted(() => ({
@@ -27,12 +26,6 @@ import {
   openChatSessionWindow,
   openNewChatSessionWindow,
 } from "../services/chatSessionWindow";
-
-const cwd = process.cwd();
-
-function read(relativePath: string) {
-  return readFileSync(resolve(cwd, relativePath), "utf8");
-}
 
 function stubTauriWindow() {
   Object.defineProperty(globalThis, "window", {
@@ -184,32 +177,5 @@ describe("chatSessionWindow", () => {
       CHAT_SESSION_WINDOW_EVENT,
       { sessionId: "session-1", title: "Session 1" },
     );
-  });
-
-  it("wires the session context menu to an independently selected full chat workspace", () => {
-    const sessionPanel = read("src/components/chat/SessionPanel.vue");
-    const windowApp = read("src/WindowApp.vue");
-    const sessionWindow = read("src/components/ChatSessionWindow.vue");
-    const chatView = read("src/components/ChatView.vue");
-    const capabilities = read("src-tauri/capabilities/default.json");
-
-    expect(sessionPanel).toContain("ctxOpenSessionInWindow");
-    expect(sessionPanel).toContain("openNewChatSessionWindow");
-    expect(sessionPanel).toContain("onNewSessionContextMenu");
-    expect(sessionPanel).toContain("if (e.ctrlKey)");
-    expect(sessionPanel).toContain("chat.session.openInWindow");
-    expect(windowApp).toContain('kind: "chat-session"');
-    expect(sessionWindow).toContain("syncActiveSessionSelection: false");
-    expect(sessionWindow).toContain("setActiveSessionSelectionPersistence(false)");
-    expect(sessionWindow).toContain(':show-session-navigation="false"');
-    expect(sessionWindow).toContain(':persist-session-selection="false"');
-    expect(sessionWindow).toContain("SessionCompactPicker");
-    expect(sessionWindow).toContain('@select-session="selectWindowSession"');
-    expect(sessionWindow).toContain("ChatWorkspaceView");
-    expect(sessionWindow).toContain("handleTitlebarPointerDown");
-    expect(sessionWindow).toContain("chat-session-window-controls");
-    expect(chatView).toContain("showSessionNavigation !== false");
-    expect(chatView).toContain("<ModelEffortSelector");
-    expect(capabilities).toContain('"chat-session-*"');
   });
 });

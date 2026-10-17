@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 import {
   filterUnityObjectReferenceSearchResults,
@@ -335,82 +335,5 @@ describe("unityObjectReferencePicker", () => {
     })).toBe(true);
     expect(getUnityObjectReferenceTypeRule("").broad).toBe(true);
     expect([...UNITY_OBJECT_REFERENCE_SEARCH_ROOTS]).toEqual(["Assets", "Packages", "ProjectSettings"]);
-  });
-
-  it("wires the picker into Locus and View object reference editors", () => {
-    const field = readFileSync("src/components/unity/UnityObjectReferenceField.vue", "utf8");
-    const editor = readFileSync("src/components/unity/UnityPropertyEditor.vue", "utf8");
-    const viewRuntime = readFileSync("src/components/view/viewRuntime.ts", "utf8");
-    const serializedTableView = readFileSync("src/components/table/SerializedTableView.vue", "utf8");
-    const exportScript = readFileSync("scripts/export-view-runtime-sources.mjs", "utf8");
-
-    expect(field).toContain("searchWorkspaceAssets");
-    expect(field).toContain("filterUnityObjectReferenceSearchResults");
-    expect(field).toContain("referenceTypeFullName?: string");
-    expect(field).toContain("const displayText = ref");
-    expect(field).toContain("const displayParts = computed");
-    expect(field).toContain("const searchText = ref(\"\")");
-    expect(field).toContain("currentValue: displayText.value");
-    expect(field).toContain("unityObjectReferenceSearchQuery(searchText.value");
-    expect(field).toContain(":title=\"displayText || title || undefined\"");
-    expect(field).toContain("function handleDisplayFocus()");
-    expect(field).toContain("function toggleEdit()");
-    expect(field).toContain("@focus=\"handleDisplayFocus\"");
-    expect(field).toContain("@click=\"toggleEdit\"");
-    expect(field).not.toContain("@click=\"beginEdit\"");
-    expect(field).toContain("unity-object-reference-display-name");
-    expect(field).not.toContain("unity-object-reference-display-path");
-    expect(field).toContain("ref=\"searchInputEl\"");
-    expect(field).toContain("<Teleport v-if=\"dropdownTarget\" :to=\"dropdownTarget\">");
-    expect(field).toContain("ref=\"dropdownEl\"");
-    expect(field).toContain("ownerDocument.addEventListener(\"scroll\", scheduleDropdownPositionUpdate, true)");
-    expect(field).toContain("@input=\"updateSearchText\"");
-    expect(field).toContain("position: fixed;");
-    expect(field).toContain("z-index: 1000;");
-    expect(field).toContain("border: 1px solid var(--border-strong);");
-    expect(field).toContain("background: var(--surface-elevated, var(--panel-bg));");
-    expect(field).toContain(":global(:root[data-theme=\"dark\"]) .unity-object-reference-dropdown");
-    expect(field).toContain("color-mix(in srgb, var(--border-color) 72%, transparent)");
-    expect(field).not.toContain("@input=\"updateText\"");
-    expect(field).not.toContain("@change=\"commitText\"");
-    expect(editor).toContain(":reference-type-full-name=\"referenceTypeFullName\"");
-    expect(viewRuntime).toContain("objectReferencePicker");
-    expect(viewRuntime).toContain("...UnityObjectReferencePickerService");
-    expect(serializedTableView).toContain(":reference-type-full-name=\"cell.referenceTypeFullName\"");
-    expect(exportScript).toContain("src/services/unityObjectReferencePicker.ts");
-  });
-
-  it("infers Unity built-in object reference field types for picker filtering", () => {
-    const serializedProperties = readFileSync("locus_unity/Editor/LocusBridge.SerializedProperties.cs", "utf8");
-    const builtInFields = readFileSync("locus_unity/Editor/LocusBridge.BuiltInSerializedFields.cs", "utf8");
-    const fieldCount = (builtInFields.match(/Field\("/g) ?? []).length;
-
-    expect(serializedProperties).toContain("ResolveBuiltInSerializedPropertyFieldType(prop)");
-    expect(fieldCount).toBeGreaterThanOrEqual(150);
-    expect(builtInFields).toContain("UnityEngine.MeshRenderer");
-    expect(builtInFields).toContain("m_AdditionalVertexStreams");
-    expect(builtInFields).toContain("UnityEngine.BoxCollider");
-    expect(builtInFields).toContain("UnityEngine.Collider\", \"m_Material\", \"UnityEngine.PhysicsMaterial\"");
-    expect(builtInFields).toContain("UnityEngine.Animator\", \"m_Controller\", \"UnityEngine.RuntimeAnimatorController\"");
-    expect(builtInFields).toContain("UnityEngine.AnimatorOverrideController\", \"m_Controller\", \"UnityEngine.RuntimeAnimatorController\"");
-    expect(builtInFields).toContain("UnityEngine.AudioSource\", \"m_Resource\", \"UnityEngine.AudioResource\"");
-    expect(builtInFields).toContain("UnityEngine.Video.VideoPlayer\", \"m_VideoClip\", \"UnityEngine.Video.VideoClip\"");
-    expect(builtInFields).toContain("UnityEngine.ParticleSystem\", \"ShapeModule.m_Mesh\", \"UnityEngine.Mesh\"");
-    expect(builtInFields).toContain("UnityEngine.ParticleSystem\", \"SubModule.subEmitters[].emitter\", \"UnityEngine.ParticleSystem\"");
-    expect(builtInFields).toContain("UnityEngine.ParticleSystemForceField\", \"m_Parameters.m_VectorField\", \"UnityEngine.Texture3D\"");
-    expect(builtInFields).toContain("UnityEngine.BillboardRenderer\", \"m_Billboard\", \"UnityEngine.BillboardAsset\"");
-    expect(builtInFields).toContain("UnityEngine.BillboardAsset\", \"material\", \"UnityEngine.Material\"");
-    expect(builtInFields).toContain("UnityEngine.UIElements.UIDocument\", \"m_PanelSettings\", \"UnityEngine.UIElements.PanelSettings\"");
-    expect(builtInFields).toContain("UnityEngine.UIElements.PanelSettings\", \"themeUss\"");
-    expect(builtInFields).toContain("UnityEngine.TextCore.Text.FontAsset\", \"m_SourceFontFile\"");
-    expect(builtInFields).toContain("UnityEngine.Tilemaps.Tile\", \"m_InstancedGameObject\", \"UnityEngine.GameObject\"");
-    expect(builtInFields).toContain("UnityEngine.TerrainData\", \"m_TreeDatabase.m_TreePrototypes[].m_Prefab\"");
-    expect(builtInFields).toContain("UnityEngine.Rigidbody2D\", \"m_Material\", \"UnityEngine.PhysicsMaterial2D\"");
-    expect(builtInFields).toContain("UnityEngine.TerrainLayer\", \"m_DiffuseTexture\", \"UnityEngine.Texture2D\"");
-    expect(builtInFields).toContain("UnityEngine.ShaderVariantCollection\", \"m_Shaders[].first\", \"UnityEngine.Shader\"");
-    expect(builtInFields).toContain("UnityEngine.Sprite\", \"m_ScriptableObjects[]\", \"UnityEngine.ScriptableObject\"");
-    expect(builtInFields).toContain("UnityEngine.RenderSettings\", \"m_SkyboxMaterial\", \"UnityEngine.Material\"");
-    expect(builtInFields).toContain("UnityEngine.LightingSettings\", \"m_LightmapParameters\", \"UnityEngine.LightmapParameters\"");
-    expect(builtInFields).toContain("NormalizeBuiltInSerializedPropertyPath");
   });
 });

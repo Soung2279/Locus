@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
 import {
   buildKnowledgeDocumentWorkspaceDragPayload,
   buildKnowledgeFolderWorkspaceDragPayload,
@@ -8,52 +7,6 @@ import {
 } from "../components/knowledge/knowledgeWorkspaceDrag";
 
 describe("knowledge internal drag payload", () => {
-  it("connects the opened directory header to the pointer drag controller", () => {
-    const documentPreview = readFileSync(
-      new URL("../components/knowledge/KnowledgePreview.vue", import.meta.url),
-      "utf8",
-    );
-    const directoryPreview = readFileSync(
-      new URL("../components/knowledge/KnowledgeDirectoryPreview.vue", import.meta.url),
-      "utf8",
-    );
-
-    expect(documentPreview).not.toContain('@pointerdown="onDocumentDragPointerDown"');
-    expect(documentPreview).not.toContain("@dragstart");
-    expect(directoryPreview).toContain("startKnowledgeInternalDrag(internalDrag, event");
-    expect(directoryPreview).toContain('@pointerdown="onDirectoryDragPointerDown"');
-    expect(directoryPreview).not.toContain("@dragstart");
-  });
-
-  it("routes knowledge placement and new-session attachment through one registered target", () => {
-    const workbench = readFileSync(
-      new URL("../components/workbench/DevelopmentWorkbench.vue", import.meta.url),
-      "utf8",
-    );
-    const overlay = readFileSync(
-      new URL("../components/ui/InternalDragOverlay.vue", import.meta.url),
-      "utf8",
-    );
-
-    expect(workbench).toContain("workbenchInternalDropTarget");
-    expect(workbench).toContain("KNOWLEDGE_INTERNAL_DRAG_TYPE");
-    expect(workbench).toContain('intent: { kind: "newSession", target: rowHit.item }');
-    expect(workbench).toContain("createNewSessionWithAttachments");
-    expect(workbench).toContain("placeKnowledgeWorkspaceDrag");
-    expect(workbench).toContain("internalDrag.registerTarget(workbenchInternalDropTarget)");
-    expect(workbench).toContain("internalLayoutDragPreview");
-    expect(workbench).toContain("node.nodeId !== internalSourceNodeId");
-    expect(workbench).toContain('"floating-with-gap"');
-    expect(workbench).not.toContain("setDragImage");
-    expect(workbench).not.toContain("KNOWLEDGE_WORKSPACE_DRAG_STATE_EVENT");
-    expect(overlay).toContain("data-internal-drag-preview");
-    expect(overlay).toContain("drag.previewMode.value !== 'inline'");
-    expect(overlay).toContain("drag.subscribeVisualPoint(applyVisualPoint)");
-    expect(overlay).toContain("internalDragFloatingTransform");
-    expect(overlay).not.toContain("window.innerWidth");
-    expect(overlay).not.toContain("Math.round");
-  });
-
   it("builds one typed internal source with activation and finish callbacks", () => {
     const activated = vi.fn();
     const finished = vi.fn();

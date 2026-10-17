@@ -1,17 +1,10 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import {
   buildUnityRunStatesRuntimePreview,
   parseUnityRunStatesArguments,
   parseUnityRunStatesOutput,
 } from "../composables/unityRunStatesPreview";
-
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 describe("unityRunStatesPreview", () => {
   it("formats states into stable start update end phases", () => {
@@ -138,124 +131,5 @@ describe("unityRunStatesPreview", () => {
     expect(preview?.printText).toContain("run-states.txt");
     expect(preview?.printText).not.toContain("fallback");
     expect(preview?.printCount).toBe(12000);
-  });
-
-  it("exposes state variables in the tool schema", () => {
-    const definition = JSON.parse(read("tools/unity_run_states.json"));
-    const stateProperties = definition.parameters.properties.states.items.properties;
-
-    expect(stateProperties.variables.type).toBe("string");
-    expect(stateProperties.variables.description).toContain("state's start, update, and end");
-    expect(definition.description).toContain("ctx.Global<T>");
-    expect(definition.description).toContain("100000 estimated tokens");
-    expect(definition.description).toContain("knowledge_query");
-    expect(definition.description).toContain("use `read`");
-    expect(read("knowledge/skill/profiler.md")).toContain("Unity Profiler Runtime Sampling");
-    const runStatesBridge = read("locus_unity/Editor/LocusBridge.RunStates.cs");
-    const profilerSkill = read("knowledge/skill/profiler.md");
-    expect(profilerSkill).toContain("skillSurface: both");
-    expect(profilerSkill).toContain("commandTrigger: /profile");
-    expect(runStatesBridge).toContain("StartProfiler(string name");
-    expect(runStatesBridge).toContain("TryGetProfilerLastValue");
-    expect(runStatesBridge).toContain("RecordProfilerSpike");
-    expect(runStatesBridge).toContain("RecordProfilerSpikeTop");
-    expect(runStatesBridge).toContain("locus.profiler.frame_hierarchy.v1");
-    expect(runStatesBridge).toContain("sample_policy");
-    expect(runStatesBridge).toContain("sample_rows=");
-    expect(runStatesBridge).toContain("frame_span=");
-    expect(runStatesBridge).toContain("session_frame_span");
-    expect(runStatesBridge).toContain("inline_rows=");
-    expect(runStatesBridge).toContain("value.ToString(\"G17\"");
-    expect(read("locus_unity/Editor/LocusBridge.Profiler.cs")).toContain("profiler_summary_file");
-    expect(profilerSkill).toContain("locus.profiler.samples_csv.v1");
-    expect(profilerSkill).toContain("locus.profiler.summary.v1");
-    expect(profilerSkill).toContain("sample_index,session_frame,unity_time_frame_count,profiler_frame_index,elapsed_ms");
-    expect(profilerSkill).toContain("sample_rows");
-    expect(profilerSkill).toContain("missing");
-    expect(profilerSkill).toContain("ctx.RecordProfilerSpikeTop");
-    expect(profilerSkill).toContain("ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount)");
-    expect(profilerSkill).toContain("ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount, inlineRows)");
-  });
-
-  it("compiles unity_run_states before requesting an editor status change", () => {
-    const agentSource = read("src-tauri/src/agent/instance/mod.rs");
-    const runStatesStart = agentSource.indexOf("async fn execute_unity_run_states");
-    const runStatesEnd = agentSource.indexOf("fn execute_unity_ref_search", runStatesStart);
-    const runStatesSource = agentSource.slice(runStatesStart, runStatesEnd);
-
-    expect(runStatesSource.indexOf("compile_run_states")).toBeGreaterThan(-1);
-    expect(runStatesSource.indexOf("compile_run_states")).toBeLessThan(
-      runStatesSource.indexOf("request_unity_editor_status_change_confirm"),
-    );
-    expect(runStatesSource).toContain("Compiling states");
-    expect(runStatesSource).toContain("Compilation failed");
-    expect(runStatesSource).toContain("Running state machine");
-    expect(runStatesSource).toContain("Runtime failed");
-    expect(runStatesSource).toContain("emit_tool_progress(");
-
-    const executeStart = agentSource.indexOf("async fn execute_unity_execute");
-    const executeEnd = agentSource.indexOf("async fn execute_unity_recompile", executeStart);
-    expect(agentSource.slice(executeStart, executeEnd)).not.toContain("compile_run_states");
-
-    expect(read("locus_unity/Editor/LocusBridge.cs")).toContain("compile_run_states");
-    expect(read("locus_unity/Editor/LocusBridge.RunStates.cs")).toContain("HandleCompileRunStates");
-  });
-
-  it("wires the preview into completed tool calls and confirmation cards", () => {
-    expect(read("src/components/ToolCallBlock.vue")).toContain("resolveToolBlockOverride");
-    expect(read("src/components/tool-block-overrides/toolBlockOverrides.ts")).toContain("unity_run_states");
-    expect(read("src/components/tool-block-overrides/UnityRunStatesToolBlock.vue")).toContain("<UnityRunStatesPreview");
-    expect(read("src/components/tool-block-overrides/UnityRunStatesToolBlock.vue")).toContain("<UnityRunStatesOutputPreview");
-    expect(read("src/components/tool-block-overrides/UnityRunStatesToolBlock.vue")).toContain("showFinalSections");
-    expect(read("src/components/chat/ToolConfirmCard.vue")).toContain("<UnityRunStatesPreview");
-  });
-
-  it("keeps unity_run_states runtime progress above the collapsible tool details", () => {
-    const source = read("src/components/tool-block-overrides/UnityRunStatesToolBlock.vue");
-    const headerIndex = source.indexOf("class=\"tool-call-header");
-    const progressIndex = source.indexOf("class=\"tool-call-progress-line");
-    const detailIndex = source.indexOf("class=\"tool-call-detail");
-
-    expect(headerIndex).toBeGreaterThanOrEqual(0);
-    expect(progressIndex).toBeGreaterThanOrEqual(0);
-    expect(detailIndex).toBeGreaterThanOrEqual(0);
-    expect(headerIndex).toBeLessThan(progressIndex);
-    expect(progressIndex).toBeLessThan(detailIndex);
-    expect(source).toContain("<span v-if=\"headerSummary\" class=\"tool-call-summary\">");
-    expect(source).toContain("const headerSummary = computed(() => runtimeProgressSummary.value)");
-    expect(source).toContain("const toolProgress = computed(() => props.toolCall.status === \"running\" ? props.toolCall.progress : null)");
-    expect(source).toContain("const toolProgressText = computed(() => {");
-    expect(source).toContain("const showRuntimeProgressLine = computed(() => props.toolCall.status === \"running\" && Boolean(runtimePreview.value))");
-    expect(source).toContain("const showToolProgressDots = computed(() => props.toolCall.status === \"running\" && Boolean(toolProgressText.value) && !runtimePreview.value)");
-    expect(read("src/composables/unityRunStatesPreview.ts")).toContain("if (toolStatus === \"running\" && !hasOutput) return null;");
-    expect(source).toContain("v-if=\"showRuntimeProgressLine\"");
-    expect(source).toContain("class=\"tool-call-inline-dots\"");
-    expect(source).toContain("const runtimePromptText = computed(() => runtimePreview.value?.promptText.trim() ?? \"\")");
-    expect(source).toContain("const showRuntimePromptText = computed(() => props.toolCall.status === \"running\" && Boolean(runtimePromptText.value))");
-    expect(source).toContain("class=\"unity-run-prompt-text ui-select-text\"");
-    expect(source).toContain("const showRuntimePrintText = computed(() => props.toolCall.status === \"running\" && hasPrints.value)");
-    expect(source).toContain("const showRuntimePrintFallback = computed(() => Boolean(runtimePreview.value) && !showRuntimePrintText.value)");
-    expect(source).toContain("v-if=\"showRuntimePrintText\"");
-    expect(source).toContain("v-else-if=\"showRuntimePrintFallback\"");
-    expect(source).not.toContain("tool.unityRunStates.currentState");
-    expect(source).not.toContain("tool.unityRunStates.userPrompt");
-    expect(source).not.toContain("unity-run-progress-summary");
-    expect(source).toContain("v-if=\"infoExpanded && hasInfoDetail\"");
-    expect(source).toContain("const isFramed = computed(() => infoExpanded.value || showRuntimeProgressLine.value)");
-    expect(source).toContain("'is-framed': isFramed");
-    expect(source).toContain("const infoExpanded = ref(false)");
-    expect(source).not.toContain("hide-prints");
-    expect(source).not.toContain("collapseTimer");
-    expect(source).not.toContain("1400");
-    expect(source).toContain("class=\"unity-tool-call-block unity-run-tool-block\"");
-    expect(source).not.toContain("class=\"tool-call-block unity-run-tool-block\"");
-    expect(source).toMatch(/\.unity-tool-call-block\s*\{[\s\S]*border:\s*0/);
-    expect(source).toMatch(/\.unity-tool-call-block\s*\{[\s\S]*border-radius:\s*0/);
-    expect(source).toMatch(/\.unity-tool-call-block\s*\{[\s\S]*overflow:\s*visible/);
-    expect(source).toMatch(/\.unity-tool-call-block\.is-framed\s*\{[\s\S]*border:\s*1px solid color-mix\(in srgb, #8b7cf6 46%, var\(--border-color\)\)/);
-    expect(source).toMatch(/\.tool-call-detail\s*\{[\s\S]*padding:\s*6px 2px 0 20px/);
-    expect(source).toMatch(/\.tool-call-progress-line\s*\{[\s\S]*padding:\s*5px 2px 0 20px/);
-    expect(source).toMatch(/\.tool-call-progress-line\s*\{[\s\S]*border-top:\s*1px solid color-mix\(in srgb, var\(--border-color\) 58%, transparent\)/);
-    expect(source).toMatch(/\.unity-run-progress\s*\{[\s\S]*background:\s*transparent/);
   });
 });

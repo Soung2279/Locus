@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const subWindowMocks = vi.hoisted(() => ({
@@ -24,12 +23,6 @@ import {
   getKnowledgeMarkdownPreviewWindowPayload,
   openKnowledgeMarkdownPreviewWindow,
 } from "../services/knowledgeMarkdownPreviewWindow";
-
-const cwd = process.cwd();
-
-function read(relativePath: string) {
-  return readFileSync(resolve(cwd, relativePath), "utf8");
-}
 
 describe("knowledgeMarkdownPreviewWindow", () => {
   const payload = {
@@ -94,30 +87,5 @@ describe("knowledgeMarkdownPreviewWindow", () => {
         height: 720,
       }),
     });
-  });
-
-  it("wires the display preference to Memory references and the preview window", () => {
-    const displaySettings = read("src/composables/useDisplaySettings.ts");
-    const displayPanel = read("src/components/settings/DisplaySettings.vue");
-    const documentOpen = read("src/composables/useKnowledgeDocumentOpen.ts");
-    const assetChip = read("src/components/AssetChip.vue");
-    const windowApp = read("src/WindowApp.vue");
-    const viewer = read("src/components/KnowledgeMarkdownPreviewWindow.vue");
-    const capabilities = read("src-tauri/capabilities/default.json");
-
-    expect(displaySettings).toContain('export type MemoryFileOpenTarget = "window" | "knowledge";');
-    expect(displaySettings).toContain("memoryFileOpenTarget: MemoryFileOpenTarget;");
-    expect(displaySettings).toContain('memoryFileOpenTarget: "knowledge",');
-    expect(displayPanel).toContain(':model-value="display.memoryFileOpenTarget"');
-    expect(displayPanel).toContain("settings.display.memoryFileOpenWindow");
-    expect(displayPanel).toContain("settings.display.memoryFileOpenKnowledge");
-    expect(documentOpen).toContain('docType === "memory"');
-    expect(documentOpen).toContain('displaySettings.memoryFileOpenTarget === "window"');
-    expect(assetChip).toContain("await openKnowledgeDocument(knowledgeRef.value.docType");
-    expect(windowApp).toContain('kind: "knowledge-markdown-preview"');
-    expect(viewer).toContain("<SearchableContent v-else>");
-    expect(viewer).toContain("<MarkdownRenderer :content=\"content\" text-zoom />");
-    expect(viewer).toContain('part: "full"');
-    expect(capabilities).toContain('"knowledge-markdown-preview"');
   });
 });

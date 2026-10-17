@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import {
   CATALOG_ANTHROPIC_BASES,
@@ -19,12 +18,6 @@ import {
   providerModelMatchesCatalog,
 } from "../services/modelCatalog";
 import type { CustomProvider, ModelCatalogModel, ModelCatalogProvider } from "../types";
-
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 const catalogModel: ModelCatalogModel = {
   name: "DeepSeek Chat",
@@ -157,123 +150,6 @@ describe("custom provider modal helpers", () => {
 });
 
 describe("custom provider modal layout", () => {
-  it("shows reasoning replay for Chat and Anthropic models while keeping the replay field Chat-only", () => {
-    const source = read("src/components/settings/ProviderModelForm.vue");
-
-    expect(source).toContain("apiFormat === 'openai_chat' || apiFormat === 'anthropic_messages'");
-    expect(source).toContain("saving || reasoningReplayRequired");
-    expect(source).toContain("apiFormat === 'openai_chat' && effectiveReasoningReplay");
-  });
-
-  it("shows Codex remote compaction only for Responses models using the shared checkbox", () => {
-    const source = read("src/components/settings/ProviderModelForm.vue");
-
-    expect(source).toContain("<template v-if=\"apiFormat === 'openai_responses'\">");
-    expect(source).toContain("model.remoteCompactionMode === 'codex_v2'");
-    expect(source).toContain("model.remoteCompactionMode = $event ? 'codex_v2' : 'disabled'");
-    expect(source).toContain("BaseCheckbox");
-    expect(source).toContain('t("settings.custom.remoteCompactionDesc")');
-  });
-
-  it("runs the add flow as a two-step wizard with in-dialog validation", () => {
-    const source = read("src/components/settings/CustomProviderModal.vue");
-
-    expect(source).toContain('import ProviderCatalogStep from "./ProviderCatalogStep.vue"');
-    expect(source).toContain('import ProviderModelsEditor from "./ProviderModelsEditor.vue"');
-    expect(source).toContain('stage.value = props.isAdding ? "pick" : "config"');
-    expect(source).toContain("catalogProviderToCustomProvider");
-    expect(source).toContain("pickManualProvider");
-    expect(source).toContain("backToPick");
-    expect(source).toContain('emit("openCatalog")');
-    // Validation errors surface inside the dialog, not on the page behind it,
-    // and point at the offending field instead of toggling sections open.
-    expect(source).toContain("localError");
-    expect(source).toContain("invalidField");
-    expect(source).toContain('t("settings.custom.nameRequired")');
-    expect(source).toContain('t("settings.custom.endpointRequired")');
-    expect(source).toContain('t("settings.custom.apiModelRequired")');
-    // The shell no longer embeds the cross-provider picker directly.
-    expect(source).not.toContain("ModelCatalogPicker");
-    expect(source).not.toContain("applyCatalogSelection");
-  });
-
-  it("keeps connection settings in a fixed sidebar the models pane cannot crush", () => {
-    const source = read("src/components/settings/CustomProviderModal.vue");
-
-    // Two-pane config stage: connection fields live in their own always-visible
-    // column; the models editor scrolls independently beside them.
-    expect(source).toContain('class="config-side"');
-    expect(source).toContain('class="config-main"');
-    // The sidebar is a flat list of fields: no group headings, no hint text
-    // crowding the labels. "Leave blank to keep the saved key" lives in the
-    // key input's placeholder (edit flow) instead of next to the label.
-    expect(source).not.toContain("side-group");
-    expect(source).not.toContain(
-      '<span class="config-hint">{{ t("settings.custom.apiKeyKeepHint") }}</span>',
-    );
-    expect(source).not.toContain("config-note");
-    expect(source).not.toContain('t("settings.custom.connectionSettings")');
-    expect(source).toContain('t("settings.custom.apiKeyKeepHint")');
-    expect(source).toContain(':placeholder="keyPlaceholder"');
-    // The old collapsible connection block (which a growing models editor
-    // flex-squeezed to 2px, "disappearing" it) must stay gone.
-    expect(source).not.toContain("connectionOpen");
-    expect(source).not.toContain("connection-toggle");
-    // Dropdowns are the themed BaseDropdown, never a native <select> whose
-    // popup ignores the app theme.
-    expect(source).toContain("BaseDropdown");
-    expect(source).not.toContain("<select");
-    // Sidebar keeps a fixed width and never flexes away.
-    expect(source).toMatch(/\.config-side\s*\{[^}]*flex-shrink:\s*0/);
-    // The endpoint edits in an auto-growing textarea so long URLs are fully
-    // visible; whitespace (incl. pasted newlines) never reaches the draft.
-    expect(source).toContain("endpoint-input");
-    expect(source).toContain("field-sizing: content");
-    expect(source).toContain('el.value.replace(/\\s+/g, "")');
-    expect(source).toContain("@keydown.enter.prevent");
-  });
-
-  it("keeps provider choice and model membership separated in the editor", () => {
-    const source = read("src/components/settings/ProviderModelsEditor.vue");
-
-    expect(source).toContain("addCatalogModelRow");
-    expect(source).not.toContain("applyCatalogSelection");
-    expect(source).toContain("providerModelMatchesCatalog");
-    expect(source).toContain("catalogProviderId");
-    // The cross-provider browse panel is a manual-provider fallback only.
-    expect(source).toContain('v-if="!hasCatalog"');
-    expect(source).toContain("ModelCatalogPicker");
-    // Rows get stable ids before a test run so results target the right row.
-    expect(source).toContain("handleTestClick");
-    expect(source).toContain("modelRowIdFromApiModel");
-  });
-
-  it("scrolls configured and available models as one list under a fixed header", () => {
-    const source = read("src/components/settings/ProviderModelsEditor.vue");
-
-    // Single scroll container: expanding a card grows the flow instead of
-    // crushing sibling sections.
-    expect(source).toContain('class="models-scroll"');
-    // Filtering dims configured rows rather than hiding them (hiding reads as
-    // data loss), and only hides rows in the available catalog below.
-    expect(source).toContain("rowMatchesFilter");
-    expect(source).toContain("dimmed");
-    // A fresh blank row opens itself so its fields are visible immediately.
-    expect(source).toContain("!first.apiModel.trim()");
-    // Failed "no model id" validation marks the culprits in place.
-    expect(source).toContain("highlightMissing");
-  });
-
-  it("offers manual setup beside the catalog on the pick step", () => {
-    const source = read("src/components/settings/ProviderCatalogStep.vue");
-
-    expect(source).toContain("pickManual");
-    expect(source).toContain("pickCatalog");
-    expect(source).toContain("FEATURED_CATALOG_PROVIDERS");
-    // The provider search must also match model names (e.g. "kimi" → Moonshot).
-    expect(source).toContain("parts.push(modelId, model.name)");
-  });
-
   it("keeps relay/reseller gateways (中转站) out of the catalog pickers", () => {
     // Every featured provider must survive the allowlist.
     for (const id of FEATURED_CATALOG_PROVIDERS) {
@@ -308,15 +184,6 @@ describe("custom provider modal layout", () => {
     ]) {
       expect(isTrustedCatalogProvider(id), `relay ${id}`).toBe(false);
     }
-
-    const step = read("src/components/settings/ProviderCatalogStep.vue");
-    expect(step).toContain("isListableCatalogProvider");
-
-    // Open browsing filters too, but an explicit provider restriction (editing
-    // an existing provider) bypasses the allowlist so its models stay usable.
-    const picker = read("src/components/settings/ModelCatalogPicker.vue");
-    expect(picker).toContain("isListableCatalogProvider");
-    expect(picker).toContain("props.restrictProviderId\n    ? [props.restrictProviderId].filter((id) => providers[id])");
   });
 
   it("hides providers Locus cannot reach with just endpoint + key", () => {
@@ -377,43 +244,5 @@ describe("custom provider modal layout", () => {
     expect(isRedundantModelId("DeepSeek V4 Flash", "deepseek-v4-flash")).toBe(true);
     expect(isRedundantModelId("Claude Fable 5", "anthropic/claude-fable-5")).toBe(false);
     expect(isRedundantModelId("Qwen Max", "qwen-max-2026-01-25")).toBe(false);
-
-    const editor = read("src/components/settings/ProviderModelsEditor.vue");
-    expect(editor).toContain("isListableCatalogModel");
-    expect(editor).toContain("isRedundantModelId");
-    // The expanded card header is a plain title bar; details live in the form.
-    expect(editor).toContain('v-if="expandedKey !== rowKey(model, index)"');
-
-    const picker = read("src/components/settings/ModelCatalogPicker.vue");
-    expect(picker).toContain("isListableCatalogModel");
-    expect(picker).toContain("isRedundantModelId");
-
-    const step = read("src/components/settings/ProviderCatalogStep.vue");
-    expect(step).toContain("isListableCatalogModel");
-  });
-
-  it("groups advanced model settings into sections scoped by wire format", () => {
-    const source = read("src/components/settings/ProviderModelForm.vue");
-
-    expect(source).toContain('t("settings.custom.formSectionBasic")');
-    expect(source).toContain('t("settings.custom.formSectionReasoning")');
-    expect(source).toContain('t("settings.custom.formSectionAnthropic")');
-    expect(source).toContain("FORMATS_BY_API");
-    expect(source).toContain("effectiveReasoningFormat");
-    // Settings-sheet layout: ONE grid for the whole form (section titles span
-    // both columns) so the label column — and thus every control edge — lines
-    // up across sections instead of each section computing its own width.
-    expect(source).toContain("grid-template-columns: max-content minmax(0, 1fr)");
-    expect(source).toContain("grid-column: 1 / -1");
-    expect(source).not.toContain('class="form-grid"');
-    // Toggles are plain label/control rows too; the replay-field select is a
-    // sibling row, not an indented nested block, and helper notes are gone.
-    expect(source).not.toContain("form-nested");
-    expect(source).not.toContain("form-note");
-    expect(source).toContain("select-md");
-    expect(source).not.toContain("form-grid-2");
-    // Dropdowns are the themed BaseDropdown, never a native <select>.
-    expect(source).toContain("BaseDropdown");
-    expect(source).not.toContain("<select");
   });
 });

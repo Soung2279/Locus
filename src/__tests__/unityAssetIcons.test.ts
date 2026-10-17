@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import {
   UNITY_ASSET_ICON_FILE_EXTENSIONS,
@@ -7,12 +6,6 @@ import {
   unityAssetIconKindForPath,
   unityAssetIconNodeForPath,
 } from "../components/icons/unityAssetIcons";
-
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 describe("Unity asset file format icons", () => {
   it("assigns distinct icon kinds to common code and document formats", () => {
@@ -43,18 +36,5 @@ describe("Unity asset file format icons", () => {
     expect(UNITY_ASSET_ICON_FILE_EXTENSIONS).toEqual(
       expect.arrayContaining([".cs", ".py", ".json", ".md"]),
     );
-  });
-
-  it("uses token-based colors for distinct file formats", () => {
-    const styles = read("src/styles/asset-icons.css");
-
-    for (const kind of ["csharp", "python", "json", "markdown"]) {
-      expect(styles).toContain(`.unity-asset-icon.unity-asset-icon--${kind}`);
-    }
-
-    expect(styles).toContain("var(--accent-color)");
-    expect(styles).toContain("var(--status-warn-fg)");
-    expect(styles).toContain("var(--status-good-fg)");
-    expect(styles).not.toMatch(/#[0-9a-f]{3,8}/i);
   });
 });

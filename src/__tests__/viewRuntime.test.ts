@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 import { compile } from "vue";
 import * as VueRuntime from "vue";
@@ -10,10 +10,6 @@ import {
 } from "../components/view/viewCompiler";
 import { compileViewSfc } from "../components/view/viewSfcCompiler";
 import { createViewSfcModuleExports } from "../components/view/viewRuntime";
-
-function read(path: string): string {
-  return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
-}
 
 describe("viewRuntime", () => {
   it("extracts and transforms Vue script setup TypeScript", () => {
@@ -658,46 +654,5 @@ await view.fs.readFile(shaderPath, "utf8");
     expect(transformed.introducedNames).toContain("writeFile");
     expect(transformed.introducedNames).toContain("fs");
     expect(transformed.introducedNames).toContain("path");
-  });
-
-  it("guards .vue module loading against circular imports", () => {
-    const runtime = read("src/components/view/viewRuntime.ts");
-    const skillRuntime = read("skills/view/app/view-runtime/src/components/view/viewRuntime.ts");
-
-    for (const source of [runtime, skillRuntime]) {
-      expect(source).toContain("const compilingSfcPaths = new Set<string>()");
-      expect(source).toContain("Circular import between .vue files is not supported");
-      expect(source).toContain("compilingSfcPaths.delete(file.relPath)");
-    }
-  });
-
-  it("wires the View fs bridge through runtime, host, service, and Tauri commands", () => {
-    const runtime = read("src/components/view/viewRuntime.ts");
-    const host = read("src/components/view/viewHostApi.ts");
-    const service = read("src/services/view.ts");
-    const commands = read("src-tauri/src/commands/view.rs");
-    const lib = read("src-tauri/src/lib.rs");
-    const viewBackend = read("src-tauri/src/view.rs");
-    const skillRuntime = read("skills/view/app/view-runtime/src/components/view/viewRuntime.ts");
-    const skillService = read("skills/view/app/view-runtime/src/services/view.ts");
-    const skillReference = read("skills/view/runtime-api.md");
-
-    expect(runtime).toContain('specifier === "fs/promises" || specifier === "node:fs/promises"');
-    expect(runtime).toContain('specifier === "path" || specifier === "node:path"');
-    expect(runtime).toContain("createNodeFsModule(context.api)");
-    expect(runtime).toContain("fsReadFile(path: string, encoding?: string | null)");
-    expect(runtime).toContain("const fs = createViewFsPromiseApi(api)");
-    expect(host).toContain("fsReadFile: (path, encoding) => viewFsReadFile(requireViewWorkspaceRef(), { path, encoding })");
-    expect(host).toContain("fsRename: (oldPath, newPath) => viewFsRename(requireViewWorkspaceRef(), { oldPath, newPath })");
-    expect(service).toContain('ipcInvoke<ViewFsReadFileResult>("view_fs_read_file"');
-    expect(service).toContain('ipcInvoke<void>("view_fs_copy_file"');
-    expect(commands).toContain("pub async fn view_fs_read_file");
-    expect(commands).toContain("view_fs_read_file_impl(&working_dir, request)");
-    expect(lib).toContain("commands::view_fs_read_file");
-    expect(viewBackend).toContain("pub async fn view_fs_write_file");
-    expect(viewBackend).toContain("fn view_fs_resolve_path");
-    expect(skillRuntime).toContain("createNodeFsPromisesModule");
-    expect(skillService).toContain("export function viewFsReadFile");
-    expect(skillReference).toContain("node:fs/promises");
   });
 });

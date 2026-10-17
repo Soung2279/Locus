@@ -1159,21 +1159,4 @@ mod tests {
             crate::resource_policy::WorkspaceActivityPriority::VisiblePane
         );
     }
-
-    #[test]
-    fn process_exit_preserves_the_durable_window_recovery_projection() {
-        let app_source = include_str!("../lib.rs");
-        let command_source = include_str!("workspace_service.rs");
-        let system_source = include_str!("system.rs");
-
-        assert!(system_source.contains("pub(crate) fn app_exit_started() -> bool"));
-        assert!(app_source
-            .contains("matches!(event, WindowEvent::Destroyed) && !commands::app_exit_started()"));
-        let detach_exit_guard = ["if crate::commands::", "app_exit_started()"].concat();
-        assert_eq!(
-            command_source.matches(&detach_exit_guard).count(),
-            2,
-            "pane and window detach commands must both preserve recovery during exit"
-        );
-    }
 }

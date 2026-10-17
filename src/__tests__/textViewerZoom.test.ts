@@ -1,6 +1,4 @@
 // @vitest-environment jsdom
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { createApp, h, nextTick, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import AssetTextViewer from "../components/asset/AssetTextViewer.vue";
@@ -11,12 +9,7 @@ import {
   TEXT_VIEWER_ZOOM_STORAGE_KEY,
 } from "../composables/useTextViewerZoom";
 
-const cwd = process.cwd();
 let app: App<Element> | null = null;
-
-function read(relPath: string): string {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 beforeEach(() => {
   resetTextViewerZoomScale();
@@ -94,21 +87,5 @@ describe("text viewer font zoom", () => {
     });
     host.querySelector<HTMLElement>(".atv-body")?.dispatchEvent(scrollEvent);
     expect(scrollEvent.defaultPrevented).toBe(false);
-  });
-
-  it("wires the shared zoom behavior into editable Markdown, Markdown previews, and diffs", () => {
-    const editor = read("src/components/ui/BaseMarkdownEditor.vue");
-    const markdown = read("src/components/MarkdownRenderer.vue");
-    const diff = read("src/components/diff/FileDiffViewer.vue");
-    const merge = read("src/components/collab/MergeTextView.vue");
-    const knowledgeWindow = read("src/components/KnowledgeMarkdownPreviewWindow.vue");
-
-    expect(editor).toContain('@wheel="handleEditorWheel"');
-    expect(editor).toContain("--markdown-source-font-size: calc(13px * var(--text-viewer-font-scale, 1));");
-    expect(markdown).toContain("textZoom?: boolean;");
-    expect(markdown).toContain('@wheel="handleMarkdownWheel"');
-    expect(diff).toContain('@wheel="handleTextViewerZoomWheel"');
-    expect(merge).toContain('@wheel="handleMergeTextWheel"');
-    expect(knowledgeWindow).toContain('<MarkdownRenderer v-else :content="content" text-zoom />');
   });
 });

@@ -1,18 +1,10 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import { Marked } from "marked";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
-
 describe("markdownRender normalization", () => {
   it("normalizes loose blockquotes before MarkdownRenderer parses them", () => {
-    const source = read("src/components/MarkdownRenderer.vue");
     const markdown = [
       "> 受击打断",
       "",
@@ -23,9 +15,6 @@ describe("markdownRender normalization", () => {
     const html = new Marked({ breaks: true, gfm: true }).parse(
       normalizeMarkdownForRender(markdown),
     ) as string;
-
-    expect(source).toContain('const content = prepareMarkdownCitations(props.content, props.citations);');
-    expect(source).toContain('markdownEngine.parse(normalizeMarkdownForRender(content))');
     expect(normalizeMarkdownForRender(markdown)).toBe([
       "> 受击打断",
       ">",

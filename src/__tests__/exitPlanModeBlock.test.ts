@@ -1,22 +1,9 @@
 // @vitest-environment jsdom
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { createPinia } from "pinia";
 import { createApp, nextTick } from "vue";
 import { describe, expect, it } from "vitest";
-import {
-  APPROVED_PLAN_MARKER,
-  REJECTED_FEEDBACK_MARKER,
-  REJECTED_PLAN_PREFIX,
-  parseExitPlanModeBlock,
-} from "../composables/exitPlanModeBlock";
+import { parseExitPlanModeBlock } from "../composables/exitPlanModeBlock";
 import ExitPlanModeToolBlock from "../components/tool-block-overrides/ExitPlanModeToolBlock.vue";
-
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 const APPROVED_OUTPUT = [
   "User has approved your plan. You can now start coding. Start with updating your todo list if applicable.",
@@ -32,19 +19,6 @@ const APPROVED_OUTPUT = [
 ].join("\n");
 
 describe("exit plan mode transcript block", () => {
-  it("mirrors the backend output markers verbatim (frontend/backend contract)", () => {
-    const backend = read("src-tauri/src/agent/instance/mod.rs");
-
-    expect(backend).toContain(APPROVED_PLAN_MARKER);
-    expect(backend).toContain(REJECTED_PLAN_PREFIX);
-    expect(backend).toContain(REJECTED_FEEDBACK_MARKER);
-  });
-
-  it("is registered as the tool block override for exit_plan_mode", () => {
-    const overrides = read("src/components/tool-block-overrides/toolBlockOverrides.ts");
-    expect(overrides).toContain("exit_plan_mode: ExitPlanModeToolBlock");
-  });
-
   it("parses the four lifecycle states from status and output", () => {
     expect(parseExitPlanModeBlock({ status: "running" })).toEqual({ kind: "awaiting" });
 

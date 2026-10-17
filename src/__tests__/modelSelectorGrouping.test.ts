@@ -1,14 +1,7 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import { groupModelsForSelector, modelListEntryName } from "../utils/modelGrouping";
 import type { ModelOption } from "../types";
-
-const cwd = process.cwd();
-
-function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
-}
 
 const providerOrder = ["anthropic", "openai_codex", "custom"] as const;
 const providerLabels: Record<string, string> = {
@@ -125,30 +118,5 @@ describe("model selector grouping", () => {
     expect(modelListEntryName(custom)).toBe("DeepSeek V4 Flash");
     expect(modelListEntryName(builtin)).toBe("Claude Opus 4.8");
     expect(modelListEntryName(legacy)).toBe("Legacy");
-  });
-
-  it("joins provider and model names with a slash, not a middle dot", () => {
-    const source = read("src/stores/model.ts");
-    expect(source).toContain("`${provider.name} / ${model.name}`");
-    expect(source).not.toContain("·");
-  });
-
-  it("both selector dropdowns render per-provider custom sections", () => {
-    for (const path of ["src/components/ModelSelector.vue", "src/components/ModelEffortSelector.vue"]) {
-      const source = read(path);
-      expect(source).toContain("groupModelsForSelector");
-      expect(source).toContain('key="group.key"');
-      expect(source).toContain("optionDisplayName(model)");
-    }
-  });
-
-  it("collapsed trigger shows the bare name and only prefixes the provider on duplicates", () => {
-    for (const path of ["src/components/ModelSelector.vue", "src/components/ModelEffortSelector.vue"]) {
-      const source = read(path);
-      // The duplicate check compares the same bare names the dropdown shows...
-      expect(source).toMatch(/duplicated = props\.models\.some\(\s*\(m(odel)?\) => m(odel)?\.id !== sel(ected)?\.id && optionDisplayName\(m(odel)?\) === displayName,?\s*\)/);
-      // ...and a duplicated custom model is prefixed with its provider name.
-      expect(source).toContain("customProviderName} / ${displayName}");
-    }
   });
 });

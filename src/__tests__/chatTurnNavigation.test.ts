@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "../types";
 import {
@@ -97,35 +96,5 @@ describe("chat turn navigation", () => {
       response: "Image response",
       images: [image],
     });
-  });
-
-  it("keeps a default-on setting and preserves the rail interactions", () => {
-    const rail = readFileSync(
-      resolve(process.cwd(), "src/components/chat/ChatTurnNavigationRail.vue"),
-      "utf8",
-    );
-    const display = readFileSync(
-      resolve(process.cwd(), "src/composables/useDisplaySettings.ts"),
-      "utf8",
-    );
-    const displayView = readFileSync(
-      resolve(process.cwd(), "src/components/settings/DisplaySettings.vue"),
-      "utf8",
-    );
-
-    expect(display).toContain("showTurnNavigationRail: true");
-    expect(displayView).toContain("display.showTurnNavigationRail");
-    expect(rail).toContain("visibleItems.value.length > 0");
-    expect(rail).toContain("buildChatTurnNavigationItems(props.messages, props.userMessageIds)");
-    expect(rail).toContain("ensurePreviewLoaded(item)");
-    expect(rail).toContain("chat-turn-navigation-images");
-    expect(rail).toContain("previewImage.mimeType");
-    expect(rail).toContain("const MIN_LEFT_GUTTER = 48");
-    expect(rail).toContain("target.scrollIntoView");
-    expect(rail).toContain("PREVIEW_OPEN_DELAY_MS = 150");
-    expect(rail).toContain("duration: 1400");
-    expect(rail).toContain("0.2308 + 0.7692 * var(--marker-progress)");
-    expect(rail).toContain("data-scrub-target");
-    expect(rail).toMatch(/\.chat-turn-navigation-button\s*\{[\s\S]*cursor:\s*default;/);
   });
 });

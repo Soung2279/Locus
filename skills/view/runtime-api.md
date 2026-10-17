@@ -8,6 +8,7 @@ Use this when building a Locus View package. Prefer `@locus/view-runtime` for se
 - `@locus/view-runtime`: main service and helper SDK.
 - `@locus/components`: native component module.
 - `@locus/frontend`: exports `locus`, the shared Workbench, UI and View SDK.
+- GPU output: `locus.unity.renderer` with `UnityRenderSurface` from `@locus/components`; see [Unity GPU output](unity-renderer.md). Rendering and animation stay in your C# script.
 - `pinia`: the native Pinia runtime; the View inherits the host instance.
 - `node:fs/promises`, `fs/promises`: Promise-based filesystem APIs.
 - `node:fs`, `fs`: filesystem APIs with `promises` and common callback forms.
@@ -19,7 +20,8 @@ Use this when building a Locus View package. Prefer `@locus/view-runtime` for se
 
 `@locus/view-runtime` currently exposes these runtime values:
 
-- `view`: `manifest`, `summary`, `reload`, `callScript`, `assets.search`, `logs.read/latest/open`, `session`, `llm`, `storage`, `fs`, `path`, `unity`, `files`, `undo`, `propertyDrawer`, `unityObjectDrawer`, `objectReferencePicker`, `openLog`, `onUpdate`.
+- `view`: `manifest`, `summary`, `reload`, `callScript`, `assets.search`, `logs.read/latest/open`, `session`, `llm`, `storage`, `documents`, `fs`, `path`, `unity`, `files`, `undo`, `propertyDrawer`, `unityObjectDrawer`, `objectReferencePicker`, `openLog`, `onUpdate`.
+- `documents`: `workspace`, `knowledge`, `list`, `read`, `update`, `setProperties`, `removeProperties`, `writeBody`, `onChanged`. Markdown references, typed YAML properties and body edits with required `expectedRevision`; see `frontend-sdk.md` → Markdown documents. Also exposed as `view.documents` and `locus.documents`. Use this instead of raw filesystem writes for document-backed editors.
 - `session`: `create`, `show`, `display`, `load`, `activeRun`, `events`, `queueInput`, `chat`, `send`, `wait`, `onEvent`, `fork`, `forkFromMessage`, `list`, `listArchived`, `rename`, `archive`, `unarchive`, `delete`, `undo`, `rollback`.
 - `llm`: `call`.
 - `storage`: `get`, `set`, `remove`.
@@ -28,7 +30,7 @@ Use this when building a Locus View package. Prefer `@locus/view-runtime` for se
 - `unity`: `callScript`, `checkConnection`, `connectionStatus`, `normalizeReference`, `sceneObjectTarget`, `selectAsset`, `inspectAsset`, `openAssetInspector`, `selectSceneObject`, `inspectSceneObject`, `openSceneObjectInspector`, `select`, `inspect`, `drag.start/arm/commitDrop/onDrop/onState`, `onDrop`, `onDragState`, `objectDrawer`, `objectReferencePicker`.
 - `files`: `drag.start/arm/onDrop/onState`, `onDrop`, `onDragState`.
 - `undo`: `state`, `record`, `undo`, `redo`, `clear`, `handleKeydown`, `isRunning`.
-- `property`: `parsePath`, `objectTarget`, `write`, `apply`, `readTree`, `fromPath`, `readProperty`, `property`.
+- `property`: `bind`, `invalidate`, `parsePath`, `objectTarget`, `write`, `apply`, `readTree`, `fromPath`, `readProperty`, `property`. Host-managed lifecycle: `observeDataVersion`, `setActive`, `dispose`.
 - `propertyDrawer`: `library`, `projectLibrary`, `register`, `registerValue`, `registerField`, `registerAttribute`, `registerPropertyPath`, `define`, `normalize`, `createLibrary`.
 - `unityObjectDrawer`: `library`, `projectLibrary`, `register`, `define`, `normalize`, `createLibrary`, `resolve`.
 - `objectReferencePicker`: `roots`, `searchQuery`, `filterResults`, `isResult`, `typeHint`, `typeKey`, `typeRule`, `normalizePath`, `extension`.
@@ -86,6 +88,7 @@ Bound trees also expose `loadChildren(property)` for truncated nodes. Array cont
 These are also available from `@locus/view-runtime` for custom renderers and advanced editors:
 
 - Property tree: `InspectorProperty`, `PropertyTree`, `createPropertyTree`, `createInspectorPropertyTreeBinding`, `resolveInspectorDrawer`, `resolveManagedReferenceTypeOption`, `searchManagedReferenceTypeOptions`, `defineInspectorPropertyDrawers`, `createInspectorPropertyDrawerLibrary`, `publicInspectorPropertyDrawerLibrary`, `projectInspectorPropertyDrawerLibrary`, `normalizeInspectorPropertyDrawers`, `registerInspectorPropertyDrawer`, `registerInspectorValueDrawer`, `registerInspectorFieldDrawer`, `registerInspectorAttributeDrawer`, `registerInspectorPropertyPathDrawer`, `propertyTreeService`.
+- Field presentation: `propertyFieldAccess`, `propertyFieldActions`, `propertyFieldActionDisabled`, `propertyFieldActionMutates`, `resolveInspectorFieldPresentation`. Types: `PropertyFieldPresentation`, `PropertyFieldScope`, `PropertyFieldContext`, `PropertyFieldValueState`, `PropertyFieldProvenance`, `PropertyFieldAction`, `PropertyFieldActionKind`, `InspectorFieldPresentationResolver`, `InspectorPropertyFieldAction`.
 - Unity property binding: `UnityBoundProperty`, `UnityBoundPropertyTree`, `createUnityPropertyRuntime`, `unityBoundPropertySnapshots`.
 - Unity value formatting: `normalizeUnityPropertyType`, `isUnityIntegerPropertyType`, `isUnityNumberPropertyType`, `isUnityVectorPropertyType`, `isUnityQuaternionPropertyType`, `unityVectorKeysForType`, `normalizeUnityOptions`, `unitySerializedValueToEditText`, `tryParseUnitySerializedEditValue`, `parseUnitySerializedEditValue`, `constrainUnityNumberValue`, `formatUnityNumberValue`, `formatUnityEnumValue`, `unityEnumIndexValue`, `unityEnumNumericValue`, `parseUnityVectorValue`, `formatUnityVectorValue`, `parseUnityQuaternionEulerValue`, `formatUnityQuaternionEulerValue`, `parseUnityColorValue`, `formatUnityColorValue`, `unityColorTextToRgbHex`, `applyUnityRgbHexToColorText`.
 - Unity property target paths: `parseUnityPropertyPath`, `resolveUnityPropertyTarget`, `unityPropertyObjectTarget`, `unityPropertyTargetWithPath`, `unityPropertyTargetKey`.
@@ -97,8 +100,10 @@ These are also available from `@locus/view-runtime` for custom renderers and adv
 `@locus/components` exposes:
 
 - `BaseButton`, `BaseCheckbox`, `BaseDropdown`, `BaseSegmented`, `BaseSwitch`.
+- `PropertyField`: reusable field row with scope, inheritance/override chrome and capability-driven context menu.
 - `CanvasView`, `GraphView`, `LinkBoard`, `SerializedTableView`.
 - `UnityBoolField`, `UnityBoundsField`, `UnityColorField`, `UnityColorHdrField`, `UnityCurveField`, `UnityEnumField`, `UnityFlagsField`, `UnityGradientField`, `UnityLayerMaskField`, `UnityNumberField`, `UnityObjectReferenceField`, `UnityPropertyDraw`, `UnityPropertyEditor`, `UnitySerializedPropertyTree`, `UnityVectorField`.
+- `UnityPropertyScope`, `UnityPropertyField`: component-driven object/value bindings with native editing.
 - `UnityObjectPreview`, `UnityReferenceChip`, `UnityDropZone`.
 
 `SerializedTableView` renders rows of Unity serialized cells with resizable columns, a progress/status bar, and per-cell editors. Props: `columns`, `rows`, `loading`, `status`, `error`, `progress`, `savingCellKey`, `sourceCount`, `columnWidths` (v-model). Events: `commit` (`SerializedTableCommitEvent`), `update:columnWidths`. The caller supplies data loading, commit handling and optional persistence.
@@ -106,6 +111,74 @@ These are also available from `@locus/view-runtime` for custom renderers and adv
 `LinkBoard` renders source-to-target connections. Props: `sources`, `targets`, `modelValue` (v-model), optional `sourceTitle`, `targetTitle`, `readonly`, `multiple`. Endpoints are `{ id, label, disabled? }`; connections are `{ source, target }`. It handles selection, connection lines, resize and unlinking; the caller owns data and persistence. `components.md` contains composition examples for this and the existing editors. `locus.views.components()` lists the available native components.
 
 `UnityCurveField` and `UnityGradientField` render AnimationCurve / Gradient previews; when given `editable` plus a `bindingTarget` (the property tree passes both automatically), clicking them opens the floating Locus value editor window, which owns its own preview/commit write-back and broadcasts `locus-value-editor:committed` on apply.
+
+## Input units
+
+`UnityNumberField`, `UnityVectorField`, `UnityBoundsField` and `UnityPropertyEditor` accept optional `unit?: string` (default empty):
+
+```vue
+<UnityNumberField :model-value="speed" unit="米/秒" aria-label="移动速度" @commit="saveSpeed" />
+<UnityPropertyEditor :model-value="seconds" property-type="Float" unit="秒" @commit="saveSeconds" />
+```
+
+The unit is a muted suffix **inside the input border**, right-aligned and separate from editable text. Do not repeat it in a parenthesized label, a second line or a private overlay. Prefer short units (`m`, `m/s`, `°`, `s`, `帧`); explanatory text such as a 60 Hz timeline convention belongs in the tooltip. Long suffixes truncate in narrow controls, retain their full tooltip/accessibility description, and do not cover the value. Clicking the suffix focuses its input. Empty/whitespace-only units retain the plain input. Range fields decorate the numeric input, not the slider; vectors and bounds decorate each numeric component.
+
+Units are **display-only**. They are not parsed, copied with the input value or sent as part of `commit`/`preview` values; precision, Long/UnsignedLong decimal strings, clamping, read-only state and Escape cancellation are unchanged. `unit="%"` does not multiply a ratio by 100; perform any desired conversion explicitly in the adapter. The single-line text fallback also supports units; Boolean, enum/flags, references, color/curve/gradient, Character and multiline text controls do not use them.
+
+Property adapters can supply `unit` on `UnitySerializedPropertySnapshot` / `InspectorPropertySnapshot`. It is normalized onto `InspectorProperty.unit`, forwarded as `unit` to custom drawers, and used by the default tree and bound property editors. Units do not implicitly propagate from a generic parent object to unrelated children. `SerializedTableCell.unit` supplies the same suffix for table cells. No label parsing or Unity attribute inference is performed; an adapter maps its own domain units to the desired display string. The shared internal implementation is `src/components/ui/InputUnit.vue`.
+
+## Field presentation
+
+`PropertyField` (also available from `@locus/view-runtime`) decorates an existing editor without owning its value or writes. Props:
+
+- `label`, optional `fieldKey` (stable owner + logical field identity), `showLabel` (default true), `tooltip`.
+- `scope?: 'template-only' | 'instance-only' | 'template-and-instance'`; `context?: 'template' | 'instance'`.
+- `provenance?: { state: 'local' | 'inherited' | 'overridden'; sourceLabel?: string; inheritedDisplayValue?: string; hasOverriddenChildren?: boolean }`.
+- `actions?: PropertyFieldAction[]`; independent `readonly`, `disabled`, `busy`.
+
+`template-only` is read-only in instance context; `instance-only` is hidden in template context. Missing scope/context preserves normal editing. Provenance never derives from value equality, dirty state or presence of an instance field: an equal-valued explicit override remains overridden. Template variants may also override their direct source. `overridden` gets a 2px bar; child-only summaries get a weaker bar. Source and inherited value live in the tooltip, accessible description and menu, not persistent badges. Theme knobs: `--property-override-color` (defaults to accent) and `--property-field-label-width`.
+
+Slots: default receives `{ readonly, disabled }` (forward both to the editor), `label` customizes the label, `children` puts nested content below the marked row. `showLabel=false` lets a tree/custom drawer supply its own layout. Do not double-wrap editors already drawn by `UnitySerializedPropertyTree` or `UnityPropertyDraw`.
+
+Actions are `{ id, kind, label, tooltip?, disabled?, disabledReason?, group?, quick?, mutates? }`. Kinds:
+
+- `create-override`: only dual-scope inherited fields.
+- `revert`, `apply-to-template`: only dual-scope overridden fields.
+- `reset-default`: only include when the owner has a well-defined initial default.
+- `inspect-source`: non-mutating, available in read-only mode.
+- `custom`: mutating by default; `mutates:false` allows read-only inspection actions.
+
+Actions from different `group` values are separated. At most the first `quick:true` action gets a hover/focus shortcut; the menu button reserves its width to avoid layout shifts. The context menu supports right-click, Shift+F10 / Menu key, arrow keys, Home/End and Escape. Menus use the owning document in popout/Unity-embedded windows. Read-only disables mutations, disabled/busy disables all actions; unsupported inheritance operations are omitted. Changing `fieldKey` closes a stale menu.
+
+Standalone `@action` emits the current `PropertyFieldAction`. It **does not** write, confirm, apply, revert or reset anything. The owner must validate actual target identity/permissions again, set busy while executing, preserve Undo and errors, then refresh provenance. UI scope checks are not backend authorization. Distinguish these operations:
+
+- Revert removes the explicit override and restores inheritance; copying the source value is not equivalent.
+- Reset writes a defined initial default, potentially creating an override.
+- Apply names its exact destination in `label`, confirms shared impact, and updates that source plus removes the current override as one undoable operation. Never clear an override before the source write succeeds; preserve other instances' overrides.
+- Program/shared-asset overrides and native Prefab overrides are separate adapters. Do not choose a Prefab operation merely because a field is styled as overridden.
+
+### Unity trees and drawers
+
+The default list editor keeps scalar/reference values inline and renders complex elements as collapsible summary rows. It includes paging (10 items by default), loaded-item search, keyboard/pointer ordering, insert/duplicate menus, and an explicit item-count form. Filtering and paging retain original array indices. Expansion/page state is scoped to the target and property path in the current window; property refreshes retain it. Use the shared editor instead of rebuilding list controls in each View.
+
+The live Unity bridge reads optional Odin `ListDrawerSettings` (paging, index/count visibility, structural read-only, add/remove visibility, default expansion, default insertion and copy-last), `ListElementLabelName` field/property getters, `FoldoutGroup`, and simple field/property `ShowIf`/`HideIf` conditions. Presentation travels in snapshot `attributes`; preserve these when localizing snapshots. Unknown expressions stay visible. Odin expression evaluation, IMGUI callbacks, and custom add/remove methods are not executed. YAML-only snapshots without live metadata retain the generic list editor and explicit creation-data requirements.
+
+List commands preserve the existing commit/undo path. `duplicate` copies an authoritative backend element, including unloaded/hidden fields; managed-reference graphs require an explicit graph copy and are excluded from this shortcut. Live `insert` with `initialize: true` creates initial values instead of implicitly copying an adjacent element. Live object-reference lists offer the existing resource picker and accept batched asset drops via `insertReferences`; the backend checks all references before inserting any. Reuse `loadChildren` for partial lists rather than reconstructing array values from loaded children.
+
+`UnitySerializedPropertyTree` and `UnityPropertyDraw` accept `fieldPresentation: (property: InspectorProperty) => PropertyFieldPresentation | null | undefined` and emit `fieldAction: { action, propertyPath, property, snapshot }`. The resolver runs for exact nodes, including nested arrays and custom drawers; use the snapshot/bound object's target identity, not a property path alone, when processing an action. Revalidate stable business IDs after array changes.
+
+The same options are supported by raw `InspectorProperty.draw(...)` and bound `draw(...)`, `drawDefaultEditor(...)`, `drawPropertyEditor(...)` as `fieldPresentation` and `onFieldAction`. Example:
+
+```ts
+const editor = tree.drawDefaultEditor({
+  fieldPresentation: resolveFieldPresentation, // supplied by this View's adapter
+  onFieldAction: handleFieldAction,             // supplied by this View's owner
+});
+```
+
+Snapshots may carry `fieldPresentation`. Precedence: resolver result > snapshot metadata > native `prefabOverride` / `isPrefabInstance` / `prefabSource` metadata. Resolver `undefined` falls back; `null` explicitly suppresses native decoration for that node. Existing native override flags automatically produce markers, **not** inferred mutation capabilities or destination targets. Missing native source metadata remains unknown, rather than guessed. Native summaries inspect loaded children only; an adapter should supply `hasOverriddenChildren` when it knows about unloaded descendants. Refresh metadata after writes, Undo/Redo, template changes and selection changes.
+
+Low-level value controls (`UnityNumberField`, `UnityPropertyEditor`, etc.) remain provenance-agnostic. Direct programmatic `property.write(...)` remains an explicit owner operation; scope guards affect render/commit paths, not the underlying transport API. Exact exported contracts live under `app/view-runtime/src/components/property-field/` and `src/services/propertyTree.ts`.
 
 ## Plugin Drawer Packages
 
@@ -124,6 +197,30 @@ The View skill grants the single `execute_typescript` TypeScript tool. It expose
 Debugging uses the same SDK and tool as authoring. `debug.md` contains the inspection workflow.
 
 ## Usage Guidance
+
+### Component-driven data requirements
+
+Import `UnityPropertyScope` and `UnityPropertyField` from `@locus/components`. A scope inherits the owning View's Live runtime, or accepts an explicit `runtime`; `target` is a resolved property path/target (nested scopes inherit it), `readonly` is inherited, and `maxDepth`/`maxArrayItems` default to 4/8. Each field's `path` is relative to its scope target. Fields register only when mounted; no separate resource/field manifest is required.
+
+`property.bind(target, options?)` returns a **lazy shared resource**, with `tree`, `property`, `value`, `loading`, `error`, `write(value, options?)`, `refresh()` and `retain()` (returns an idempotent release). `UnityPropertyField :binding="resource"` owns retain/release automatically. `useUnityPropertyBinding(() => path)` does the same for custom controls inside a scope and exposes computed value/loading/error/read-only state plus write/refresh. A field slot exposes plain `value/loading/error/readonly` and write/refresh functions. Do not fetch or clone a second editable value store.
+
+Live display demands are grouped by object identity. The owning View keeps a bounded object-value cache (128 objects), while static field Schema is shared separately within that runtime. Ordinary ScriptableObject/component fields use compact value snapshots and revision-based deltas; Unity API access remains on the main thread, and only captured managed DTO encoding runs off-thread. The frontend projects each field's requested depth/array range from the shared object. Insufficient coverage, paged arrays, compound/specialized roots, managed-reference graphs, runtime objects and older bridges keep the existing authoritative reader; unsupported is not a reason to switch to YAML. No value cache crosses checkout, backend or View lifetime boundaries.
+
+Declarative resources still retain at most 128 inactive binding candidates (active subscribers are never evicted). Contiguous Editor change notifications invalidate affected object identities; missing events, Undo/Redo, domain/structural/project changes conservatively invalidate the necessary wider scope. Hidden Views revalidate on return without clearing mounted values. Custom setters that bypass Unity change notifications must call `property.invalidate(target)`. Unresolved `selection` cannot be retained; resolve its identity first. Runtime Play Mode values require explicit refresh; pass persistent-edit read-only rules through the scope.
+
+`property.invalidate(target?)` refreshes matching active resources after a custom domain command; `property.observeDataVersion(version, changes?)`, `property.setActive(active)` and `property.dispose()` are lifecycle services normally managed by the host. Do not invoke them per render. View-runtime `readTree/fromPath/readProperty` also reuse eligible object snapshots; use `tree.refresh()` or a resource's `refresh()` for an authoritative reread. Agent-side `locus.unity.property.read()` remains a fresh explicit operation. This does not pre-mount unopened pages, infer arbitrary TypeScript dependencies, or switch a Live scope silently to disk YAML.
+
+### Continuous property editing
+
+Use bound `property.fromPath()` / `readTree()` editors for interactive forms. A scalar commit updates the local draft immediately and merges the backend's actual value on acknowledgement; it does not reread unrelated fields or remount the page. Field validation (`refreshObject`), structural commands, or an explicit `{refresh:true}` retain a conservative refresh. `{refresh:false}` prevents the follow-up read, not receipt reconciliation. `tree.pending` and `tree.error` expose status without disabling input. Failed scalar drafts remain available for correction; do not silently discard them on an earlier failed response.
+
+View writes serialize with Undo/Redo. Live previews share this queue with the final commit: previews may coalesce with adjacent previews, but never with a commit, and do not add Undo records. Adjacent queued scalar assignments to the same target may supersede one another; all callers receive the last assignment's receipt. In-flight work is never cancelled, different targets and structural/history operations are ordering barriers, and `{coalesce:false}` preserves every intermediate assignment when required. Undo uses the authoritative `beforeSnapshot` captured by the backend, not an extra pre-read. Bound YAML trees serialize their revision advancement; after a failed/uncertain write they require an explicit fresh root read before another write.
+
+Do not disable a form while saving, use an early `if (saving) return` to drop input, increment Vue keys after a commit, or unconditionally `await tree.refresh()` after every scalar edit. Custom project side effects should report their own status and explicitly invalidate affected objects. Persistence and derived Unity/Baking completion are not the same as accepting user input.
+
+Ordinary committed scalar writes return a compact incremental receipt, patch the owning object cache and retain the authoritative `beforeSnapshot` for Undo. Preview, structural, validation-dependent and unsupported writes keep their existing safe path. No timeout or uncertain mutation is replayed through a fallback. New Live commit receipts distinguish `applied:true` from `persisted:false`: they changed Unity memory but did not save the asset. `saved` remains a legacy acknowledgement flag, not proof of disk persistence. Do not add per-field Save/Import calls to make the input responsive.
+
+Identical legacy in-flight reads still share a request and distinct same-turn requests use bounded batches; this fallback coordinator does not cache values. The separate object-value store owns freshness. Use returned stable object targets for queued edits.
 
 ### Property backend and deferred writes
 
@@ -183,8 +280,10 @@ await tree.refresh();
   in-flight promise. A failed batch cannot replay automatically: inspect its outcome,
   `clear()`, reread and rebuild. `live` apply may report partial success; it is not
   the same rollback contract as the YAML transaction.
+- YAML schema/reference discovery uses the checkout's existing asset database (GUID/path, duplicate GUIDs and script class candidates). A bounded four-checkout cache shares immutable discovery maps; database/WAL identity and generation changes invalidate it. It keeps no SQLite connection open across requests, and resolves only consumed Prefab GUIDs on the property hot path. This is not an asset-value cache or proof that the filesystem watcher has finished indexing a new file. Current source/meta bytes still determine types and dependency revisions. Consumed metadata that no longer matches its indexed GUID fails with `property.stale_asset_index`; refresh the asset database rather than bypassing the conflict. Missing/unusable databases retain the standalone filesystem scan fallback. Neither path uses the asset index as a substitute for dirty checks or current serialized values.
+- For read profiling, use `yaml.read({target, profile:true})`. Its optional `profile` includes `totalMs`, `indexSource`, `indexLoadMs`, `fullProjectScans` and projection counters. The indexed hot path does not walk Assets/Packages or read all meta files.
 - For profiling, use `yaml.apply({writes, profile:true})`. The optional response
-  `profile` contains `prepareMs`, `commitMs`, `projectionMs`, `totalMs`,
+  `profile` contains `prepareMs`, `commitMs`, `projectionMs`, `totalMs`, `indexSource`, `indexLoadMs`, `fullProjectScans`,
   `effectiveBuilds`, `treeBuilds`, `overrideValidationPasses`, `materializedCompilePasses`, `readProjections`
   and byte-changing `changedFiles`. When connected, `profile.editor` separates
   Unity `preflightMs`, `writeMs`, `importMs` and `changedFiles`; offline it is null.

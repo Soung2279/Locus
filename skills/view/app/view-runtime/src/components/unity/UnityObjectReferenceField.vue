@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Ban, Check, X } from "lucide";
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { previewWorkspaceAssetThumbnail, searchWorkspaceAssets } from "../../services/asset";
 import {
   filterUnityObjectReferenceSearchResults,
@@ -130,6 +130,7 @@ const showEmpty = computed(() =>
   dropdownVisible.value && !searching.value && !searchError.value && results.value.length === 0,
 );
 const dropdownEl = ref<HTMLElement | null>(null);
+const dropdownTarget = shallowRef<HTMLElement | null>(null);
 const dropdownPosition = ref({
   left: 0,
   top: 0,
@@ -149,6 +150,7 @@ const dropdownStyle = computed(() => ({
   "--unity-object-reference-dropdown-origin": dropdownPosition.value.placement === "top" ? "bottom left" : "top left",
 }));
 let positionFrame = 0;
+let positionFrameWindow: Window | null = null;
 const DROPDOWN_GAP = 4;
 const DROPDOWN_MARGIN = 8;
 const DROPDOWN_MAX_HEIGHT = 246;
@@ -168,14 +170,18 @@ watch(
   },
 );
 
-watch(dropdownVisible, (visible) => {
-  if (!visible) {
-    removeDropdownPositionListeners();
-    return;
-  }
-  addDropdownPositionListeners();
-  void nextTick(() => {
-    scheduleDropdownPositionUpdate();
+watch(dropdownVisible, (visible, _previous, onCleanup) => {
+  if (!visible) return;
+  const ownerDocument = rootEl.value?.ownerDocument;
+  const ownerWindow = ownerDocument?.defaultView;
+  if (!ownerDocument || !ownerWindow) return;
+  updateDropdownPosition();
+  ownerWindow.addEventListener("resize", scheduleDropdownPositionUpdate);
+  ownerDocument.addEventListener("scroll", scheduleDropdownPositionUpdate, true);
+  onCleanup(() => {
+    cancelDropdownPositionUpdate();
+    ownerWindow.removeEventListener("resize", scheduleDropdownPositionUpdate);
+    ownerDocument.removeEventListener("scroll", scheduleDropdownPositionUpdate, true);
   });
 });
 
@@ -183,7 +189,6 @@ onBeforeUnmount(() => {
   clearDebounce();
   clearBlurTimer();
   cancelDropdownPositionUpdate();
-  removeDropdownPositionListeners();
 });
 
 function clearDebounce() {
@@ -200,24 +205,25 @@ function clearBlurTimer() {
 
 function cancelDropdownPositionUpdate() {
   if (!positionFrame) return;
-  window.cancelAnimationFrame(positionFrame);
+  positionFrameWindow?.cancelAnimationFrame(positionFrame);
   positionFrame = 0;
-}
-
-function viewportSize() {
-  return {
-    width: window.innerWidth || document.documentElement.clientWidth,
-    height: window.innerHeight || document.documentElement.clientHeight,
-  };
+  positionFrameWindow = null;
 }
 
 function updateDropdownPosition() {
   positionFrame = 0;
+  positionFrameWindow = null;
   const field = rootEl.value;
   if (!field || !dropdownVisible.value) return;
+  const ownerDocument = field.ownerDocument;
+  const ownerWindow = ownerDocument.defaultView;
+  if (!ownerWindow) return;
 
   const rect = field.getBoundingClientRect();
-  const viewport = viewportSize();
+  const viewport = {
+    width: ownerWindow.innerWidth || ownerDocument.documentElement.clientWidth,
+    height: ownerWindow.innerHeight || ownerDocument.documentElement.clientHeight,
+  };
   const width = Math.min(
     Math.max(rect.width, 220),
     Math.max(0, viewport.width - DROPDOWN_MARGIN * 2),
@@ -251,18 +257,10 @@ function updateDropdownPosition() {
 }
 
 function scheduleDropdownPositionUpdate() {
-  if (positionFrame) return;
-  positionFrame = window.requestAnimationFrame(updateDropdownPosition);
-}
-
-function addDropdownPositionListeners() {
-  window.addEventListener("resize", scheduleDropdownPositionUpdate);
-  document.addEventListener("scroll", scheduleDropdownPositionUpdate, true);
-}
-
-function removeDropdownPositionListeners() {
-  window.removeEventListener("resize", scheduleDropdownPositionUpdate);
-  document.removeEventListener("scroll", scheduleDropdownPositionUpdate, true);
+  const ownerWindow = rootEl.value?.ownerDocument.defaultView;
+  if (positionFrame || !dropdownVisible.value || !ownerWindow) return;
+  positionFrameWindow = ownerWindow;
+  positionFrame = ownerWindow.requestAnimationFrame(updateDropdownPosition);
 }
 
 function updateSearchText(event: Event) {
@@ -280,6 +278,9 @@ function beginEdit() {
   focused.value = true;
   clearBlurTimer();
   if (shouldResetSearch) searchText.value = "";
+  // Shared workbench windows use the opener's Vue runtime. Resolve the actual
+  // field document on each open instead of Teleport's global "body" selector.
+  dropdownTarget.value = rootEl.value?.ownerDocument.body ?? null;
   open.value = true;
   scheduleSearch(true);
   focusSearchInput();
@@ -317,7 +318,7 @@ function focusDisplay() {
 function scheduleBlurCheck() {
   clearBlurTimer();
   blurTimer = window.setTimeout(() => {
-    const active = document.activeElement;
+    const active = rootEl.value?.ownerDocument.activeElement;
     if (active && rootEl.value?.contains(active)) return;
     if (active && dropdownEl.value?.contains(active)) return;
     focused.value = false;
@@ -334,7 +335,6 @@ function closeDropdown() {
   results.value = [];
   highlightedIndex.value = -1;
   clearDebounce();
-  removeDropdownPositionListeners();
 }
 
 function scheduleSearch(immediate: boolean) {
@@ -409,7 +409,7 @@ function optionId(index: number): string {
 function scrollHighlightedIntoView() {
   void nextTick(() => {
     if (!open.value || highlightedIndex.value < 0) return;
-    document.getElementById(optionId(highlightedIndex.value))?.scrollIntoView({ block: "nearest" });
+    dropdownEl.value?.ownerDocument.getElementById(optionId(highlightedIndex.value))?.scrollIntoView({ block: "nearest" });
   });
 }
 
@@ -537,7 +537,7 @@ function handleSearchKeydown(event: KeyboardEvent) {
     </button>
   </div>
 
-  <Teleport to="body">
+  <Teleport v-if="dropdownTarget" :to="dropdownTarget">
     <div
       v-if="dropdownVisible"
       ref="dropdownEl"

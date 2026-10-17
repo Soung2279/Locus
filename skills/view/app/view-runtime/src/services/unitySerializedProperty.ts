@@ -5,6 +5,7 @@ import type {
 } from "../components/unity/unitySerializedValue";
 import type { WorkspaceRef } from "./project";
 import { assetInteger } from "./unityAssets";
+import type { PropertyObjectRequest, PropertyObjectResponse } from "./propertyObjectData";
 
 export type UnitySerializedPropertyWriteMode = "commit" | "preview";
 /** live uses SerializedObject on Unity's main thread; yaml edits persisted data. */
@@ -26,6 +27,8 @@ export type UnitySerializedPropertyTarget = UnitySerializedPropertyTargetSnapsho
 export type UnitySerializedPropertySnapshot = UnitySerializedPropertySnapshotValue;
 
 export interface UnitySerializedPropertyReadRequest {
+  /** YAML index and projection timings, without starting Unity. */
+  profile?: boolean;
   arrayOffset?: number | null;
   bindingId?: string | null;
   target: UnitySerializedPropertyTarget;
@@ -103,7 +106,18 @@ export interface UnitySerializedPropertyDiscoverMatch {
   depth: number;
 }
 
+export interface UnityPropertyDataChanges {
+  fromVersion?: string | null;
+  full: boolean;
+  objects: string[];
+}
+
 export interface UnitySerializedPropertyReadResult extends UnitySerializedPropertySnapshot {
+  dataVersion?: string;
+  dependencyObjectIds?: string[];
+  conservativeInvalidation?: boolean;
+  profile?: { totalMs: number; indexSource: "asset_database" | "scan" | "frozen"; indexLoadMs: number;
+    fullProjectScans: number; effectiveBuilds?: number; treeBuilds?: number; readProjections?: number };
   diagnostics?: { code: string; message: string; severity: string; object_id?: string | null; property_path?: string | null }[];
   backend?: UnitySerializedPropertyBackend;
   revision?: string;
@@ -130,12 +144,18 @@ export interface UnitySerializedPropertyDiscoverResult {
 }
 
 export interface UnitySerializedPropertyWriteResult extends UnitySerializedPropertyReadResult {
+  /** Legacy acknowledgement flag; use applied/persisted to distinguish states. */
   saved: boolean;
+  applied?: boolean;
+  persisted?: boolean;
   beforeSnapshot?: UnitySerializedPropertySnapshot | null;
+  /** OnValidate or other object-level effects require a targeted refresh. */
+  refreshObject?: boolean;
 }
 
 export interface UnitySerializedPropertyApplyResult {
   profile?: { prepareMs: number; commitMs: number; projectionMs: number; totalMs: number;
+    indexSource?: "asset_database" | "scan" | "frozen"; indexLoadMs?: number; fullProjectScans?: number;
     effectiveBuilds?: number; treeBuilds?: number; overrideValidationPasses?: number; changedFiles?: number;
     materializedCompilePasses?: number; readProjections?: number;
     editor?: { preflightMs: number; writeMs: number; importMs: number; changedFiles: number } | null };
@@ -158,6 +178,13 @@ export function exactUnityPropertyTarget(target: UnitySerializedPropertyTarget):
   return result;
 }
 
+export async function executeUnityPropertyObjects(workspaceRef: WorkspaceRef, request: PropertyObjectRequest): Promise<PropertyObjectResponse> {
+  const exact = request.action === "read"
+    ? { ...request, reads: request.reads.map(read => ({ ...read, target: exactUnityPropertyTarget(read.target) })) }
+    : { ...request, write: { ...request.write, target: exactUnityPropertyTarget(request.write.target) } };
+  return ipcInvoke<PropertyObjectResponse>("unity_property_objects", { workspaceRef, request: exact });
+}
+
 export async function readUnitySerializedProperty(
   workspaceRef: WorkspaceRef,
   request: UnitySerializedPropertyReadRequest,
@@ -165,6 +192,16 @@ export async function readUnitySerializedProperty(
   return ipcInvoke<UnitySerializedPropertyReadResult>("unity_serialized_property_read", {
     workspaceRef,
     request: { ...request, target: exactUnityPropertyTarget(request.target) },
+  });
+}
+
+export async function readUnitySerializedProperties(
+  workspaceRef: WorkspaceRef,
+  reads: UnitySerializedPropertyReadRequest[],
+): Promise<UnitySerializedPropertyReadResult[]> {
+  return ipcInvoke<UnitySerializedPropertyReadResult[]>("unity_serialized_property_read_many", {
+    workspaceRef,
+    request: { reads: reads.map(read => ({ ...read, target: exactUnityPropertyTarget(read.target) })) },
   });
 }
 

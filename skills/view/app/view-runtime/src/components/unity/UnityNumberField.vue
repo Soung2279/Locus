@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import InputUnit from "../ui/InputUnit.vue";
 import {
   UNITY_FLOAT_DRAG_STEP,
   constrainUnityNumberDragValue,
@@ -11,6 +12,7 @@ import {
   type UnityNumberConstraintOptions,
 } from "./unitySerializedValue";
 
+defineOptions({ inheritAttrs: false });
 const props = withDefaults(defineProps<{
   modelValue: unknown;
   propertyType?: string;
@@ -19,6 +21,7 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   title?: string;
   ariaLabel?: string;
+  unit?: string;
   hasRange?: boolean;
   rangeMin?: number;
   rangeMax?: number;
@@ -30,6 +33,7 @@ const props = withDefaults(defineProps<{
   placeholder: "",
   title: "",
   ariaLabel: "",
+  unit: "",
   hasRange: false,
   rangeMin: 0,
   rangeMax: 0,
@@ -43,7 +47,10 @@ const emit = defineEmits<{
   commit: [value: unknown];
 }>();
 
+const unitText = computed(() => props.unit.trim());
 const text = ref(unitySerializedValueToEditText(props.propertyType, props.modelValue));
+const focused = ref(false);
+const hasDraft = ref(false);
 const rangeMin = computed(() => Math.min(props.rangeMin, props.rangeMax));
 const rangeMax = computed(() => Math.max(props.rangeMin, props.rangeMax));
 const usesRange = computed(() =>
@@ -72,7 +79,8 @@ const sliderValue = computed(() => {
 
 watch(
   () => [props.modelValue, props.propertyType] as const,
-  () => {
+  ([, type], [, previousType]) => {
+    if (focused.value && hasDraft.value && type === previousType) return;
     text.value = unitySerializedValueToEditText(props.propertyType, props.modelValue);
   },
 );
@@ -103,6 +111,7 @@ function emitNumberValue(value: number) {
 function updateFromInput(event: Event) {
   const target = event.target as HTMLInputElement | null;
   text.value = target?.value ?? "";
+  hasDraft.value = true;
   emit("edit", text.value);
   const parsed = parsedNumber(text.value);
   if (parsed != null) emit("update:modelValue", parsed);
@@ -147,7 +156,7 @@ function restoreTextOnEscape(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div v-if="usesRange" class="unity-number-range-field">
+  <div v-if="usesRange" v-bind="$attrs" class="unity-number-range-field" :class="{ 'has-unit': !!unitText }">
     <input
       class="unity-number-range-slider"
       type="range"
@@ -158,9 +167,11 @@ function restoreTextOnEscape(event: KeyboardEvent) {
       :step="inputStep"
       :title="title || undefined"
       :aria-label="ariaLabel || undefined"
+      :aria-valuetext="unitText ? `${sliderValue} ${unitText}` : undefined"
       @input="updateFromRange"
       @change="commitFromInput"
     />
+    <InputUnit :unit="unitText" :disabled="disabled" :readonly="readonly" v-slot="{ unitId }">
     <input
       class="unity-number-field unity-number-range-input"
       type="number"
@@ -174,14 +185,19 @@ function restoreTextOnEscape(event: KeyboardEvent) {
       :step="inputStep"
       :title="title || undefined"
       :aria-label="ariaLabel || undefined"
+      :aria-describedby="unitId"
       @input="updateFromInput"
+    @focus="focused = true"
+    @blur="focused = false; hasDraft = false"
       @change="commitFromInput"
       @keydown.enter.prevent="blurOnEnter"
       @keydown.esc.prevent="restoreTextOnEscape"
     />
+    </InputUnit>
   </div>
+  <InputUnit v-else :unit="unitText" :disabled="disabled" :readonly="readonly" v-slot="{ unitId }">
   <input
-    v-else
+    v-bind="$attrs"
     class="unity-number-field"
     type="text"
     inputmode="decimal"
@@ -191,11 +207,15 @@ function restoreTextOnEscape(event: KeyboardEvent) {
     :placeholder="placeholder"
     :title="title || undefined"
     :aria-label="ariaLabel || undefined"
+    :aria-describedby="[$attrs['aria-describedby'], unitId].filter(Boolean).join(' ') || undefined"
     @input="updateFromInput"
+    @focus="focused = true"
+    @blur="focused = false; hasDraft = false"
     @change="commitFromInput"
     @keydown.enter.prevent="blurOnEnter"
     @keydown.esc.prevent="restoreTextOnEscape"
   />
+  </InputUnit>
 </template>
 
 <style scoped>
@@ -206,6 +226,10 @@ function restoreTextOnEscape(event: KeyboardEvent) {
   grid-template-columns: minmax(0, 1fr) minmax(58px, 74px);
   align-items: center;
   gap: 6px;
+}
+
+.unity-number-range-field.has-unit {
+  grid-template-columns: minmax(0, 1fr) minmax(0, min(50%, 140px));
 }
 
 .unity-number-range-slider {

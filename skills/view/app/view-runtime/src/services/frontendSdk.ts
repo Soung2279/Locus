@@ -9,6 +9,10 @@ import { getFrontendWorkbench } from "./frontendWorkbench";
 import { getDebugConsoleSnapshot } from "./debugConsole";
 import { createUnityAssets } from "./unityAssets";
 import { createUnityPropertyApi } from "./unityPropertyApi";
+import { createViewDocuments } from "./viewDocuments";
+import { createUnityRenderer } from "./unityRenderer";
+export type { UnityRenderer, UnityRenderOutput, UnityRenderSurfaceHandle, UnityRenderStatus, UnityRendererCapabilities } from "./unityRenderer";
+export type { ViewDocumentRef, ViewDocumentSnapshot, ViewDocumentEdit, ViewDocumentWriteOptions, ViewDocumentListOptions, ViewDocumentListPage, ViewDocumentChange, DocumentPropertyValue } from "./viewDocuments";
 
 export interface FrontendImage { data: string; mimeType: string; width?: number; height?: number; }
 export interface FrontendLocatorTarget { selector?: string; text?: string; name?: string; role?: string; id?: string; }
@@ -47,7 +51,7 @@ function uiHandle(execute: Execute) {
 
 /** The same typed SDK is used by native modules, View packages and the single
  * TypeScript tool. All project operations retain the caller's checkout scope. */
-export function createFrontendSdk(workspaceRef: WorkspaceRef, options: { signal?: AbortSignal; images?: FrontendImage[]; windowLabel?: string; ownerWindow?: Window } = {}) {
+export function createFrontendSdk(workspaceRef: WorkspaceRef, options: { signal?: AbortSignal; images?: FrontendImage[]; windowLabel?: string; ownerWindow?: Window; active?: { readonly value: boolean } } = {}) {
   const windowLabel = options.windowLabel ?? "main";
   const ownerWindow = options.ownerWindow ?? window;
   const controller = new AbortController();
@@ -88,6 +92,7 @@ export function createFrontendSdk(workspaceRef: WorkspaceRef, options: { signal?
   const ui = uiHandle(async (kind, payload) => { assertLive(); return automation().handle(kind, payload); });
   return {
     workspace: refScope,
+    documents: createViewDocuments(refScope, { signal }),
     assets: createUnityAssets(refScope, { signal }),
     windowLabel,
     logs: { read: (limit = 100) => getDebugConsoleSnapshot().slice(-Math.min(500, Math.max(1, limit))) },
@@ -134,7 +139,7 @@ export function createFrontendSdk(workspaceRef: WorkspaceRef, options: { signal?
       write: (path: string, content: string) => { assertLive(); return viewService.viewFsWriteFile(refScope, { path, data: content, encoding: "utf8" }); },
       list: (path: string) => viewService.viewFsReaddir(refScope, { path, withFileTypes: true }),
     },
-    unity: { property: createUnityPropertyApi(refScope, { signal }) },
+    unity: { property: createUnityPropertyApi(refScope, { signal }), renderer: createUnityRenderer(refScope, { signal, windowLabel, ownerWindow, active: options.active }) },
   };
 }
 export type LocusFrontendSdk = ReturnType<typeof createFrontendSdk>;

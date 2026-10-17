@@ -4,6 +4,8 @@ import type {
   InspectorProperty,
   InspectorPropertyCommit,
   InspectorPropertyDrawerInput,
+  InspectorFieldPresentationResolver,
+  InspectorPropertyFieldAction,
 } from "../../services/propertyTree";
 import type { UnitySerializedPropertyCommitEvent } from "./unitySerializedValue";
 
@@ -44,6 +46,10 @@ export default defineComponent({
       type: null as unknown as PropType<InspectorPropertyDrawerInput>,
       default: undefined,
     },
+    fieldPresentation: {
+      type: Function as PropType<InspectorFieldPresentationResolver>,
+      default: undefined,
+    },
     disabled: {
       type: Boolean,
       default: false,
@@ -62,6 +68,7 @@ export default defineComponent({
     },
   },
   emits: {
+    fieldAction: (_event: InspectorPropertyFieldAction) => true,
     commit: (_event: UnitySerializedPropertyCommitEvent) => true,
   },
   setup(props, { emit }) {
@@ -90,6 +97,8 @@ export default defineComponent({
       try {
         return props.property.draw({
           drawers: props.propertyDrawers,
+          fieldPresentation: props.fieldPresentation,
+          onFieldAction: (event) => emit("fieldAction", event),
           disabled: props.disabled,
           readonly: props.readonly,
           compact: props.compact,

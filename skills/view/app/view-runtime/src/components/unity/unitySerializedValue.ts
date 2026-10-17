@@ -1,3 +1,5 @@
+import type { PropertyFieldPresentation } from "../property-field/propertyField";
+
 export type UnitySerializedPropertyType =
   | "Integer"
   | "Boolean"
@@ -54,6 +56,10 @@ export interface UnitySerializedPropertyTargetSnapshot {
 }
 
 export interface UnitySerializedPropertySnapshot {
+  fieldPresentation?: PropertyFieldPresentation;
+  prefabOverride?: boolean;
+  isPrefabInstance?: boolean;
+  prefabSource?: string;
   restoreState?: string | null;
   propertyPath: string;
   semanticPath?: string;
@@ -88,6 +94,8 @@ export interface UnitySerializedPropertySnapshot {
   managedReferenceDisplayName?: string;
   managedReferenceTypes?: UnityManagedReferenceTypeOption[];
   tooltip?: string;
+  /** Display-only input suffix. No unit conversion or serialization changes. */
+  unit?: string;
   header?: string;
   hasRange?: boolean;
   rangeMin?: number;

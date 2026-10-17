@@ -18,8 +18,14 @@ import {
 import * as VueRuntime from "vue";
 import * as PiniaRuntime from "pinia";
 import { createFrontendSdk } from "../../services/frontendSdk";
+import { createPropertyObjectData, type PropertyObjectTransport } from "../../services/propertyObjectData";
+import { createPropertyEditQueue, isCoalesciblePropertyValue } from "../../services/propertyEditQueue";
 import { emit as emitTauriEvent } from "@tauri-apps/api/event";
 import { listenUnityValueEditorCommitted, UNITY_VALUE_EDITOR_COMMITTED_EVENT } from "../../services/unityValueEditorWindow";
+import UnityPropertyScope from "../unity/UnityPropertyScope.vue";
+import UnityPropertyField from "../unity/UnityPropertyField.vue";
+import { useUnityPropertyBinding } from "../unity/unityPropertyScope";
+export type { UnityPropertyResource } from "../unity/unityPropertyResources";
 import { UNITY_PROPERTY_EDITING, UNITY_PROPERTY_WORKSPACE } from "../unity/unityPropertyEditingContext";
 import { t } from "../../i18n";
 import { VIEW_CONTEXT, useViewContext, useOptionalViewContext, type ViewExecutionScope } from "./viewExecutionScope";
@@ -30,6 +36,10 @@ import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
+import { PropertyField } from "../property-field";
+import * as PropertyFieldApi from "../property-field/propertyField";
+export type { PropertyFieldScope, PropertyFieldContext, PropertyFieldValueState, PropertyFieldProvenance, PropertyFieldActionKind, PropertyFieldAction, PropertyFieldPresentation } from "../property-field/propertyField";
+export type { InspectorFieldPresentationResolver, InspectorPropertyFieldAction } from "../../services/propertyTree";
 import { LinkBoard } from "../link-board";
 export type { LinkBoardConnection, LinkBoardEndpoint } from "../link-board";
 import {
@@ -62,6 +72,7 @@ import UnityVectorField from "../unity/UnityVectorField.vue";
 import * as UnityPropertyBinding from "../unity/unityPropertyBinding";
 import * as UnitySerializedValue from "../unity/unitySerializedValue";
 import UnityObjectPreview from "../unity-preview/UnityObjectPreview.vue";
+import UnityRenderSurface from "../unity-renderer/UnityRenderSurface.vue";
 import type {
   ViewCallScriptResult,
   ViewFsFileData,
@@ -175,6 +186,7 @@ export type {
   ViewSessionWaitRequest,
   ViewSessionWaitResult,
 } from "../../services/view";
+export type { ViewDocumentRef, ViewDocumentSnapshot, ViewDocumentEdit, ViewDocumentWriteOptions, ViewDocumentListOptions, ViewDocumentListPage, ViewDocumentChange, DocumentPropertyValue } from "../../services/viewDocuments";
 
 export type {
   UnitySerializedPropertyDiscoverMatch,
@@ -267,6 +279,8 @@ const PROJECT_VIEW_IMPORT_PREFIXES = [
 export interface ViewRuntimeApi {
   workspaceRef: WorkspaceRef;
   callScript(scriptName: string, method: string, args?: unknown): Promise<ViewCallScriptResult>;
+  unityPropertyObjects?: PropertyObjectTransport;
+  unityPropertyReadMany?(requests: UnitySerializedPropertyReadRequest[]): Promise<UnitySerializedPropertyReadResult[]>;
   unityPropertyRead(request: UnitySerializedPropertyReadRequest): Promise<UnitySerializedPropertyReadResult>;
   unityPropertyDiscover(request: UnitySerializedPropertyDiscoverRequest): Promise<UnitySerializedPropertyDiscoverResult>;
   unityPropertyWrite(request: UnitySerializedPropertyWriteRequest): Promise<UnitySerializedPropertyWriteResult>;
@@ -356,6 +370,8 @@ export type ViewSerializedPropertySnapshotInput = Partial<UnitySerializedPropert
 };
 
 export interface ViewRuntimePropertyWriteOptions {
+  /** Set false when every intermediate scalar assignment is significant. */
+  coalesce?: boolean;
   undoable?: boolean;
   label?: string;
   beforeSnapshot?: ViewSerializedPropertySnapshotInput | null;
@@ -812,6 +828,10 @@ const UnityDropZone = defineComponent({
 });
 
 export const LOCUS_COMPONENTS = {
+  UnityRenderSurface,
+  UnityPropertyScope,
+  UnityPropertyField,
+  PropertyField,
   BaseButton,
   BaseCheckbox,
   BaseDropdown,
@@ -862,12 +882,8 @@ function runtimeErrorMessage(error: unknown): string {
 }
 
 function createViewUndoService() {
-  let operationTail: Promise<unknown> = Promise.resolve();
-  function enqueue<T>(job: () => Promise<T>): Promise<T> {
-    const result = operationTail.then(job);
-    operationTail = result.catch(() => undefined);
-    return result;
-  }
+  const operations = createPropertyEditQueue();
+  const enqueue = operations.enqueue;
   const undoStack: Required<ViewRuntimeUndoEntry>[] = [];
   const redoStack: Required<ViewRuntimeUndoEntry>[] = [];
   const state = reactive<ViewRuntimeUndoState>({
@@ -987,19 +1003,7 @@ function snapshotHistoryKey(snapshot: ViewSerializedPropertySnapshotInput | null
   }
 }
 
-function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof createViewUndoService>) {
-
-  async function readBeforeSnapshot(
-    request: UnitySerializedPropertyWriteRequest,
-    options: ViewRuntimePropertyWriteOptions,
-  ): Promise<ViewSerializedPropertySnapshotInput | null> {
-    if (options.beforeSnapshot) return options.beforeSnapshot;
-    const result = await api.unityPropertyRead({
-      bindingId: request.bindingId,
-      target: request.target,
-    });
-    return result;
-  }
+function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof createViewUndoService>, invalidateReads: () => void) {
 
   function recordWriteUndo(
     request: UnitySerializedPropertyWriteRequest,
@@ -1024,9 +1028,14 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
     request: UnitySerializedPropertyWriteRequest,
     options: ViewRuntimePropertyWriteOptions = {},
   ): Promise<UnitySerializedPropertyWriteResult> {
-    const shouldRecord = options.undoable !== false && !undo.isRunning();
-    const before = shouldRecord ? await readBeforeSnapshot(request, options) : null;
-    const result = await api.unityPropertyWrite(request);
+    const shouldRecord = request.writeMode !== "preview" && options.undoable !== false && !undo.isRunning();
+    // Unity/YAML capture beforeSnapshot atomically with the write. A separate
+    // read both adds a round trip and can be stale before the mutation executes.
+    const before = options.beforeSnapshot ?? null;
+    invalidateReads();
+    let result: UnitySerializedPropertyWriteResult;
+    try { result = await api.unityPropertyWrite(request); }
+    finally { invalidateReads(); }
     if (!result.ok) throw new Error(result.message || "Failed to write Unity property.");
     if (shouldRecord && (result.beforeSnapshot || before)) {
       recordWriteUndo(request, result.beforeSnapshot ?? before!, result, options);
@@ -1039,7 +1048,12 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
     request: UnitySerializedPropertyWriteRequest,
     options: ViewRuntimePropertyWriteOptions = {},
   ): Promise<UnitySerializedPropertyWriteResult> {
-    return undo.enqueue(() => writeNow(request, options));
+    // Freeze target identity before this request joins the asynchronous queue.
+    request = { ...request, target: { ...request.target } };
+    const key = options.coalesce !== false && isCoalesciblePropertyValue(request.value)
+      && !(request.target.kind === "selection" && !request.target.globalObjectId)
+      ? UnityPropertyPathService.unityPropertyTargetKey(request.target) + `|mode=${request.writeMode ?? "commit"}|undo=${options.undoable !== false}` : undefined;
+    return undo.enqueue(() => writeNow(request, options), key);
   }
 
   function apply(request: UnitySerializedPropertyApplyRequest, options: ViewRuntimePropertyApplyOptions = {}) {
@@ -1051,27 +1065,22 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
     options: ViewRuntimePropertyApplyOptions = {},
   ): Promise<UnitySerializedPropertyApplyResult> {
     const shouldRecord = options.undoable !== false && !undo.isRunning();
-    const before = shouldRecord
-      ? await Promise.all(request.writes.map((writeRequest) =>
-        api.unityPropertyRead({
-          bindingId: writeRequest.bindingId,
-          target: writeRequest.target,
-        }).catch(() => null),
-      ))
-      : [];
-    const result = await api.unityPropertyApply(request);
+    invalidateReads();
+    let result: UnitySerializedPropertyApplyResult;
+    try { result = await api.unityPropertyApply(request); }
+    finally { invalidateReads(); }
     if (shouldRecord) {
       const undoWrites: UnitySerializedPropertyApplyWrite[] = result.results
-        .map((after, index): UnitySerializedPropertyApplyWrite | null => (after.beforeSnapshot || before[index]?.ok) && after.ok && after.target
+        .map((after): UnitySerializedPropertyApplyWrite | null => after.beforeSnapshot && after.ok && after.target
           ? {
             bindingId: after.bindingId,
             target: after.target,
-            value: snapshotRestoreValue(after.beforeSnapshot ?? before[index]!),
+            value: snapshotRestoreValue(after.beforeSnapshot!),
           }
           : null)
         .filter((item): item is UnitySerializedPropertyApplyWrite => !!item);
       const redoWrites: UnitySerializedPropertyApplyWrite[] = result.results
-        .filter((after, index) => after.ok && after.target && (after.beforeSnapshot || before[index]?.ok))
+        .filter((after) => after.ok && after.target && !!after.beforeSnapshot)
         .map((after) => ({
           bindingId: after.bindingId,
           target: after.target,
@@ -1567,41 +1576,56 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     const registration = subscribe(...args); return scope ? scope.trackAsync(registration) : registration;
   }) as T;
   const undo = createViewUndoService();
-  const propertyWrites = createViewPropertyRuntime(api, undo);
+  const propertyReads = createPropertyObjectData(api.unityPropertyRead, api.unityPropertyReadMany, api.unityPropertyObjects);
+  const invalidatePropertyReads = () => propertyReads.invalidatePending();
+  const propertyWrites = createViewPropertyRuntime({ ...api,
+    unityPropertyWrite: request => propertyReads.write(request, () => api.unityPropertyWrite(request)),
+    unityPropertyApply: async request => {
+      request.writes.forEach(write => propertyReads.invalidate(write.target));
+      const result = await api.unityPropertyApply(request);
+      result.results.forEach(receipt => propertyReads.reconcile(receipt));
+      return result;
+    },
+  }, undo, invalidatePropertyReads);
   const unityProperty = UnityPropertyBinding.createUnityPropertyRuntime({
-    read: (request) => api.unityPropertyRead(request),
+    read: propertyReads.read,
+    invalidate: propertyReads.invalidate,
     write: (request, options = {}) => {
-      if (request.writeMode === "preview") {
-        return api.unityPropertyWrite(request);
-      }
+      invalidatePropertyReads();
       return propertyWrites.write({
         bindingId: request.bindingId,
         target: request.target,
         value: request.value,
         writeMode: request.writeMode,
       }, {
+        coalesce: options.coalesce,
         label: options.label,
-        undoable: options.undoable,
+        undoable: request.writeMode === "preview" ? false : options.undoable,
         beforeSnapshot: (options.beforeSnapshot ?? null) as ViewSerializedPropertySnapshotInput | null,
         onApplied: options.onApplied,
       });
     },
     apply: (request, options = {}) => {
-      if (request.writes.some((write) => write.writeMode === "preview")) {
-        return api.unityPropertyApply(request);
-      }
+      invalidatePropertyReads();
       return propertyWrites.apply(request, {
         label: options.label,
-        undoable: options.undoable,
+        undoable: request.writes.some(write => write.writeMode === "preview") ? false : options.undoable,
         onApplied: options.onApplied,
       });
     },
     undo: undo.undo,
     redo: undo.redo,
   });
+  if (scope) {
+    scope.track(VueRuntime.watch(() => scope.context.active.value, active => unityProperty.setActive(active), { immediate: true }));
+    scope.context.onDispose(() => { propertyReads.dispose(); unityProperty.dispose(); });
+    scope.trackAsync(api.onUpdate(event => { propertyReads.observeVersion(event.propertyDataVersion, event.propertyDataChanges); unityProperty.observeDataVersion(event.propertyDataVersion, event.propertyDataChanges); })
+      .then(stop => typeof stop === "function" ? stop : () => {}));
+  }
   const historyOwner = scope ? `${scope.context.windowLabel}:${scope.context.editorId}:${scope.context.viewId}` : "";
   if (scope) scope.trackAsync(listenUnityValueEditorCommitted((event) => {
     const result = event.result;
+    invalidatePropertyReads();
     if (!historyOwner || event.historyOwner !== historyOwner || event.historyReplay || !result?.ok || !result.beforeSnapshot) return;
     if (event.workspaceRef.checkoutId !== api.workspaceRef?.checkoutId || event.workspaceRef.expectedGeneration !== api.workspaceRef.expectedGeneration) return;
     if (event.workspaceRef.expectedMaterializationEpoch !== api.workspaceRef.expectedMaterializationEpoch) return;
@@ -1735,7 +1759,10 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     onDragState: trackSubscription(subscribeLocusFileDragState),
   };
 
+  const locus = createFrontendSdk(api.workspaceRef, { signal: scope?.context.signal, windowLabel: scope?.context.windowLabel, ownerWindow: scope?.ownerWindow, active: scope?.context.active });
+  const documents = locus.documents;
   const view = {
+    documents,
     manifest: readonly(detail.manifest),
     summary: readonly(detail.summary),
     reload: api.reload,
@@ -1771,7 +1798,8 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
   };
 
   return {
-    locus: createFrontendSdk(api.workspaceRef, { signal: scope?.context.signal, windowLabel: scope?.context.windowLabel, ownerWindow: scope?.ownerWindow }),
+    locus,
+    documents,
     view,
     session,
     llm,
@@ -1783,12 +1811,14 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     undo,
     propertyDrawer,
     unityObjectDrawer,
+    useUnityPropertyBinding,
     property: unityProperty,
     propertyEditing: {
+      runtime: unityProperty,
       workspaceRef: api.workspaceRef,
       historyOwner,
       adapter: {
-        read: (request: UnityPropertyBinding.UnityBoundPropertyReadRequest) => api.unityPropertyRead(request),
+        read: propertyReads.read,
         write: (request: UnityPropertyBinding.UnityBoundPropertyWriteRequest, options?: UnityPropertyBinding.UnityBoundPropertyWriteOptions) =>
           unityProperty.write(request.target, request.value, { ...options, writeMode: request.writeMode ?? undefined }),
         apply: (request: UnityPropertyBinding.UnityBoundPropertyApplyRequest, options?: UnityPropertyBinding.UnityBoundPropertyApplyOptions) => unityProperty.apply(request.writes, options),
@@ -1801,10 +1831,12 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     GraphView,
     GraphViewController,
     SerializedTableView,
+    PropertyField,
     UnityPropertyDraw,
     UnityPropertyEditor,
     UnitySerializedPropertyTree,
     UnityObjectPreview,
+    UnityRenderSurface,
     UnityReferenceChip,
     UnityDropZone,
     layoutGraphDocument,
@@ -1813,6 +1845,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     resolveSerializedTableSources,
     serializedTableSourcesFromAssets,
     ...PropertyTreeService,
+    ...PropertyFieldApi,
     ...UnityPropertyBinding,
     ...UnitySerializedValue,
     ...UnityPropertyPathService,
@@ -2001,6 +2034,10 @@ function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntim
         targetKind: request.target?.kind ?? "",
         propertyPath: request.target?.propertyPath ?? "",
       }),
+    unityPropertyObjects: api.unityPropertyObjects ? request =>
+      measureRequest("unityPropertyObjects", () => api.unityPropertyObjects!(request), { action: request.action }) : undefined,
+    unityPropertyReadMany: api.unityPropertyReadMany ? requests =>
+      measureRequest("unityPropertyReadMany", () => api.unityPropertyReadMany!(requests), { readCount: requests.length }) : undefined,
     unityPropertyDiscover: (request) =>
       measureRequest("unityPropertyDiscover", () => api.unityPropertyDiscover(request), {
         bindingId: request.bindingId ?? "",

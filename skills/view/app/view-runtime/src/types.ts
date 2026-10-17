@@ -95,6 +95,7 @@ export type AssistantRenderPart =
 export interface ImageAttachment {
   data: string;
   mimeType: string;
+  capture?: { id: string } | null;
 }
 
 export type ManagedLocalFileStatus = "loading" | "ready" | "error";
@@ -294,6 +295,8 @@ export interface UnityObservedMainThreadState {
   quiescentForMs: number;
   stackClass?: string | null;
   suspendWindowUs?: number | null;
+  heartbeatAgeMs?: number | null;
+  activeExecutions?: number | null;
 }
 
 export interface UnityObservedSafetyState {
@@ -335,6 +338,43 @@ export interface UnitySemanticState {
   safety: UnityObservedSafetyState;
   statePlane: UnityObservedStatePlane;
   editorLog: UnityObservedEditorLogState;
+  /** Where the main thread is stuck; present while `phase` is `unresponsive`. */
+  hangDiagnosis?: UnityHangDiagnosis | null;
+}
+
+export interface UnityHangFrame {
+  index: number;
+  kind: "managed" | "native" | "unknown" | string;
+  origin: "user" | "agent" | "locus" | "unity" | "system" | "runtime" | "native" | "unknown" | string;
+  ip: string;
+  module?: string | null;
+  symbol?: string | null;
+  assembly?: string | null;
+  file?: string | null;
+  line?: number | null;
+  display: string;
+}
+
+export interface UnityHangDiagnosis {
+  status: "running" | "complete" | "failed" | string;
+  processId: number;
+  processCreatedAtMs?: number | null;
+  startedAtMs: number;
+  capturedAtMs?: number | null;
+  heartbeatAgeMs?: number | null;
+  source?: "native_broker" | "external_scan" | string | null;
+  verdict: "busy" | "waiting" | "unknown" | string;
+  cpuPercent?: number | null;
+  waitingOn?: string | null;
+  stackStable?: boolean | null;
+  sampleCount: number;
+  location?: UnityHangFrame | null;
+  locationReason?: string | null;
+  activeExecutions?: number | null;
+  summary: string;
+  frames: UnityHangFrame[];
+  notes?: string[];
+  error?: string | null;
 }
 
 export interface UnityNativeBrokerStatus {
@@ -466,6 +506,7 @@ export interface SessionDetail {
 }
 
 export interface SessionViewSnapshot {
+  remoteSyncWarning?: string | null;
   session: SessionDetail;
   userMessageIds?: string[];
   oldestMessageRowId?: number | null;
@@ -488,7 +529,7 @@ export interface SessionMessagePage {
 export interface CompactedContextOutput {
   messageId: string;
   snapshotStatus: "complete" | "reconstructed" | "partial" | string;
-  compactionKind: "checkpoint" | "readable" | "codexEncrypted" | string;
+  compactionKind: "checkpoint" | "readable" | "codexEncrypted" | "claudeNative" | string;
   encryptedContentChars?: number;
   checkpoint: { summary: string; recent: string } | "empty";
   messages: Array<{
@@ -675,7 +716,9 @@ export interface CustomProviderModel {
   name: string;
   contextLength: number;
   remoteCompactionMode: RemoteCompactionMode;
-  /** Protocol-native lazy tool loading (defer_loading/tool_reference); Anthropic format only. */
+  /** Opt into the Codex wire protocol; null retains generic Responses HTTP. */
+  codexTransport?: CodexTransportMode | null;
+  /** Native tool loading for Anthropic or an explicitly configured Codex route. */
   supportsToolLazyLoading: boolean;
   supportedReasoningEfforts: EffortLevel[];
   reasoningParamFormat: ReasoningParamFormat | null;
@@ -745,13 +788,12 @@ export interface ModelDefaults {
   subagentEfforts: Record<string, EffortLevel>;
   /** Missing keys inherit the current session; explicit false selects standard speed. */
   subagentFastModes: Record<string, boolean>;
-  /** Opt-in: Claude Code CLI models only join the model list when true. */
-  claudeCodeEnabled?: boolean;
 }
 
 export type CodexTransportMode = "http" | "websocket";
 
 export interface CodexModelConfig {
+  autoUpdateClientVersion: boolean;
   transport: CodexTransportMode;
   contextWindow: number;
   /** Legacy 272K/372K switch retained while older config files migrate. */
@@ -1045,6 +1087,7 @@ export interface TodoItem {
 export interface TodoSnapshot {
   items: TodoItem[];
   latestRunId: string | null;
+  sessionScoped?: boolean;
 }
 
 export type TodoPanelMode = "current" | "all";
@@ -1273,6 +1316,11 @@ export type StreamEvent = {
       contextLimit: number;
       /** "reactive" means the server rejected the request as over the window. */
       trigger?: "auto" | "manual" | "reactive";
+    }
+  | {
+      type: "historySynchronized";
+      sessionId: string;
+      messages: ChatMessage[];
     }
   | {
       type: "compactDone";
@@ -1559,7 +1607,7 @@ export interface KnowledgeDocumentSummary {
   path: string;
   title: string;
   injectMode: KnowledgeInjectModeSetting;
-  /** L2/L3 injection targets. Missing metadata defaults to Unity; [] disables injection. */
+  /** L2/L3 injection targets: Agent ids or `*` patterns (`*` matches every Agent). Missing metadata keeps the legacy Unity-only target; [] disables injection. */
   injectAgents?: string[];
   effectiveInjectMode: KnowledgeInjectMode;
   injectModeSource?: KnowledgeConfigSource | null;
@@ -1594,6 +1642,7 @@ export interface KnowledgeDocumentFileMetadata {
 }
 
 export interface KnowledgeDocument extends KnowledgeDocumentSummary {
+  propertiesYaml?: string;
   body: string;
   maintenanceRules: string | null;
   effectiveMaintenanceRules: string | null;
@@ -1922,6 +1971,8 @@ export interface KnowledgeDocumentEditOperation {
 }
 
 export interface KnowledgeDocumentPatch {
+  propertiesYaml?: string;
+  expectedPropertiesYaml?: string;
   id?: string;
   type?: KnowledgeDocumentType;
   injectMode?: KnowledgeInjectModeSetting;

@@ -40,6 +40,7 @@ export interface ViewManifest {
   /** Historical package metadata; new Views do not use templates. */
   template?: string;
   displayPath?: string | null;
+  /** Bundled Lucide name/alias or inline static SVG (up to 32 KiB UTF-8). */
   icon?: string | null;
   entry: string;
   style?: string;
@@ -65,6 +66,7 @@ export interface ViewPackageSummary {
   temporary?: boolean;
   source?: string;
   pluginId?: string | null;
+  pluginName?: string | null;
   pluginScope?: "app" | "project" | string | null;
 }
 
@@ -107,6 +109,7 @@ export interface ViewCreateRequest {
   directories?: string[];
   /** Require a connected Unity editor; stored in the optional <view> block. */
   unity?: boolean | null;
+  /** Bundled Lucide name/alias or inline static SVG (up to 32 KiB UTF-8). */
   icon?: string | null;
   displayPath?: string | null;
   temporary?: boolean;
@@ -336,6 +339,9 @@ export interface ViewRuntimeUpdateEvent {
   isPlaying: boolean;
   isPaused: boolean;
   activeScenePath: string;
+  /** Domain-qualified authoring change token; absent on older bridges. */
+  propertyDataVersion?: string;
+  propertyDataChanges?: import("./unitySerializedProperty").UnityPropertyDataChanges;
   selection: ViewRuntimeSelectionSnapshot;
 }
 
@@ -532,6 +538,13 @@ export function viewRead(workspaceRef: WorkspaceRef, viewId: string): Promise<Vi
 
 export function viewReload(workspaceRef: WorkspaceRef, viewId: string): Promise<ViewPackageSummary> {
   return ipcInvoke<ViewPackageSummary>("view_reload", { workspaceRef, viewId });
+}
+
+export function viewUpdateMetadata(
+  workspaceRef: WorkspaceRef,
+  request: { viewId: string; name: string; icon: string | null },
+): Promise<ViewPackageSummary> {
+  return ipcInvoke<ViewPackageSummary>("view_update_metadata", { workspaceRef, request });
 }
 
 export function viewRun(workspaceRef: WorkspaceRef, viewId: string, windowLabel?: string): Promise<ViewRunResult> {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, watch } from "vue";
+import InputUnit from "../ui/InputUnit.vue";
 import {
   isUnityQuaternionPropertyType,
   parseUnityVectorValue,
@@ -15,6 +16,7 @@ const props = withDefaults(defineProps<{
   displayValue?: string;
   title?: string;
   ariaLabel?: string;
+  unit?: string;
 }>(), {
   propertyType: "Vector3",
   disabled: false,
@@ -22,6 +24,7 @@ const props = withDefaults(defineProps<{
   displayValue: "",
   title: "",
   ariaLabel: "",
+  unit: "",
 });
 
 const emit = defineEmits<{
@@ -100,24 +103,29 @@ function restorePartOnEscape(key: string, event: KeyboardEvent) {
     :aria-label="ariaLabel || undefined"
   >
     <label v-for="key in keys" :key="key" class="unity-vector-part">
-      <span>{{ key }}</span>
+      <span class="unity-vector-axis">{{ key }}</span>
+      <InputUnit :unit="unit" :disabled="disabled" :readonly="readonly" v-slot="{ unitId }">
       <input
         type="text"
         inputmode="decimal"
         :value="parts[key]"
         :disabled="disabled"
         :readonly="readonly"
+        :aria-label="[ariaLabel, key.toUpperCase()].filter(Boolean).join(' ')"
+        :aria-describedby="unitId"
         @input="updatePart(key, $event)"
         @change="commitVector"
         @keydown.enter.prevent="blurOnEnter"
         @keydown.esc.prevent="restorePartOnEscape(key, $event)"
       />
+      </InputUnit>
     </label>
   </div>
 </template>
 
 <style scoped>
 .unity-vector-field {
+  --input-unit-end-padding: 4px;
   width: 100%;
   min-width: 0;
   min-height: var(--unity-property-row-height, 26px);
@@ -134,7 +142,7 @@ function restorePartOnEscape(key: string, event: KeyboardEvent) {
   gap: 4px;
 }
 
-.unity-vector-part span {
+.unity-vector-axis {
   color: var(--text-secondary);
   font-size: 11px;
   text-transform: uppercase;

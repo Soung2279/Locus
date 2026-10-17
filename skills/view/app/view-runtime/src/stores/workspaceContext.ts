@@ -210,6 +210,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
       delete workspaceStateByCheckout.value[runtime.checkoutId];
     }
     const checkout: WorkspaceCheckoutDescriptor = {
+      knowledgeEnabled: runtime.knowledgeEnabled,
       checkoutId: runtime.checkoutId,
       projectId: runtime.projectId,
       root: runtime.root,
@@ -320,6 +321,12 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     const current = workspaceStateByCheckout.value[event.checkoutId];
     const currentEvent = current?.events[event.eventName];
     if (currentEvent && event.streamRevision <= currentEvent.streamRevision) return false;
+    if (event.eventName === "workspace-setup-changed") {
+      const payload = event.payload as { knowledgeEnabled?: boolean };
+      if (typeof payload?.knowledgeEnabled === "boolean") {
+        upsertRuntime({ ...runtime, knowledgeEnabled: payload.knowledgeEnabled });
+      }
+    }
     workspaceStateByCheckout.value[event.checkoutId] = {
       projectId: event.projectId,
       checkoutId: event.checkoutId,

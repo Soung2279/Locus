@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch, type CSSProperties } from "vue";
+import { computed, nextTick, ref, shallowRef, watch, type CSSProperties } from "vue";
 
 export interface DropdownOption {
   value: string;
@@ -46,6 +46,7 @@ const open = ref(false);
 const rootRef = ref<HTMLElement | null>(null);
 const triggerRef = ref<HTMLButtonElement | null>(null);
 const listboxRef = ref<HTMLElement | null>(null);
+const dropdownTarget = shallowRef<HTMLElement | null>(null);
 const activeIndex = ref(-1);
 const menuFixedStyle = ref<CSSProperties>({});
 const listboxId = `dropdown-${Math.random().toString(36).slice(2, 10)}`;
@@ -133,8 +134,10 @@ function repositionMenu() {
   const trigger = triggerRef.value;
   const menu = listboxRef.value;
   if (!trigger || !menu) return;
+  const ownerWindow = trigger.ownerDocument.defaultView;
+  if (!ownerWindow) return;
   const rect = trigger.getBoundingClientRect();
-  const viewport = { width: window.innerWidth, height: window.innerHeight };
+  const viewport = { width: ownerWindow.innerWidth, height: ownerWindow.innerHeight };
 
   // The menu never renders narrower than the trigger (minWidth below), so
   // horizontal math must use the floored width, not the raw measurement.
@@ -166,8 +169,7 @@ function repositionMenu() {
 
 function onWindowScroll(event: Event) {
   if (!open.value) return;
-  const target = event.target as Node | null;
-  if (target && listboxRef.value && target !== (document as unknown as Node) && listboxRef.value.contains(target)) {
+  if (listboxRef.value && event.composedPath().includes(listboxRef.value)) {
     return;
   }
   repositionMenu();
@@ -179,6 +181,8 @@ function onWindowResize() {
 
 function openMenu() {
   const wasOpen = open.value;
+  // The trigger can live in a shared workbench window outside this Vue runtime.
+  dropdownTarget.value = triggerRef.value?.ownerDocument.body ?? null;
   open.value = true;
   activeIndex.value = selectedEnabledIndex();
   if (props.teleport) {
@@ -206,7 +210,7 @@ function scrollActiveIntoView() {
   if (!open.value) return;
   const option = props.options[activeIndex.value];
   if (!option) return;
-  document.getElementById(`${listboxId}-option-${option.value}`)?.scrollIntoView({ block: "nearest" });
+  listboxRef.value?.ownerDocument.getElementById(`${listboxId}-option-${option.value}`)?.scrollIntoView({ block: "nearest" });
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -260,38 +264,33 @@ watch(activeIndex, () => {
   if (open.value) nextTick(scrollActiveIntoView);
 });
 
-watch(open, (isOpen) => {
-  if (!props.teleport) return;
-  if (isOpen) {
-    window.addEventListener("scroll", onWindowScroll, true);
-    window.addEventListener("resize", onWindowResize);
-  } else {
-    window.removeEventListener("scroll", onWindowScroll, true);
-    window.removeEventListener("resize", onWindowResize);
+watch(open, (isOpen, _previous, onCleanup) => {
+  if (!isOpen) return;
+  const ownerDocument = triggerRef.value?.ownerDocument;
+  const ownerWindow = ownerDocument?.defaultView;
+  if (!ownerDocument || !ownerWindow) return;
+  ownerDocument.addEventListener("click", onDocumentClick, true);
+  if (props.teleport) {
+    ownerWindow.addEventListener("scroll", onWindowScroll, true);
+    ownerWindow.addEventListener("resize", onWindowResize);
   }
+  onCleanup(() => {
+    ownerDocument.removeEventListener("click", onDocumentClick, true);
+    ownerWindow.removeEventListener("scroll", onWindowScroll, true);
+    ownerWindow.removeEventListener("resize", onWindowResize);
+  });
 });
 
-let menuResizeObserver: ResizeObserver | null = null;
-watch(listboxRef, (menu) => {
-  menuResizeObserver?.disconnect();
-  if (!menu || !props.teleport || typeof ResizeObserver === "undefined") return;
-  menuResizeObserver = new ResizeObserver(repositionMenu);
+watch(listboxRef, (menu, _previous, onCleanup) => {
+  const OwnerResizeObserver = menu?.ownerDocument.defaultView?.ResizeObserver;
+  if (!menu || !props.teleport || !OwnerResizeObserver) return;
+  const menuResizeObserver = new OwnerResizeObserver(repositionMenu);
   menuResizeObserver.observe(menu);
+  onCleanup(() => menuResizeObserver.disconnect());
 });
 
 watch(() => props.disabled, (disabled) => {
   if (disabled) close();
-});
-
-onMounted(() => {
-  document.addEventListener("click", onDocumentClick, true);
-});
-
-onUnmounted(() => {
-  menuResizeObserver?.disconnect();
-  document.removeEventListener("click", onDocumentClick, true);
-  window.removeEventListener("scroll", onWindowScroll, true);
-  window.removeEventListener("resize", onWindowResize);
 });
 </script>
 
@@ -314,7 +313,7 @@ onUnmounted(() => {
       <span class="base-dropdown-chevron" :class="{ open }">&#9662;</span>
     </button>
 
-    <Teleport to="body" :disabled="!teleport">
+    <Teleport v-if="dropdownTarget" :to="dropdownTarget" :disabled="!teleport">
       <Transition name="dropdown">
         <div
           v-if="open"

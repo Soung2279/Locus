@@ -6,6 +6,8 @@ export interface ViewContext {
   editorId: string;
   windowLabel: string;
   workspaceRef: WorkspaceRef;
+  /** Immutable binding supplied by an embedded editor control. */
+  binding?: Readonly<Record<string, unknown>>;
   active: Readonly<Ref<boolean>>;
   signal: AbortSignal;
   onDispose(dispose: () => void): () => void;
@@ -24,6 +26,7 @@ export function createViewExecutionScope(options: {
   windowLabel?: string;
   ownerWindow?: Window;
   workspaceRef: WorkspaceRef;
+  binding?: Readonly<Record<string, unknown>>;
   active: Ref<boolean>;
   state: Map<string, unknown>;
   log(level: "debug" | "log" | "info" | "warn" | "error", args: unknown[]): void;
@@ -34,6 +37,9 @@ export function createViewExecutionScope(options: {
   const disposers = new Set<() => void>();
   const timers = new Map<number, () => void>();
   const frames = new Map<number, () => void>();
+  // Physical native child documents are pooled; user globals belong to a
+  // binding, not to the retained browser Window.
+  const localGlobals = new Map<PropertyKey, unknown>();
   let stateSequence = 0;
   function track(dispose: () => void): () => void {
     let live = true;
@@ -67,7 +73,7 @@ export function createViewExecutionScope(options: {
   const context: ViewContext = {
     viewId: options.viewId, editorId: options.editorId,
     windowLabel: options.windowLabel ?? "main",
-    workspaceRef: Object.freeze({ ...options.workspaceRef }), active: readonly(options.active),
+    workspaceRef: Object.freeze({ ...options.workspaceRef }), binding: options.binding, active: readonly(options.active),
     signal: controller.signal, onDispose: track,
   };
   const logger = Object.fromEntries(["debug", "log", "info", "warn", "error"].map((level) => [level, (...args: unknown[]) => {
@@ -95,6 +101,16 @@ export function createViewExecutionScope(options: {
     frames.set(id, () => window.cancelAnimationFrame(id)); return id;
   };
   function globals(locus: unknown): Record<string, unknown> {
+    function observerConstructor(name: "MutationObserver" | "ResizeObserver" | "IntersectionObserver") {
+      const Constructor = (window as unknown as Record<string, unknown>)[name];
+      if (typeof Constructor !== "function") return Constructor;
+      return new Proxy(Constructor, { construct(target, args) {
+        if (controller.signal.aborted) throw new DOMException("View was released", "AbortError");
+        const callback = args[0] as (...values: unknown[]) => void;
+        const observer = Reflect.construct(target, [(...values: unknown[]) => { if (!controller.signal.aborted) callback(...values); }, ...args.slice(1)]) as { disconnect(): void };
+        track(() => observer.disconnect()); return observer;
+      } });
+    }
     function listenerMethods(target: EventTarget) {
       const eventListeners = new Map<EventListenerOrEventListenerObject, Map<string, () => void>>();
       return {
@@ -121,11 +137,31 @@ export function createViewExecutionScope(options: {
       clearTimeout: clearTimer, clearInterval: clearTimer, requestAnimationFrame: frame, cancelAnimationFrame: cancelFrame,
       ...listenerMethods(window),
     };
+    if (options.binding) {
+      for (const name of ["MutationObserver", "ResizeObserver", "IntersectionObserver"] as const) overrides[name] = observerConstructor(name);
+      overrides.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const cancellation = new AbortController();
+        const signals = [controller.signal, init?.signal ?? (typeof input === "object" && "signal" in input ? input.signal : undefined)].filter((signal): signal is AbortSignal => !!signal);
+        const abort = () => cancellation.abort();
+        for (const signal of signals) { signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort(); }
+        try { return await window.fetch(input, { ...init, signal: cancellation.signal }); }
+        finally { for (const signal of signals) signal.removeEventListener("abort", abort); }
+      };
+    }
     const scopedWindow = new Proxy(window, { get(target, key) {
       if (key === "window" || key === "self" || key === "globalThis") return scopedWindow;
       if (typeof key === "string" && key in overrides) return overrides[key];
+      if (localGlobals.has(key)) return localGlobals.get(key);
       const value = Reflect.get(target, key, target); return typeof value === "function" && !value.prototype ? value.bind(target) : value;
-    } });
+    }, set(target, key, value) {
+      if (options.binding && (!(key in target) || localGlobals.has(key))) {
+        if (!controller.signal.aborted) localGlobals.set(key, value); return true;
+      }
+      return Reflect.set(target, key, value, target);
+    }, deleteProperty(target, key) {
+      if (localGlobals.has(key)) return localGlobals.delete(key);
+      return Reflect.deleteProperty(target, key);
+    }, has(target, key) { return localGlobals.has(key) || Reflect.has(target, key); } });
     return { ...overrides, window: scopedWindow, self: scopedWindow, globalThis: scopedWindow };
   }
   return {
@@ -138,6 +174,7 @@ export function createViewExecutionScope(options: {
     dispose() {
       if (controller.signal.aborted) return;
       controller.abort();
+      localGlobals.clear();
       for (const cancel of timers.values()) cancel(); timers.clear();
       for (const cancel of frames.values()) cancel(); frames.clear();
       for (const dispose of [...disposers]) {

@@ -1,7 +1,10 @@
 import { toRaw } from "vue";
+import { createPropertyReadCoordinator } from "./propertyReadCoordinator";
+import { createPropertyEditQueue, isCoalesciblePropertyValue } from "./propertyEditQueue";
+import { unityPropertyTargetKey } from "./unityPropertyPath";
 import { createUnityPropertyRuntime, type UnityBoundPropertyRuntimeOptions, type UnityBoundPropertyTree, type UnityPropertyPathInput } from "../components/unity/unityPropertyBinding";
 import { applyYamlProperties, applyYamlPropertySummary, readYamlProperty, discoverYamlProperties } from "./unityYamlProperty";
-import { applyUnitySerializedProperties, discoverUnitySerializedProperties, readUnitySerializedProperty, writeUnitySerializedProperty,
+import { applyUnitySerializedProperties, discoverUnitySerializedProperties, readUnitySerializedProperties, readUnitySerializedProperty, writeUnitySerializedProperty,
   type UnitySerializedPropertyBackend, type UnitySerializedPropertyReadRequest, type UnitySerializedPropertyReadResult,
   type UnitySerializedPropertyDiscoverRequest, type UnitySerializedPropertyDiscoverResult, type UnitySerializedPropertyWriteRequest,
   type UnitySerializedPropertyWriteResult, type UnitySerializedPropertyApplyRequest, type UnitySerializedPropertyApplyResult,
@@ -33,6 +36,12 @@ export interface UnityPropertyApi {
 export function createUnityPropertyApi(workspaceRef: WorkspaceRef, options: { backend?: UnitySerializedPropertyBackend; signal?: AbortSignal } = {}): UnityPropertyApi {
   const workspace = Object.freeze({ ...workspaceRef });
   const mode = options.backend ?? "live";
+  const reads = createPropertyReadCoordinator<UnitySerializedPropertyReadResult>(
+    request => mode === "yaml" ? readYamlProperty(workspace, request) : readUnitySerializedProperty(workspace, request),
+    mode === "live" ? requests => readUnitySerializedProperties(workspace, requests) : undefined,
+  );
+  function invalidateReads() { reads.invalidate(); }
+  options.signal?.addEventListener("abort", () => reads.dispose(), { once: true });
   if (mode !== "yaml" && mode !== "live") throw new Error("Property backend must be yaml or live.");
   function active() {
     if (options.signal?.aborted) throw new Error("Frontend execution was cancelled.");
@@ -41,18 +50,21 @@ export function createUnityPropertyApi(workspaceRef: WorkspaceRef, options: { ba
   function apply(request: UnityYamlPropertySummaryRequest): Promise<UnityYamlPropertySummaryResult>;
   async function apply(request: UnitySerializedPropertyApplyRequest | UnityYamlPropertySummaryRequest): Promise<UnitySerializedPropertyApplyResult | UnityYamlPropertySummaryResult> {
     active();
-    if (request.resultMode === "summary") {
-      if (mode !== "yaml") throw new Error("Summary results require the YAML property backend.");
-      return applyYamlPropertySummary(workspace, request, options.signal);
-    }
-    return mode === "yaml" ? applyYamlProperties(workspace, request, options.signal) : applyUnitySerializedProperties(workspace, request);
+    invalidateReads();
+    try {
+      if (request.resultMode === "summary") {
+        if (mode !== "yaml") throw new Error("Summary results require the YAML property backend.");
+        return await applyYamlPropertySummary(workspace, request, options.signal);
+      }
+      return await (mode === "yaml" ? applyYamlProperties(workspace, request, options.signal) : applyUnitySerializedProperties(workspace, request));
+    } finally { invalidateReads(); }
   }
   const api: UnityPropertyApi = {
     mode,
     backend: (backend) => createUnityPropertyApi(workspace, { ...options, backend }),
     async read(request) {
       active();
-      return mode === "yaml" ? readYamlProperty(workspace, request) : readUnitySerializedProperty(workspace, request);
+      return reads.read(request);
     },
     async discover(request) {
       active();
@@ -61,8 +73,11 @@ export function createUnityPropertyApi(workspaceRef: WorkspaceRef, options: { ba
     },
     async write(request) {
       active();
-      if (mode === "live") return writeUnitySerializedProperty(workspace, request);
-      return (await applyYamlProperties(workspace, { writes: [request] }, options.signal)).results[0]!;
+      invalidateReads();
+      try {
+        if (mode === "live") return await writeUnitySerializedProperty(workspace, request);
+        return (await applyYamlProperties(workspace, { writes: [request] }, options.signal)).results[0]!;
+      } finally { invalidateReads(); }
     },
     apply,
     async readTree(target, treeOptions) {
@@ -72,9 +87,14 @@ export function createUnityPropertyApi(workspaceRef: WorkspaceRef, options: { ba
       let revision: string | undefined;
       let dependencies: Record<string, string> | undefined;
       let rootPath: string | undefined;
+      const edits = createPropertyEditQueue();
+      let writeFailed = false;
+      let contentEpoch = 0;
       const runtime = createUnityPropertyRuntime({
         read: async (request) => {
+          const epoch = contentEpoch;
           const result = await api.read(request);
+          if (epoch !== contentEpoch) return { ...result, stale: true };
           const path = request.target.propertyPath ?? "";
           const dependencyChanged = dependencies && (Object.keys(dependencies).length !== Object.keys(result.dependencies ?? {}).length
             || Object.entries(dependencies).some(([path, version]) => result.dependencies?.[path] !== version));
@@ -84,22 +104,40 @@ export function createUnityPropertyApi(workspaceRef: WorkspaceRef, options: { ba
           rootPath ??= path;
           revision = result.revision;
           dependencies = result.dependencies;
+          if (path === rootPath && !(request.arrayOffset ?? 0)) writeFailed = false;
           return result;
         },
-        write: async (request) => {
+        write: async (request, writeOptions) => {
           active();
           if (mode === "yaml" && request.writeMode === "preview") {
             // The number editor already renders its drag value locally.
             return { ok: true, saved: false, message: "", target: request.target, propertyPath: request.target.propertyPath ?? "", value: request.value };
           }
-          const result = await api.write({ ...request, expectedRevision: revision, expectedDependencies: dependencies });
-          if (result.ok && result.saved) { revision = result.revision; dependencies = result.dependencies; }
-          return result;
+          return edits.enqueue(async () => {
+            active();
+            if (writeFailed) throw new Error("A previous property write failed; refresh the tree before retrying.");
+            ++contentEpoch;
+            try {
+              const result = await api.write({ ...request, expectedRevision: revision, expectedDependencies: dependencies });
+              if (!result.ok) throw new Error(result.message || "Property write failed.");
+              if (result.saved) { revision = result.revision; dependencies = result.dependencies; }
+              return result;
+            } catch (error) { writeFailed = true; throw error; }
+            finally { ++contentEpoch; }
+          }, writeOptions?.coalesce !== false && isCoalesciblePropertyValue(request.value) ? `${unityPropertyTargetKey(request.target)}|${request.writeMode ?? "commit"}` : undefined);
         },
         apply: async (request) => {
-          const result = await api.apply({ writes: request.writes.map((write) => ({ ...write, expectedRevision: revision, expectedDependencies: dependencies })) });
-          if (result.ok) { revision = result.results[0]?.revision ?? revision; dependencies = result.results[0]?.dependencies ?? dependencies; }
-          return result;
+          return edits.enqueue(async () => {
+            if (writeFailed) throw new Error("A previous property write failed; refresh the tree before retrying.");
+            ++contentEpoch;
+            try {
+              const result = await api.apply({ writes: request.writes.map((write) => ({ ...write, expectedRevision: revision, expectedDependencies: dependencies })) });
+              if (!result.ok) throw new Error(result.message || "Property batch failed.");
+              revision = result.results[0]?.revision ?? revision; dependencies = result.results[0]?.dependencies ?? dependencies;
+              return result;
+            } catch (error) { writeFailed = true; throw error; }
+            finally { ++contentEpoch; }
+          });
         },
       });
       return runtime.readTree(target, treeOptions);

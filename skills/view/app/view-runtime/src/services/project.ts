@@ -30,6 +30,7 @@ export function appendMaterializationEpoch(params: URLSearchParams, epoch: numbe
 }
 
 export interface WorkspaceRuntimeDescriptor {
+  knowledgeEnabled?: boolean;
   projectId: string;
   checkoutId: string;
   root: string;
@@ -82,6 +83,7 @@ export interface WorkspaceServiceStateSnapshot {
 }
 
 export interface WorkspaceCheckoutDescriptor {
+  knowledgeEnabled?: boolean;
   checkoutId: string;
   projectId: string;
   root: string;
@@ -95,6 +97,11 @@ export interface ProjectContextDescriptor {
   projectId: string;
   detectedServices: string[];
   checkouts: WorkspaceCheckoutDescriptor[];
+}
+
+export function projectKnowledgeEnabled(project: ProjectContextDescriptor | undefined): boolean {
+  return !project || project.checkouts.some(checkout => checkout.available !== false
+    && (checkout.knowledgeEnabled ?? checkout.runtime?.knowledgeEnabled ?? true));
 }
 
 export interface WindowPaneWorkspaceContext {
@@ -167,6 +174,21 @@ export function listWorkspaceRuntimes(): Promise<WorkspaceRuntimeDescriptor[]> {
 
 export function openWorkspace(path: string): Promise<WorkspaceRuntimeDescriptor> {
   return ipcInvoke<WorkspaceRuntimeDescriptor>("open_workspace", { path });
+}
+
+export interface WorkspaceSetup {
+  isUnityProject: boolean;
+  knowledgeEnabled: boolean;
+  unityTestToolsEnabled: boolean;
+  extraWorkdirs?: import("./extraWorkdirs").ExtraWorkdirStatus[];
+}
+
+export function inspectWorkspaceSetup(path: string): Promise<WorkspaceSetup> {
+  return ipcInvoke("inspect_workspace_setup", { path });
+}
+
+export function saveWorkspaceSetup(path: string, setup: WorkspaceSetup): Promise<WorkspaceSetup> {
+  return ipcInvoke("save_workspace_setup", { path, setup });
 }
 
 export function removeWorkspace(projectId: string): Promise<boolean> {

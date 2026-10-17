@@ -19,8 +19,8 @@ import { registerNativeViewHost } from "./viewHostRegistry";
 import { acquireViewEditorState } from "./viewEditorState";
 import { getFrontendWorkbench } from "../../services/frontendWorkbench";
 
-const props = withDefaults(defineProps<{ viewId: string; workspaceRef: WorkspaceRef; instanceId: string; active?: boolean; windowLabel?: string; ownerWindow?: Window }>(), { active: true, windowLabel: "main" });
-const emit = defineEmits<{ activate: []; ready: [] }>();
+const props = withDefaults(defineProps<{ viewId: string; workspaceRef: WorkspaceRef; instanceId: string; active?: boolean; windowLabel?: string; ownerWindow?: Window; binding?: Readonly<Record<string, unknown>> }>(), { active: true, windowLabel: "main" });
+const emit = defineEmits<{ activate: []; ready: []; failed: [message: string]; 'icon-change': [icon: string | null]; 'title-change': [title: string] }>();
 const root = ref<HTMLElement | null>(null);
 const detail = shallowRef<ViewPackageDetail | null>(null);
 const runtimeComponent = shallowRef<Component | null>(null);
@@ -79,7 +79,7 @@ function applyStyles(compiled: CompiledViewPackage) {
   if (!style) { const owner = root.value?.ownerDocument ?? props.ownerWindow?.document ?? document; style = owner.createElement("style"); style.dataset.locusViewInstance = props.instanceId; owner.head.appendChild(style); }
   style.textContent = [...compiled.styles, ...Object.values(compiled.modules).flatMap((module) => module.styles)].join("\n");
 }
-async function reload(): Promise<void> {
+async function reload(options: { force?: boolean } = {}): Promise<void> {
   const requested = ++revision;
   stale = true;
   if (!props.active && runtimeComponent.value) return;
@@ -91,16 +91,18 @@ async function reload(): Promise<void> {
     try {
       const next = await viewRead(workspaceRef, viewId);
       if (disposed || requested !== revision) return;
+      emit("icon-change", next.manifest.icon ?? null);
+      emit("title-change", next.manifest.name);
       if (viewRequiresUnityConnection(next.manifest) && !(await checkUnityConnectionStatus(workspaceRef)).connected) throw new Error(t("view.host.unityConnectionRequired"));
       const compiled = await compileViewPackage(next);
       if (disposed || requested !== revision) return;
-      if (compilation.value?.scriptKey === compiled.scriptKey && runtimeComponent.value) {
+      if (!options.force && compilation.value?.scriptKey === compiled.scriptKey && runtimeComponent.value) {
         compilation.value = compiled; detail.value = next; applyStyles(compiled); stale = false; error.value = ""; return;
       }
-      candidate = createViewExecutionScope({ viewId, editorId: props.instanceId, windowLabel: props.windowLabel, ownerWindow: props.ownerWindow ?? root.value?.ownerDocument.defaultView ?? window, workspaceRef, active, state, log: (level, args) => log(workspaceRef, viewId, level, args) });
+      candidate = createViewExecutionScope({ viewId, editorId: props.instanceId, windowLabel: props.windowLabel, ownerWindow: props.ownerWindow ?? root.value?.ownerDocument.defaultView ?? window, workspaceRef, binding: props.binding, active, state, log: (level, args) => log(workspaceRef, viewId, level, args) });
       const api = createViewHostApi({ viewId, workspaceRef, scope: candidate, title: () => next.manifest.name, reload });
       const component = createViewRuntimeComponent({ detail: next, api, compilation: compiled, scope: candidate, onError: (failure) => {
-        error.value = normalizeAppError(failure).message; log(workspaceRef, viewId, "error", [failure]);
+        error.value = normalizeAppError(failure).message; emit("failed", error.value); log(workspaceRef, viewId, "error", [failure]);
       } });
       if (disposed || requested !== revision) { candidate.dispose(); return; }
       const previous = execution;
@@ -112,7 +114,7 @@ async function reload(): Promise<void> {
     } catch (failure) {
       candidate?.dispose();
       if (disposed || requested !== revision) return;
-      error.value = normalizeAppError(failure).message; log(workspaceRef, viewId, "error", [failure]);
+      error.value = normalizeAppError(failure).message; emit("failed", error.value); log(workspaceRef, viewId, "error", [failure]);
     } finally { if (requested === revision) loading.value = false; }
   })();
   pending = task;
@@ -135,7 +137,7 @@ defineExpose({ ensureMounted, reload, exportState, restoreState });
 async function attachWatcher() {
   const attachment = ++watcherRevision;
   watcherRelease?.(); watcherRelease = null;
-  if (!hasTauriWindowRuntime()) return;
+  if (!hasTauriWindowRuntime() && getLocusRuntime().kind !== "unity") return;
   const workspaceRef = { ...props.workspaceRef };
   const viewId = props.viewId;
   const hostLabel = props.windowLabel || getCurrentWindow().label;
@@ -163,6 +165,7 @@ function registerHost() {
   });
 }
 watch(() => [props.viewId, props.workspaceRef.checkoutId, props.workspaceRef.expectedGeneration, props.workspaceRef.expectedMaterializationEpoch], () => {
+  emit("icon-change", null);
   ++revision; execution?.dispose(); execution = null; compilation.value = null; runtimeComponent.value = null; detail.value = null;
   stateOwner.release(); stateOwner = acquireViewEditorState(stateKey()); state = stateOwner.state;
   registerHost(); void attachWatcher().catch((failure) => { error.value = normalizeAppError(failure).message; }); void reload();
@@ -171,11 +174,25 @@ watch(active, (visible) => { if (visible && stale) void ensureMounted(); });
 onMounted(async () => {
   registerHost();
   try {
-    const release = await getLocusRuntime().subscribe<RoutedWorkspaceEvent<{ id?: string }>>(WORKSPACE_EVENT_NAME, (event) => {
-      if (event.eventName === "view-package-reloaded" && event.payload.id === props.viewId && matches(props.workspaceRef, event)) scheduleReload();
+    const release = await getLocusRuntime().subscribe<RoutedWorkspaceEvent<{ id?: string; name?: string; icon?: string | null }>>(WORKSPACE_EVENT_NAME, (event) => {
+      if (event.eventName === "view-package-reloaded" && event.payload.id === props.viewId && matches(props.workspaceRef, event)) {
+        emit("icon-change", event.payload.icon ?? null);
+        if (event.payload.name) emit("title-change", event.payload.name);
+        scheduleReload();
+      }
     }, { owner: "ViewRuntimeHost.reload", signal: lifetime });
     if (lifetime.aborted) release(); else lifetime.addEventListener("abort", release, { once: true });
     await attachWatcher();
+    // Restored background tabs need their icon before the View is activated.
+    // Read metadata without compiling or executing the inactive View.
+    if (!disposed && !props.active) {
+      const requested = revision;
+      const next = await viewRead({ ...props.workspaceRef }, props.viewId);
+      if (!disposed && requested === revision) {
+        emit("icon-change", next.manifest.icon ?? null);
+        emit("title-change", next.manifest.name);
+      }
+    }
   } catch (failure) { error.value = normalizeAppError(failure).message; }
   if (!disposed && props.active) await ensureMounted();
 });

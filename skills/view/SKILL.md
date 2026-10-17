@@ -19,6 +19,7 @@ All operations use the skill-loaded `execute_typescript` tool, which executes Ty
 2. Create the package with `locus.views.create()`.
    - Use lowercase kebab-case file names, for example `asset-panel.vue`. `id` can be omitted when `fileName` is supplied. Alternatively, supply `id` and Locus names the file `<id>.vue`.
    - A component View contains one root `.vue` file in its own `packageRoot`, with no `view.json`, `main.ts`, independent CSS or workspace scaffold. Optional metadata goes in a leading `<view>` JSON block (see `frontend-sdk.md`); omit the whole block when defaults suffice. `name`, `icon`, `displayPath` and `unity` creation options are written into that block only when supplied.
+   - `icon` accepts any bundled Lucide name (for example `Swords` or `alarm-clock`) or an inline SVG string. Use `viewBox` and `currentColor` for custom SVG icons; see `frontend-sdk.md` for the supported static SVG subset and size limit.
    - Omit `component` to initialize a minimal empty Vue file and write the implementation afterwards. Optional `directories`, for example `["src/components", "unity"]`, create only those directories inside `packageRoot`. There is no template parameter or template catalog.
    - Set `temporary: true` for one-off display Views. They are written under the app temp directory, stay out of `Locus/View` and `locus.views.list()`, and the requested id gains a unique suffix — use the returned id everywhere afterwards.
    - `displayPath` only changes the user-visible View tree path. `packageName` picks the workspace folder under `Locus/View` and defaults to the Unity project name.
@@ -36,6 +37,8 @@ All operations use the skill-loaded `execute_typescript` tool, which executes Ty
    - Exported runtime sources under this skill package's `app/view-runtime/src/`: exact component props, graph/canvas data shapes, and release behavior.
    - Locus application sources: only present in a development checkout. Installed releases do not ship them, so never depend on them from package code or instructions.
 
+   For Markdown-backed tables, boards and editors, use `documents` from `@locus/view-runtime` (also `locus.documents`). Use workspace/Knowledge references, read properties and body, and save with the returned revision. Keep business data in the original documents. See `frontend-sdk.md` → Markdown documents for discovery, typed edits and lifecycle-managed change notifications; do not implement frontmatter writes using raw `fs.writeFile` or persist a second editable copy in View storage.
+
    Typical starting imports:
 
 ```ts
@@ -44,7 +47,11 @@ import { UnitySerializedPropertyTree, GraphView } from "@locus/components";
 ```
 
 5. Use the right runtime path for Unity data.
+   - Default for configuration pages: `UnityPropertyScope :target="resolvedTarget"` containing `UnityPropertyField path="serialized.path"`. Display bindings are the demand declaration; do not maintain a second field list, fetch in each component, or implement a private cache/queue. Custom controls use the field slot or `useUnityPropertyBinding`. Locus owns object-level value caching, static Schema, compact Live snapshots, incremental receipts, invalidation and local drafts. Pass project read-only/Play Mode constraints through the scope. See `components.md` → Component-driven Unity data.
+   - Custom setters must invalidate the affected target with `property.invalidate(target)`; use `tree.refresh()` when an authoritative reread is required. Do not replace the default writer with raw YAML, discard Undo, or save/import after every keystroke. A Live `applied` receipt is not disk `persisted` completion.
+   - Keep TypeScript/C# for domain queries and semantic guards that cannot be inferred from serialized fields; do not bypass those checks when migrating to default fields.
    - `SerializedProperty` editing from package code: `property.fromPath("asset/<assetPath>/property/<propertyPath>")` — also `selection/…`, `guid/<assetGuid>/…`, `scene/…`, and `prefab/…` path forms — then `tree.drawDefaultEditor()`, `tree.require(path).draw()`, `property.write(target, value)`, or batched `property.apply([...])`.
+   - For existing bound-tree forms, use `tree.require(path).drawDefaultEditor()` / `.write(value)`. Bound scalar edits keep local drafts, merge authoritative receipts and preserve the mounted controls; `tree.pending` and `tree.error` are status, not reasons to disable the form. Do not add a `saving` guard that drops edits, change component keys per commit, or reread a whole page after each scalar change. See `runtime-api.md` → Continuous property editing for conflict/Undo behavior.
    - Unknown property paths: `locus.unity.property.discover()` before hardcoding any path. Agent-side spot checks and one-off fixes: `locus.unity.property.read()`, `.write()`, `.apply()`.
    - Custom property rendering: `propertyDrawer.registerValue/registerField/registerAttribute/registerPropertyPath/register`, passed as `propertyDrawers` into `UnitySerializedPropertyTree`, `UnityPropertyDraw`, or `UnityObjectPreview`. Whole-object rendering: `unityObjectDrawer.register(...)`, passed as `objectDrawers` into `UnityObjectPreview`. App-wide drawers (affecting chat fences and the Locus Inspector, not just this View) ship as plugin drawer packages instead — see `runtime-api.md` "Plugin Drawer Packages".
    - Custom Unity logic: declare the C# file in `<view>` `scripts[]` (or legacy `view.json`), then call it with `view.callScript` from package code or `locus.views.compileScript()` + `locus.views.callScript()` from the agent.

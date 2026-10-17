@@ -87,6 +87,19 @@ export interface WorkspaceSceneObjectSearchResult {
   matchScore: number;
 }
 
+/** Search the editor's loaded authoring scenes, including open SubScenes. */
+export function searchLoadedSceneObjects(
+  query: string,
+  limit: number,
+  workspaceRef: WorkspaceRef,
+): Promise<WorkspaceSceneObjectSearchResult[]> {
+  return ipcInvoke<WorkspaceSceneObjectSearchResult[]>("search_workspace_scene_objects", {
+    query,
+    limit,
+    workspaceRef,
+  });
+}
+
 export function searchWorkspaceSceneObjects(
   scenePath: string,
   query: string,

@@ -509,6 +509,8 @@ struct RestartUnityEditorParams {
     timeout_ms: Option<u64>,
     #[serde(default)]
     force: bool,
+    #[serde(skip)]
+    recovery_process: Option<(u32, u64)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -802,6 +804,9 @@ async fn codex_model_values(
                     config.base_url.as_deref(),
                     &cache_dir,
                     false,
+                    crate::commands::load_codex_model_config()
+                        .unwrap_or_default()
+                        .auto_update_client_version,
                 )
                 .await
                 {
@@ -1093,6 +1098,8 @@ impl SdkAgentSpec {
             env_template: String::new(),
             tools,
             sub_agents: self.sub_agents.clone(),
+            delegatable: true,
+            default_project_types: Vec::new(),
             default: false,
             default_effort: self.default_effort.clone(),
             model_recommendation: self.model_recommendation.clone(),
@@ -1322,13 +1329,26 @@ async fn resolve_prompt_model(
             }
         }
     }
-    if let Ok(model) = crate::commands::get_last_model(app.clone()).await {
-        if let Some(model) = nonempty(Some(model)) {
+    // Same order as a new chat: a pinned main model, then the project's
+    // remembered choice, then the most recent choice anywhere.
+    if let Ok(defaults) = crate::commands::get_model_defaults(app.clone()).await {
+        if let Some(model) = nonempty(Some(defaults.main_model)) {
             return Ok(model);
         }
     }
-    if let Ok(defaults) = crate::commands::get_model_defaults(app.clone()).await {
-        if let Some(model) = nonempty(Some(defaults.main_model)) {
+    if let Some(scope) = params.workspace_ref.as_ref().and_then(|workspace_ref| {
+        app.state::<Arc<crate::workspace_service::ProjectRegistry>>()
+            .resolve_workspace_ref(workspace_ref)
+            .ok()
+    }) {
+        if let Some(model) =
+            crate::commands::remembered_model_for_project(scope.runtime().project_id().as_str())
+        {
+            return Ok(model);
+        }
+    }
+    if let Ok(model) = crate::commands::get_last_model(app.clone()).await {
+        if let Some(model) = nonempty(Some(model)) {
             return Ok(model);
         }
     }
@@ -2041,6 +2061,17 @@ async fn ensure_unity_editor(
     }
 }
 
+pub(crate) async fn restart_unresponsive_unity_editor(
+    app: &AppHandle, workspace_ref: crate::workspace_service::WorkspaceRef,
+    process_id: u32, created_at_ms: u64,
+) -> Result<(), String> {
+    restart_unity_editor(app, RestartUnityEditorParams {
+        target: UnityTargetParams { project: None, workspace_ref: Some(workspace_ref) },
+        mode: None, wait_until: Some("connected".to_string()), timeout_ms: Some(180_000),
+        force: true, recovery_process: Some((process_id, created_at_ms)),
+    }).await.map(|_| ())
+}
+
 async fn restart_unity_editor(
     app: &AppHandle,
     params: RestartUnityEditorParams,
@@ -2048,7 +2079,7 @@ async fn restart_unity_editor(
     use crate::workspace_service::ServiceKind;
 
     let target = UnityEnsureTarget::parse(params.wait_until.as_deref())?;
-    let launch_mode = crate::unity_bridge::UnityLaunchMode::parse(params.mode.as_deref())?;
+    let mut launch_mode = crate::unity_bridge::UnityLaunchMode::parse(params.mode.as_deref())?;
     let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_UNITY_ENSURE_TIMEOUT_MS);
     if timeout_ms == 0 || timeout_ms > MAX_UNITY_ENSURE_TIMEOUT_MS {
         return Err(format!(
@@ -2084,9 +2115,24 @@ async fn restart_unity_editor(
         .map_err(|error| format!("unity.editor.restart Unity service is unavailable: {error}"))?;
 
     let project_path = runtime.root().to_string_lossy().to_string();
+    if let Some((pid, created)) = params.recovery_process {
+        let state = crate::unity_bridge::unity_semantic_state(&project_path).await;
+        if !state.can_restart_process(pid, created) {
+            return Err("Unity is no longer the unresponsive process that was confirmed; refresh its status".to_string());
+        }
+        let connection = crate::unity_bridge::query_unity_connection_status(&project_path).await;
+        launch_mode = if connection.headless { crate::unity_bridge::UnityLaunchMode::Headless } else { crate::unity_bridge::UnityLaunchMode::Interactive };
+        // Requests still waiting on the hung Editor (agent tool calls) end
+        // now, carrying the hang diagnosis, instead of reattaching to the
+        // replacement Editor or hanging until their own timeouts.
+        crate::unity_bridge::hang_diagnosis::interrupt_requests_for_user_restart(&project_path, pid)
+            .await;
+    }
     let close_timeout = deadline.saturating_duration_since(tokio::time::Instant::now())
         .min(Duration::from_secs(60));
-    let close = if params.force {
+    let close = if let Some((pid, created)) = params.recovery_process {
+        crate::unity_bridge::force_close_editor_identity(&project_path, pid, created, close_timeout).await
+    } else if params.force {
         crate::unity_bridge::force_close_current_project_unity_processes(
             &project_path,
             close_timeout,
@@ -2735,6 +2781,7 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
         runtime_state: Some(Arc::new(ToolRuntimeState::default())),
         cancel_rx: None,
         progress: None,
+        tool_progress: None,
         output: None,
         output_path: None,
         background: false,
@@ -2831,6 +2878,17 @@ pub(crate) async fn wake_session_for_agent_message(app: &AppHandle, session_id: 
 }
 
 async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value, String> {
+    if let Some(action) = method.strip_prefix("captures.") {
+        let reference = serde_json::from_value(params.get("workspaceRef").cloned().ok_or("Capture APIs require workspaceRef")?).map_err(|e|e.to_string())?;
+        let scope = resolve_sdk_workspace_scope(app, &reference, method)?;
+        let id = params["captureId"].as_str().filter(|s|s.len()<=64).ok_or("captureId is required")?;
+        let session = params["sessionId"].as_str().ok_or("Capture APIs require the current sessionId")?;
+        return app.state::<Arc<SessionStore>>().capture_query(id, &scope.runtime().checkout_id().to_string(), session, action, &params);
+    }
+    if method == "views.native.open" {
+        let reference = serde_json::from_value(params.get("workspaceRef").cloned().ok_or("workspaceRef is required")?).map_err(|e|e.to_string())?;
+        return serde_json::to_value(crate::native_view::open(app, reference, params["viewId"].as_str().ok_or("viewId is required")?).await?).map_err(|e|e.to_string());
+    }
     if let Some(action) = method.strip_prefix("csv.") {
         return csv::dispatch(app, action, params).await;
     }
@@ -3013,7 +3071,9 @@ async fn handle_request_inner(
         Err(error) => return json_response(&rpc_error(Value::Null, -32700, error.to_string())),
     };
     let id = rpc.id.clone();
-    let response = match dispatch(&app, &rpc.method, rpc.params).await {
+    // Keep the RPC state machine out of Hyper's service/connection futures.
+    // This is one allocation per request, not one allocation per poll.
+    let response = match Box::pin(dispatch(&app, &rpc.method, rpc.params)).await {
         Ok(result) => rpc_success(id, result),
         Err(error) => {
             let code = if error.starts_with("Unknown SDK method") {
@@ -3082,6 +3142,17 @@ pub async fn start(app: AppHandle) -> Result<SocketAddr, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sdk_http_future_stays_small() {
+        fn size<A, F: std::future::Future>(_: impl FnOnce(A) -> F) -> usize {
+            std::mem::size_of::<F>()
+        }
+        // Type-only measurement: no application, socket or request is created.
+        let handler = size(|(request, app, token)| super::handle_request(request, app, token));
+        println!("SDK_HTTP_FUTURE_BYTES {handler}");
+        assert!(handler < 16 * 1024, "HTTP future grew to {handler} bytes");
+    }
+
     #[test]
     fn direct_frontend_dispatcher_does_not_hold_outer_workspace_gate() {
         for enabled in [true, false] {

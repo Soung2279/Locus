@@ -23,6 +23,8 @@ const props = defineProps<{
   scrollElement: HTMLElement | null;
   loadPreview?: (messageId: string) => Promise<SessionTurnPreview | null>;
   loadTurn?: (messageId: string) => Promise<boolean>;
+  /** Whether the host shows the transcript; omitted means shown. */
+  presented?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -71,6 +73,13 @@ const remainingPreviewImageCount = computed(() => Math.max(
 ));
 const canShow = computed(() =>
   hasLeftGutter.value && visibleItems.value.length > 0);
+// The entrance animation marks a rail that appears in a transcript the user is
+// already looking at. A rail shown with its surface (a session switch remounts
+// the chat view) is part of that surface's first frame and must not fade in.
+const animateEnter = ref(false);
+let initialLayoutPending = true;
+let initialLayoutFrame = 0;
+let measuringForPresentation = false;
 
 let connectedScrollElement: HTMLElement | null = null;
 let contentResizeObserver: ResizeObserver | null = null;
@@ -177,6 +186,29 @@ function measureLayout() {
   updateActiveItems();
   scheduleTooltipPosition();
   void nextTick(updateListOverflow);
+  if (initialLayoutPending && !initialLayoutFrame) {
+    initialLayoutFrame = requestFrame(() => {
+      initialLayoutFrame = 0;
+      initialLayoutPending = false;
+    });
+  }
+}
+
+/**
+ * Measures synchronously. The chat view calls this right after it aligned the
+ * transcript viewport, while layout is clean, so the rail and its active turn
+ * are part of the same frame as the transcript.
+ */
+function measureNow(scrollElement: HTMLElement | null) {
+  if (!scrollElement) return;
+  if (connectedScrollElement !== scrollElement) connect(scrollElement);
+  cancelFrame(layoutFrame);
+  measuringForPresentation = true;
+  try {
+    measureLayout();
+  } finally {
+    measuringForPresentation = false;
+  }
 }
 
 function updateListOverflow() {
@@ -593,6 +625,12 @@ watch(
 );
 
 watch(canShow, (show) => {
+  if (show) {
+    animateEnter.value = props.presented !== false && !measuringForPresentation && !initialLayoutPending;
+  }
+}, { flush: "sync" });
+
+watch(canShow, (show) => {
   if (!show) {
     listOverflows.value = false;
     closePreview();
@@ -603,15 +641,19 @@ watch(canShow, (show) => {
 
 onBeforeUnmount(() => {
   disconnect();
+  cancelFrame(initialLayoutFrame);
   clearHoverTimer();
   clearCloseTimer();
 });
+
+defineExpose({ measureNow });
 </script>
 
 <template>
   <nav
     v-if="canShow"
     class="chat-turn-navigation-rail"
+    :class="{ 'is-entering': animateEnter }"
     :aria-label="t('chat.turnNavigation.ariaLabel')"
   >
     <div
@@ -709,6 +751,9 @@ onBeforeUnmount(() => {
   left: 12px;
   z-index: 20;
   transform: translateY(-50%);
+}
+
+.chat-turn-navigation-rail.is-entering {
   animation: chat-turn-navigation-enter 150ms cubic-bezier(0.23, 1, 0.32, 1);
 }
 
@@ -969,7 +1014,7 @@ onBeforeUnmount(() => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .chat-turn-navigation-rail {
+  .chat-turn-navigation-rail.is-entering {
     animation-duration: 0s;
   }
 

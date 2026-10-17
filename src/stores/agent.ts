@@ -3,8 +3,10 @@ import { defineStore } from "pinia";
 import * as agentService from "../services/agent";
 import type { AgentInfo } from "../types";
 import type { WorkspaceRef } from "../services/project";
+import { useSelectionMemoryStore } from "./selectionMemory";
 
 export const useAgentStore = defineStore("agent", () => {
+  const selectionMemory = useSelectionMemoryStore();
   const agents = ref<AgentInfo[]>([]);
   const subagents = ref<AgentInfo[]>([]);
   const appAgents = ref<AgentInfo[]>([]);
@@ -55,9 +57,7 @@ export const useAgentStore = defineStore("agent", () => {
       selectedAgentId.value = resolvedCurrent;
       return;
     }
-    const def = list.find((a) => a.isDefault);
-    if (def) selectedAgentId.value = def.id;
-    else if (list.length > 0) selectedAgentId.value = list[0].id;
+    resetToDefault();
   }
 
   async function loadWorkspaceAgents(workspaceRef: WorkspaceRef) {
@@ -68,6 +68,8 @@ export const useAgentStore = defineStore("agent", () => {
       const [list, subList] = await Promise.all([
         agentService.listWorkspaceAgents(workspaceRef),
         agentService.listWorkspaceSubagentDefs(workspaceRef),
+        // The remembered choice must be ready before a new session resolves.
+        selectionMemory.load(workspaceRef),
       ]);
       if (epoch !== agentLoadEpoch) return;
       agents.value = list;
@@ -82,8 +84,7 @@ export const useAgentStore = defineStore("agent", () => {
         selectedAgentId.value = resolvedCurrent;
         return;
       }
-      const fallback = list.find((agent) => agent.isDefault) ?? list[0];
-      selectedAgentId.value = fallback?.id ?? "";
+      resetToDefault();
     } catch (e) {
       console.error("list_workspace_agents failed:", e);
     }
@@ -100,10 +101,12 @@ export const useAgentStore = defineStore("agent", () => {
     selectedAgentId.value = resolveAgentId(id);
   }
 
-  function resetToDefault() {
-    const def = agents.value.find((a) => a.isDefault);
-    if (def) selectedAgentId.value = def.id;
-    else if (agents.value.length > 0) selectedAgentId.value = agents.value[0].id;
+  function resetToDefault(options: { forNewSession?: boolean } = {}) {
+    selectedAgentId.value = selectionMemory.resolveAgentId(
+      workspaceCheckoutId.value,
+      agents.value,
+      options,
+    );
   }
 
   return {

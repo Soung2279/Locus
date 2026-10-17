@@ -1,7 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch, watchPostEffect } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch, watchPostEffect } from "vue";
 import { t } from "../../i18n";
 import { useEmbeddedChatSession } from "../../composables/useEmbeddedChatSession";
+import { useWorkspaceNavigationMode } from "../../composables/useWorkspaceNavigationMode";
+import { readSharedComposerDraft } from "../../composables/chatComposerDraftMemory";
+import { provideSurfaceContentReadiness } from "../../composables/surfaceContentReadiness";
 import { useSkills } from "../../composables/useSkills";
 import { useKnowledgeAccessMode } from "../../composables/useKnowledgeAccessMode";
 import { useWorkspaceAssetDbStatus } from "../../composables/useWorkspaceAssetDbStatus";
@@ -15,6 +18,7 @@ import { useAuthStore } from "../../stores/auth";
 import { useChatChangesStore } from "../../stores/chatChanges";
 import { useModelStore } from "../../stores/model";
 import { useNotificationStore } from "../../stores/notification";
+import { useSelectionMemoryStore } from "../../stores/selectionMemory";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import type {
   AssetRefAttachment,
@@ -23,19 +27,24 @@ import type {
   ImageAttachment,
   KnowledgeDocumentType,
   SessionContextExportRequest,
+  SessionSummary,
   UserIntentMeta,
 } from "../../types";
-import type { WorkbenchEditorInput } from "../../types/workbench";
+import type { WorkbenchEditorInput, WorkbenchEditorTransferSnapshot } from "../../types/workbench";
 import ChatView from "../ChatView.vue";
 import ChatSidebarPanel from "../ChatSidebarPanel.vue";
 import ThinkingPanel from "../ThinkingPanel.vue";
+import SessionComposerPicker from "../chat/SessionComposerPicker.vue";
 
 const props = defineProps<{
   editor: WorkbenchEditorInput;
   workspaceRef: WorkspaceRef | null;
   selectWorktree?: (item: ManagedWorktree) => Promise<void>;
   workspaceChanging?: boolean;
+  sessions?: SessionSummary[];
   active?: boolean;
+  /** Whether the editor stack shows this surface (false while it is prepared behind another). */
+  presented?: boolean;
   referenceDropAvailable?: boolean;
   referenceDropActive?: boolean;
   shortcutActive?: boolean;
@@ -46,6 +55,7 @@ const emit = defineEmits<{
   (event: "session-unarchived", sessionId: string): void;
   (event: "ready"): void;
   (event: "session-created", payload: { editorId: string; sessionId: string }): void;
+  (event: "session-selected", payload: { editorId: string; sessionId: string }): void;
   (event: "new-session-requested", payload: {
     editorId: string;
     source: "control" | "shortcut";
@@ -78,8 +88,13 @@ const chatChangesStore = useChatChangesStore();
 const modelStore = useModelStore();
 const notificationStore = useNotificationStore();
 const workspaceContextStore = useWorkspaceContextStore();
+const workspaceNavigation = useWorkspaceNavigationMode();
+const showSessionPicker = computed(() => (
+  workspaceNavigation.getMode(props.workspaceRef?.checkoutId) === "files"
+));
 const { skillItems, loadSkills } = useSkills(() => props.workspaceRef);
 const { state: knowledgeAccessState } = useKnowledgeAccessMode();
+const selectionMemory = useSelectionMemoryStore();
 const chatViewRef = ref<InstanceType<typeof ChatView> | null>(null);
 
 const requestedSessionId = computed(() => (
@@ -88,23 +103,44 @@ const requestedSessionId = computed(() => (
     ? props.editor.resource.sessionId ?? null : null
 ));
 const sessionKey = computed(() => `workbench:${props.editor.editorId}`);
-const editorAgentId = ref(agentStore.selectedAgentId?.trim() ?? "");
-const editorModelId = ref(modelStore.selectedModelId);
-const editorEffort = ref<EffortLevel>(modelStore.effort);
-const editorFastMode = ref(modelStore.effectiveCodexFastMode);
+// Explicit values come from the user, the session, or a transferred tab. Until
+// then the tab follows the workspace's remembered choice, so it stays correct
+// while the workspace memory and model catalogs load.
+const editorAgentId = ref(requestedSessionId.value ? agentStore.selectedAgentId?.trim() ?? "" : "");
+const explicitModelId = ref<string | null>(null);
+const explicitEffort = ref<EffortLevel | null>(null);
+const explicitFastMode = ref<boolean | null>(null);
 const editorMultiAgentEnabled = ref(false);
 const selectedAgentId = computed(() => {
   const current = editorAgentId.value.trim();
   if (current && agentStore.agents.some((agent) => agent.id === current)) return current;
-  return agentStore.agents.find((agent) => agent.isDefault)?.id
-    ?? agentStore.agents[0]?.id
-    ?? "";
+  // Workspace catalogs load asynchronously. Do not pin the previous checkout's
+  // default through the embedded controller's execution-selection echo.
+  if (props.workspaceRef && agentStore.workspaceCheckoutId !== props.workspaceRef.checkoutId) return "";
+  return selectionMemory.resolveAgentId(
+    props.workspaceRef?.checkoutId,
+    agentStore.agents,
+    { forNewSession: !requestedSessionId.value },
+  );
 });
-const editorEfforts = computed<EffortLevel[]>(() => {
-  const model = modelStore.availableModels.find((candidate) => candidate.id === editorModelId.value);
-  if (model?.supportedEfforts?.length) return model.supportedEfforts;
-  if (editorModelId.value === modelStore.selectedModelId) return modelStore.availableEfforts;
-  return [];
+const selectedAgent = computed(() => agentStore.agents.find((agent) => agent.id === selectedAgentId.value) ?? null);
+const resolvedExecution = computed(() => selectionMemory.resolveExecution(
+  props.workspaceRef?.checkoutId,
+  selectedAgent.value ?? (selectedAgentId.value ? { id: selectedAgentId.value } : null),
+));
+const editorModelId = computed<string>({
+  get: () => explicitModelId.value ?? (resolvedExecution.value.modelId || modelStore.selectedModelId),
+  set: (modelId) => { explicitModelId.value = modelId; },
+});
+const editorEfforts = computed<EffortLevel[]>(() => modelStore.effortsForModel(editorModelId.value));
+const editorEffort = computed<EffortLevel>({
+  get: () => explicitEffort.value
+    ?? selectionMemory.clampEffort(editorModelId.value, resolvedExecution.value.effort),
+  set: (effort) => { explicitEffort.value = effort; },
+});
+const editorFastMode = computed<boolean>({
+  get: () => editorFastModeAvailable.value && (explicitFastMode.value ?? resolvedExecution.value.fastMode),
+  set: (enabled) => { explicitFastMode.value = enabled; },
 });
 const editorEffortSupported = computed(() => editorEfforts.value.length > 0);
 const editorFastModeAvailable = computed(() => {
@@ -182,6 +218,7 @@ const {
   pendingToolConfirms,
   queuedFollowUp,
   errorMessage,
+  errorNotificationHandled,
   isLoading,
   sessionId,
   currentRunId,
@@ -249,9 +286,37 @@ const {
   },
 });
 
+// The editor stack keeps the previous surface on screen until "ready". Content
+// still resolving a layout-changing value (unknown inline path statuses) holds
+// it, so the first presented frame is final. A stalled request never blocks
+// the switch for longer than the timeout.
+const CONTENT_READY_TIMEOUT_MS = 200;
+const contentReadiness = provideSurfaceContentReadiness();
+let contentReadyTimer: ReturnType<typeof setTimeout> | undefined;
+
+function clearContentReadyTimer(): void {
+  clearTimeout(contentReadyTimer);
+  contentReadyTimer = undefined;
+}
+
 watchPostEffect(() => {
-  if (!isLoading.value) emit("ready");
+  if (isLoading.value) return;
+  if (contentReadiness.pending.value > 0) {
+    contentReadyTimer ??= setTimeout(() => {
+      contentReadyTimer = undefined;
+      emit("ready");
+    }, CONTENT_READY_TIMEOUT_MS);
+    return;
+  }
+  clearContentReadyTimer();
+  emit("ready");
 });
+
+onBeforeUnmount(clearContentReadyTimer);
+
+// Restore before the input's controlled-value watcher can replace the cached text.
+const recoveredDraft = readSharedComposerDraft(sessionKey.value);
+if (!inputText.value && recoveredDraft) inputText.value = recoveredDraft.text;
 
 watch(restoredComposerDraft, async (draft) => {
   if (!draft) return;
@@ -322,15 +387,17 @@ watch(sessionId, (nextSessionId) => {
   });
 });
 
-watch(errorMessage, (message) => {
-  if (message) notificationStore.addNotice("error", message);
+watch([errorMessage, errorNotificationHandled], ([message, notified]) => {
+  if (message && !notified) notificationStore.addNotice("error", message);
 });
 
 watch(
   [sessionAgentId, sessionModelId, sessionEffort, sessionFastMode, sessionMultiAgentEnabled] as const,
   ([agentId, modelId, effort, fastMode, multiAgentEnabled]) => {
     if (agentId && agentStore.agents.some((agent) => agent.id === agentId)) editorAgentId.value = agentId;
-    if (modelId && modelStore.availableModels.some((model) => model.id === modelId)) editorModelId.value = modelId;
+    if (modelId) {
+      if (modelId.startsWith("claude_code/") || modelStore.availableModels.some((model) => model.id === modelId)) editorModelId.value = modelId;
+    }
     if (effort && editorEfforts.value.includes(effort)) editorEffort.value = effort;
     if (fastMode != null) editorFastMode.value = editorFastModeAvailable.value && fastMode;
     editorMultiAgentEnabled.value = multiAgentEnabled;
@@ -339,8 +406,22 @@ watch(
 );
 
 watch(editorFastModeAvailable, (available) => {
-  if (!available) editorFastMode.value = false;
+  if (!available && explicitFastMode.value) explicitFastMode.value = false;
 }, { immediate: true });
+
+watch(() => props.workspaceRef?.checkoutId, () => {
+  void selectionMemory.load(props.workspaceRef);
+}, { immediate: true });
+
+/** Records an explicit choice so the next session in this workspace starts with it. */
+function rememberEditorSelection(): void {
+  selectionMemory.remember(props.workspaceRef, {
+    agentId: selectedAgentId.value,
+    modelId: editorModelId.value,
+    effort: editorEffortSupported.value ? editorEffort.value : null,
+    fastMode: editorFastModeAvailable.value ? editorFastMode.value : null,
+  });
+}
 
 let executionStateSaveQueue = Promise.resolve();
 
@@ -422,11 +503,23 @@ function exportTransferSnapshot() {
   return {
     kind: "session" as const,
     composerDraft: chatViewRef.value?.exportComposerDraft() ?? null,
+    executionSelection: exportExecutionSelection(),
+    scrollState: chatViewRef.value?.exportWorkStateScroll() ?? null,
   };
 }
 
 function exportComposerDraft() {
   return chatViewRef.value?.exportComposerDraft() ?? null;
+}
+
+async function restoreWorkState(snapshot: WorkbenchEditorTransferSnapshot): Promise<boolean> {
+  if (snapshot.kind !== "session") return false;
+  await nextTick();
+  if (!chatViewRef.value) return false;
+  if (snapshot.composerDraft) await applyDraftPrefill(snapshot.composerDraft as Parameters<typeof applyDraftPrefill>[0]);
+  if (snapshot.executionSelection) applyExecutionSelection(snapshot.executionSelection);
+  if (snapshot.scrollState) chatViewRef.value.restoreWorkStateScroll(snapshot.scrollState);
+  return true;
 }
 
 function exportExecutionSelection() {
@@ -447,11 +540,17 @@ async function focusComposerInput(): Promise<void> {
 
 function handleSelectAgent(agentId: string): void {
   const agent = agentStore.agents.find((item) => item.id === agentId);
-  const fallbackEffort = modelStore.hasUserDefaultEffort
-    ? modelStore.defaultEffort
-    : (agent?.defaultEffort ?? "none");
+  const rememberedModel = selectionMemory.snapshotFor(props.workspaceRef?.checkoutId)?.memory.agents[agentId];
   editorAgentId.value = agentId;
-  if (editorEfforts.value.includes(fallbackEffort)) editorEffort.value = fallbackEffort;
+  if (!sessionId.value && (explicitModelId.value === null || rememberedModel)) {
+    // A new session switches to the model and effort this Agent last used here.
+    explicitModelId.value = null;
+    explicitEffort.value = null;
+  } else {
+    const fallbackEffort = selectionMemory.fallbackEffort(agent);
+    if (editorEfforts.value.includes(fallbackEffort)) editorEffort.value = fallbackEffort;
+  }
+  rememberEditorSelection();
 }
 
 function handleSelectModel(modelId: string): void {
@@ -462,17 +561,20 @@ function handleSelectModel(modelId: string): void {
   }
   if (!editorFastModeAvailable.value) editorFastMode.value = false;
   persistExecutionSelection();
+  rememberEditorSelection();
 }
 
 function handleSelectEffort(effort: EffortLevel): void {
   if (!editorEfforts.value.includes(effort)) return;
   editorEffort.value = effort;
   persistExecutionSelection();
+  rememberEditorSelection();
 }
 
 function handleSelectFastMode(enabled: boolean): void {
   editorFastMode.value = editorFastModeAvailable.value && enabled;
   persistExecutionSelection();
+  rememberEditorSelection();
 }
 
 function handleSelectMultiAgent(enabled: boolean): void {
@@ -540,6 +642,13 @@ function handleOpenKnowledgeDocument(
 function handleNewSessionRequest(request: { source: "control" | "shortcut" }): void {
   if (request.source !== "shortcut" || props.newChatShortcutAction !== "newTab") {
     resetSession();
+    editorAgentId.value = props.workspaceRef && agentStore.workspaceCheckoutId !== props.workspaceRef.checkoutId
+      ? ""
+      : selectionMemory.resolveAgentId(props.workspaceRef?.checkoutId, agentStore.agents);
+    // The new session follows the workspace's latest remembered choice.
+    explicitModelId.value = null;
+    explicitEffort.value = null;
+    explicitFastMode.value = null;
   }
   emit("new-session-requested", {
     editorId: props.editor.editorId,
@@ -554,6 +663,7 @@ defineExpose({
   appendComposerDraft,
   exportComposerDraft,
   exportTransferSnapshot,
+  restoreWorkState,
   focusComposerInput,
 });
 </script>
@@ -602,6 +712,7 @@ defineExpose({
     :sessions="[]"
     :active-session-id="sessionId"
     :active="active"
+    :presented="presented"
     :current-run-id="currentRunId"
     :is-viewing-subagent="!!parentSessionId"
     :pending-session-id="null"
@@ -673,7 +784,17 @@ defineExpose({
     @start-scan="startWorkspaceAssetScan"
     @install-plugin="installWorkspaceUnityPlugin"
     @launch-unity-project="launchWorkspaceUnity"
-    />
+    >
+      <template v-if="showSessionPicker" #session-picker>
+        <SessionComposerPicker
+          :sessions="sessions ?? []"
+          :active-session-id="sessionId"
+          :active="active"
+          :disabled="workspaceChanging"
+          @select-session="emit('session-selected', { editorId: editor.editorId, sessionId: $event })"
+        />
+      </template>
+    </ChatView>
     <ThinkingPanel
       v-if="showThinkingPanel"
       :text="thinkingPanelContent"

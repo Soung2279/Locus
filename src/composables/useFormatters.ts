@@ -21,8 +21,7 @@ export function formatSessionTime(ts: number): string {
   return d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-export function formatRelativeDate(ts: number): string {
-  const now = Date.now() / 1000;
+export function formatRelativeDate(ts: number, now = Date.now() / 1000): string {
   const diff = now - ts;
   if (diff < 60) return t("time.justNow");
   if (diff < 3600) return t("time.minutesAgo", String(Math.floor(diff / 60)));
@@ -31,4 +30,13 @@ export function formatRelativeDate(ts: number): string {
   if (diff < 2592000) return t("time.weeksAgo", String(Math.floor(diff / 604800)));
   const d = new Date(ts * 1000);
   return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+/** Workspace lists keep older updates in days instead of switching to calendar dates. */
+export function formatWorkspaceUpdatedTime(ts?: number, now = Date.now() / 1000): string {
+  if (!ts || !Number.isFinite(ts) || ts < 0) return "";
+  const elapsed = now - ts;
+  return elapsed >= 86400
+    ? t("time.daysAgo", String(Math.floor(elapsed / 86400)))
+    : formatRelativeDate(ts, now);
 }

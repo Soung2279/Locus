@@ -1732,7 +1732,7 @@ impl Default for WorkspacePreviewCache {
 const SCENE_OBJECT_SEARCH_DEFAULT_LIMIT: usize = 160;
 const SCENE_OBJECT_SEARCH_MAX_LIMIT: usize = 500;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceSceneObjectSearchResult {
     pub scene_path: String,
@@ -1857,18 +1857,53 @@ fn scene_object_search_score(query: &str, name: &str, full_path: &str) -> Option
 
 #[tauri::command]
 pub async fn search_workspace_scene_objects(
-    scene_path: String,
+    scene_path: Option<String>,
     query: String,
     limit: Option<usize>,
     workspace_ref: WorkspaceRef,
     project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<WorkspaceSceneObjectSearchResult>, AppError> {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let result_limit = limit
+        .unwrap_or(SCENE_OBJECT_SEARCH_DEFAULT_LIMIT)
+        .clamp(1, SCENE_OBJECT_SEARCH_MAX_LIMIT);
+    // Explicit paths retain the disk/YAML API. The composer searches live
+    // loaded scenes so unsaved edits and prefab children are included.
+    let Some(scene_path) = scene_path else {
+        let project_path = scope.root_string();
+        if !crate::unity_bridge::is_unity_project(&project_path) {
+            return Ok(Vec::new());
+        }
+        let payload = serde_json::json!({ "query": query, "limit": result_limit });
+        // This read must not wait behind the compilation/execution operation
+        // lock or a full editor-process/status probe on every keystroke.
+        let response = crate::unity_bridge::send_message_with_timeout(
+            &project_path,
+            "search_scene_objects",
+            &payload.to_string(),
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .map_err(|error| AppError::new("asset.scene_hierarchy.live", error))?;
+        if !response.ok {
+            return Err(AppError::new(
+                "asset.scene_hierarchy.live",
+                response.error.unwrap_or_else(|| "Scene search failed".into()),
+            ));
+        }
+        #[derive(Deserialize)]
+        struct SearchResponse {
+            results: Vec<WorkspaceSceneObjectSearchResult>,
+        }
+        return serde_json::from_str::<SearchResponse>(&response.message.unwrap_or_default())
+            .map(|response| response.results)
+            .map_err(|error| AppError::new("asset.scene_hierarchy.response", error.to_string()));
+    };
     let scene_path = scene_path.trim().replace('\\', "/");
     if !scene_path.to_ascii_lowercase().ends_with(".unity") {
         return Ok(Vec::new());
     }
 
-    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
     let preview_cache = Arc::clone(scope.resolved().runtime().core().asset_preview_cache());
     if scope.root().as_os_str().is_empty() {
         return Ok(Vec::new());
@@ -1909,9 +1944,6 @@ pub async fn search_workspace_scene_objects(
     };
 
     let query = query.trim().to_string();
-    let result_limit = limit
-        .unwrap_or(SCENE_OBJECT_SEARCH_DEFAULT_LIMIT)
-        .clamp(1, SCENE_OBJECT_SEARCH_MAX_LIMIT);
     let search_objects = objects.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut best_matches: BinaryHeap<Reverse<(i32, usize)>> =
@@ -1965,11 +1997,9 @@ pub async fn search_workspace_scene_objects(
 }
 
 /// Extension classifier. Returns the language identifier for known text
-/// extensions; `None` means "treat as binary or structured".
+/// extensions; `None` means try a specialized viewer, then sniff the content.
 ///
-/// Kept narrow on purpose — anything we don't recognize as text gets the
-/// binary/structured path. This avoids accidentally trying to render a 200MB
-/// FBX as utf-8.
+/// Unknown files are only read up to the snippet budget by the text fallback.
 fn text_language_for_ext(ext: &str) -> Option<&'static str> {
     match ext {
         "cs" => Some("csharp"),
@@ -2159,6 +2189,63 @@ fn read_text_snippet(path: &Path, focus_line: Option<u32>) -> Result<AssetTextPr
     })
 }
 
+/// Unknown extensions need content detection rather than a lossy UTF-8 read.
+/// Bound the read itself, including files containing one extremely long line.
+fn try_read_detected_text_snippet(path: &Path, focus_line: Option<u32>) -> Option<AssetTextPreview> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(TEXT_SNIPPET_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let mut truncated = bytes.len() > TEXT_SNIPPET_MAX_BYTES;
+    bytes.truncate(TEXT_SNIPPET_MAX_BYTES);
+    let decoded = super::text_preview::decode_text_preview(&bytes, truncated)?;
+    let lines: Vec<_> = decoded.text.lines().collect();
+    let requested_line = focus_line.unwrap_or(1).max(1);
+    let start_line = if requested_line > TEXT_SNIPPET_MAX_LINES as u32 / 2 {
+        requested_line.saturating_sub(50).max(1)
+    } else {
+        1
+    }
+    .min(lines.len().max(1) as u32);
+    let skipped = (start_line - 1) as usize;
+    truncated |= skipped > 0;
+    let mut snippet = String::new();
+    let mut emitted = 0;
+    for line in lines.iter().skip(skipped) {
+        if emitted == TEXT_SNIPPET_MAX_LINES {
+            truncated = true;
+            break;
+        }
+        if snippet.len() + line.len() + 1 > TEXT_SNIPPET_MAX_BYTES {
+            if emitted == 0 {
+                let mut end = (TEXT_SNIPPET_MAX_BYTES - 1).min(line.len());
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                snippet.push_str(&line[..end]);
+                snippet.push('\n');
+                emitted += 1;
+            }
+            truncated = true;
+            break;
+        }
+        snippet.push_str(line);
+        snippet.push('\n');
+        emitted += 1;
+    }
+    Some(AssetTextPreview {
+        snippet,
+        truncated,
+        total_lines: (skipped + emitted) as u32,
+        start_line,
+        language: None,
+    })
+}
+
 /// Build the binary-info stub payload for a file. Used for any non-text asset
 /// in Slice 3a until proper handlers replace it.
 fn build_binary_info_payload(
@@ -2334,17 +2421,21 @@ fn try_build_binary_rendered_payload(
 }
 
 /// Convenience: render-or-fallback. Tries the renderable binary path first
-/// and falls back to the metadata-only card if anything bails.
+/// then detects text before falling back to the metadata-only card.
 fn build_binary_payload(
     rel_path: &str,
     canonical: &Path,
     binary_cache: &BinaryCache,
     ref_graph_state: &AssetDbState,
+    focus_line: Option<u32>,
 ) -> AssetPreviewPayload {
     if let Some(rendered) =
         try_build_binary_rendered_payload(rel_path, canonical, binary_cache, ref_graph_state)
     {
         return rendered;
+    }
+    if let Some(preview) = try_read_detected_text_snippet(canonical, focus_line) {
+        return AssetPreviewPayload::Text(preview);
     }
     build_binary_info_payload(rel_path, canonical, ref_graph_state)
 }
@@ -3166,6 +3257,32 @@ pub async fn render_workspace_asset_preview_frame(
     })
 }
 
+/// Parse an immutable file-history snapshot with the same asset viewers. The
+/// temporary file only exists during parsing; caches own all retained bytes.
+pub(crate) fn preview_file_history_snapshot(
+    snapshot: &Path,
+    scope: Option<&ResolvedWorkspaceScope>,
+    binary_cache: &BinaryCache,
+) -> Option<AssetPreviewPayload> {
+    let name = snapshot.file_name()?.to_str()?;
+    let ext = snapshot.extension().and_then(|ext| ext.to_str()).unwrap_or("").to_lowercase();
+    let empty_db = AssetDbState(Arc::new(Mutex::new(None)));
+    if let Some(scope) = scope {
+        let runtime = scope.runtime();
+        let key = format!("{}:{}", runtime.checkout_id(), runtime.generation());
+        let cache = runtime.core().asset_preview_cache();
+        let db = AssetDbState(runtime.core().asset_db());
+        let kind = crate::diff::content::unity_asset_kind(name);
+        let structured = if is_scene_or_prefab_ext(&ext) {
+            try_build_scene_structured_payload(name, snapshot, kind, &key, cache, &db)
+        } else if is_slice3c_yaml_ext(&ext) {
+            try_build_yaml_structured_payload(name, snapshot, kind, &key, cache, &db)
+        } else { None };
+        if structured.is_some() { return structured; }
+    }
+    try_build_binary_rendered_payload(name, snapshot, binary_cache, &empty_db)
+}
+
 #[tauri::command]
 pub async fn preview_workspace_asset(
     file_path: String,
@@ -3241,9 +3358,14 @@ pub async fn preview_workspace_asset(
     //
     // Slice 3b: try to render image/psd/model via the existing BinaryCache
     //   + locus-binary URI protocol. On success → `binaryPreview` payload.
-    //   On unknown kind / oversized / read error → `binaryInfo` fallback.
-    let payload =
-        build_binary_payload(&asset_rel_path, &canonical, binary_cache.inner(), &asset_db);
+    //   Otherwise try bounded content detection before the `binaryInfo` fallback.
+    let payload = build_binary_payload(
+        &asset_rel_path,
+        &canonical,
+        binary_cache.inner(),
+        &asset_db,
+        focus_line,
+    );
     if let Some(start) = preview_start {
         eprintln!(
             "[perf:preview-workspace-asset:fbx] path={} total={}ms payload={}",
@@ -3254,6 +3376,10 @@ pub async fn preview_workspace_asset(
     }
     Ok(payload)
 }
+
+#[cfg(test)]
+#[path = "asset_text_preview_tests.rs"]
+mod text_preview_tests;
 
 #[cfg(test)]
 mod tests {

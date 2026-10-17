@@ -4,6 +4,15 @@ use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionTitleMatch {
+    pub id: String,
+    pub title: String,
+    pub archived: bool,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionSearchMatch {
     pub session_id: String,
     pub session_title: String,
@@ -31,6 +40,31 @@ pub struct SessionSearchPage {
 mod search;
 
 impl SessionStore {
+    /// Composer discovery reads metadata only, including archived sessions.
+    /// Literal matching keeps SQL wildcards in user-supplied titles harmless.
+    pub fn search_session_titles(
+        &self,
+        checkout_id: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<SessionTitleMatch>, String> {
+        if query.chars().count() > 1_000 || query.contains('\0') || !(1..=120).contains(&limit) {
+            return Err("query must be at most 1000 characters with no NUL; limit must be 1..120".into());
+        }
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare(
+            "SELECT id, title, archived_at IS NOT NULL, updated_at FROM sessions
+             WHERE default_checkout_id = ?1 AND instr(lower(title), lower(?2)) > 0
+             ORDER BY updated_at DESC, id DESC LIMIT ?3",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map(params![checkout_id, query.trim(), limit], |row| {
+            Ok(SessionTitleMatch {
+                id: row.get(0)?, title: row.get(1)?, archived: row.get(2)?, updated_at: row.get(3)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
+    }
+
     fn require_history_session(
         conn: &Connection,
         checkout_id: &str,
@@ -63,7 +97,7 @@ impl SessionStore {
         if !(1..=1_000).contains(&limit) || before_row_id.is_some_and(|id| id <= 0) {
             return Err("limit must be 1..1000 and beforeRowId must be positive".into());
         }
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         Self::require_history_session(&conn, checkout_id, session_id)?;
         let mut page = Self::get_message_page_with_conn(&conn, session_id, before_row_id, limit)?;
         drop(conn);

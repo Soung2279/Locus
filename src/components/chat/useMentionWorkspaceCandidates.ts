@@ -5,10 +5,13 @@ import { useWorkbenchStore } from "../../stores/workbench";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import { useWorkspaceExplorerStore } from "../../stores/workspaceExplorer";
 import type { MentionSearchRankable } from "./mentionSearchRanking";
+import { mapViewMentionResult } from "./mentionViewSearch";
 
 export interface MentionSearchResult extends MentionSearchRankable {
   isDir: boolean;
   localFile?: LocusFileDropRef;
+  viewIcon?: string | null;
+  updatedAt?: number;
 }
 
 function normalizePath(path: string): string {
@@ -44,6 +47,12 @@ export function useMentionWorkspaceCandidates(
       && document.availableCheckoutIds.includes(scope.checkoutId)
     ));
     const documentsById = new Map(scopedDocuments.map((document) => [document.id, document]));
+    const viewsById = new Map((explorer.viewResources[projectId] ?? [])
+      .filter(({ workspaceRef: binding }) => binding.checkoutId === scope.checkoutId
+        && (binding.expectedGeneration == null || scope.expectedGeneration == null
+          || binding.expectedGeneration === scope.expectedGeneration)
+        && workspaceMaterializationMatches(scope.expectedMaterializationEpoch, binding.expectedMaterializationEpoch))
+      .map(({ view }) => [view.id, view]));
     const otherRoots = Object.values(context.checkoutsById)
       .filter((item) => item.checkoutId !== scope.checkoutId)
       .map((item) => normalizePath(item.root)).filter(Boolean);
@@ -106,6 +115,11 @@ export function useMentionWorkspaceCandidates(
               if (document) add(`${document.type}/${document.path}`, document.title || tab.title, false, "tab", "knowledge");
               break;
             }
+            case "view": {
+              const view = viewsById.get(resource.viewId);
+              if (binding && view) results.push({ ...mapViewMentionResult(view, root), source: "tab" });
+              break;
+            }
             case "localFile":
             case "localDirectory":
             case "folder":
@@ -131,6 +145,10 @@ export function useMentionWorkspaceCandidates(
     }
     for (const node of nodes) {
       if (!isVisible(node)) continue;
+      if (node.resourceKind === "view" && node.resourceId) {
+        const view = viewsById.get(node.resourceId);
+        if (view) results.push({ ...mapViewMentionResult(view, root), source: "tree" });
+      }
       if (node.resourceKind === "knowledge" && node.resourceId) {
         const document = documentsById.get(node.resourceId);
         if (document) add(`${document.type}/${document.path}`, document.title || document.path, false, "tree", "knowledge");

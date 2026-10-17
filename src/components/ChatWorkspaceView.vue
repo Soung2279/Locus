@@ -40,6 +40,7 @@ import { useUiStore } from "../stores/ui";
 import { useSkills } from "../composables/useSkills";
 import type { UserMessageDraft } from "../composables/chatMessageDraft";
 import { emptyComposerIntent } from "../composables/chatInputIntents";
+import { applyNewSessionSelection, rememberChatSelection } from "../composables/newSessionSelection";
 import {
   createAnimationFrameResizeObserver,
   type ResizeObserverHandle,
@@ -229,19 +230,29 @@ function publishSessionExecutionState() {
     });
 }
 
+function selectWorkspaceAgent(agentId: string) {
+  agentStore.selectAgent(agentId);
+  // A new session switches to the model this Agent last used here.
+  if (!chatStore.activeSessionId) applyNewSessionSelection({ agentId: agentStore.selectedAgentId });
+  rememberChatSelection(workspaceContextStore.focusedWorkspaceRef);
+}
+
 async function selectWorkspaceModel(modelId: string) {
   modelStore.selectModel(modelId);
+  rememberChatSelection(workspaceContextStore.focusedWorkspaceRef);
   await nextTick();
   publishSessionExecutionState();
 }
 
 function selectWorkspaceEffort(effort: EffortLevel) {
   modelStore.selectEffort(effort);
+  rememberChatSelection(workspaceContextStore.focusedWorkspaceRef);
   publishSessionExecutionState();
 }
 
 function selectWorkspaceFastMode(enabled: boolean) {
   modelStore.selectCodexFastMode(enabled);
+  rememberChatSelection(workspaceContextStore.focusedWorkspaceRef);
   publishSessionExecutionState();
 }
 
@@ -770,7 +781,7 @@ onUnmounted(() => {
       @fork="chatStore.forkSession"
       @cancel="chatStore.cancelChat"
       @resume="chatStore.resumeInterrupted"
-      @select-agent="(id: string) => agentStore.selectAgent(id)"
+      @select-agent="selectWorkspaceAgent"
       @select-model="selectWorkspaceModel"
       @select-effort="selectWorkspaceEffort"
       @select-fast-mode="selectWorkspaceFastMode"

@@ -40,7 +40,9 @@ import {
 } from "../../composables/assistantRenderParts";
 import { useThrottledLiveRenderParts } from "../../composables/streamingRenderThrottle";
 import { useDisplaySettings } from "../../composables/useDisplaySettings";
-import { parseChatAssetRefs } from "../../composables/chatAssetRefs";
+import { parseChatAssetRefs, type ChatAssetRefSegment } from "../../composables/chatAssetRefs";
+import { parseSessionReferences, type SessionReferenceSegment } from "../../composables/sessionReferences";
+import SessionReference from "./SessionReference.vue";
 import {
   displayUserMessageContent,
   userMessageConsoleEntries,
@@ -120,6 +122,7 @@ const props = withDefaults(defineProps<{
   isStreaming: boolean;
   isCompacting?: boolean;
   isThinking: boolean;
+  showThinkingBlocks?: boolean;
   hasThinking?: boolean;
   thinkingText?: string;
   thinkingOrder?: number;
@@ -152,6 +155,7 @@ const props = withDefaults(defineProps<{
   workspaceRef?: WorkspaceRef | null;
 }>(), {
   variant: "embedded",
+  showThinkingBlocks: true,
   hasThinking: undefined,
   typedTextStream: null,
   hasStreamingText: undefined,
@@ -247,9 +251,11 @@ function userMessageDisplayContent(message: ChatMessage) {
 
 function userMessageDisplaySegments(message: ChatMessage) {
   const content = userMessageDisplayContent(message);
-  return props.userContentMode === "asset"
-    ? parseChatAssetRefs(content)
-    : [{ type: "text" as const, value: content }];
+  // Resolve session labels before asset scanning so title text is never treated as a path.
+  return parseSessionReferences(content).flatMap<ChatAssetRefSegment | SessionReferenceSegment>((segment) =>
+    segment.type === "text" && props.userContentMode === "asset"
+      ? parseChatAssetRefs(segment.value)
+      : [segment]);
 }
 
 function messageAssetRefs(message: ChatMessage): AssetRefAttachment[] {
@@ -984,8 +990,18 @@ watch(
     if (!isStreaming) {
       clearRetainedCollapsedToolCalls("stream-ended");
     }
-    if (isStreaming || !handoff?.collapseFinished) return;
-    clearToolCallHandoff("stream-ended-after-collapse");
+    if (isStreaming || !handoff) return;
+    // Final text can enter history while the promoted tool collection is still
+    // collapsing. Its replacement may never emit collapseFinished. Reconcile
+    // ownership on stream end as well as message updates: synchronous prop
+    // watchers can see the new messages before isStreaming becomes false.
+    if (shouldReleaseToolCallHandoffToHistory(props.messages, handoff.toolCallMatchState)) {
+      clearToolCallHandoff("stream-ended-history-ready");
+      return;
+    }
+    if (handoff.collapseFinished) {
+      clearToolCallHandoff("stream-ended-after-collapse");
+    }
   },
   { flush: "sync" },
 );
@@ -1022,7 +1038,7 @@ function toolCallsFromInfos(toolCalls: ToolCallInfo[] | undefined) {
 }
 
 function shouldHideThinkingBlocks() {
-  return displaySettings.hideThinkingBlocks !== false;
+  return !props.showThinkingBlocks || displaySettings.hideThinkingBlocks !== false;
 }
 
 function shouldRenderHistoryThinkingBlock(item: Pick<MessageRenderItem, "message">) {
@@ -1048,7 +1064,7 @@ function livePartHasContent(part: Extract<AssistantRenderPart, { kind: "thinking
 }
 
 function shouldRenderTransientThinkingSegment(part: Extract<AssistantRenderPart, { kind: "thinking" }>) {
-  return !!part.active || (!shouldHideThinkingBlocks() && livePartHasContent(part));
+  return props.showThinkingBlocks && (!!part.active || (!shouldHideThinkingBlocks() && livePartHasContent(part)));
 }
 
 function shouldRenderItem(item: MessageRenderItem) {
@@ -1556,7 +1572,7 @@ const historyStaticRenderMemoKey = computed(() => [
   props.thoughtMomentLabel,
   displaySettings.rightAlignUserMessages ? "align-user" : "left-user",
   displaySettings.compactToolCalls ? "compact-tools" : "open-tools",
-  displaySettings.hideThinkingBlocks !== false ? "hide-thinking" : "show-thinking",
+  shouldHideThinkingBlocks() ? "hide-thinking" : "show-thinking",
 ].join("\u241e"));
 
 function historySelectionMemoKey(group: MessageGroup) {
@@ -1705,7 +1721,7 @@ const hasRunningTransientToolCall = computed(() => {
 });
 const hasToolCallHandoff = computed(() => hasTransientToolCalls.value && !hasLiveToolCalls.value);
 const hasVisibleActiveThinkingBlock = computed(() =>
-  props.isThinking
+  props.showThinkingBlocks && props.isThinking
   && canonicalLiveRenderParts.value.some((part) => part.kind === "thinking" && part.active),
 );
 const hasVisibleTransientThinkingBlock = computed(
@@ -1721,7 +1737,7 @@ const isWaitingForResponse = computed(
   () => shouldShowWaitingPlaceholder({
     isStreaming: props.isStreaming,
     hasStreamingContent: hasStreamingContent.value,
-    isThinking: props.isThinking,
+    isThinking: props.showThinkingBlocks && props.isThinking,
     hasThinkingContent: hasVisibleCompletedThinkingContent.value,
   }),
 );
@@ -3002,6 +3018,8 @@ function openImage(src: string) {
                       :workspace-ref="workspaceRef"
                       context-menu-mode="inherit"
                     />
+                    <SessionReference v-else-if="segment.type === 'session'"
+                      :session-id="segment.sessionId" :title="segment.value" />
                     <template v-else>{{ segment.value }}</template>
                   </template>
                 </div>

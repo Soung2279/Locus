@@ -6,6 +6,7 @@ import type {
   SkillIntentItem,
 } from "../types";
 import { extractChatAssetRefs } from "./chatAssetRefs";
+import { extractSessionReferences, normalizeSessionReferences, type SessionReferenceAttachment } from "./sessionReferences";
 import {
   displayUserMessageContent,
   stripUserMessageKnowledgeQuoteBlocks,
@@ -55,6 +56,7 @@ export interface UserMessageDraft {
   images: ImageAttachment[];
   assetRefs: AssetRefAttachment[];
   knowledgeQuotes?: UserMessageDraftKnowledgeQuote[];
+  sessionRefs?: SessionReferenceAttachment[];
   localFiles: UserMessageDraftLocalFile[];
   consoleTexts: UserMessageDraftConsoleText[];
   intent: ComposerIntentState;
@@ -165,6 +167,7 @@ function normalizeImage(value: unknown): ImageAttachment | null {
   return {
     data: value.data,
     mimeType: value.mimeType,
+    capture: isObject(value.capture) && typeof value.capture.id === "string" && value.capture.id.length <= 64 ? { id: value.capture.id } : undefined,
   };
 }
 
@@ -238,7 +241,11 @@ function userMessageIntent(message: ChatMessage): ComposerIntentState {
 
 function normalizeUserMessageDraft(value: unknown): UserMessageDraft | null {
   if (!isObject(value)) return null;
-  const text = typeof value.text === "string" ? value.text : "";
+  const inlineSessions = extractSessionReferences(typeof value.text === "string" ? value.text : "");
+  const text = inlineSessions.text;
+  const sessionRefs = normalizeSessionReferences([
+    ...inlineSessions.sessionRefs, ...normalizeSessionReferences(value.sessionRefs),
+  ]);
   const images = Array.isArray(value.images)
     ? value.images.map(normalizeImage).filter((image): image is ImageAttachment => !!image)
     : [];
@@ -277,6 +284,7 @@ function normalizeUserMessageDraft(value: unknown): UserMessageDraft | null {
     images,
     assetRefs,
     knowledgeQuotes,
+    ...(sessionRefs.length ? { sessionRefs } : {}),
     localFiles,
     consoleTexts,
     intent: normalizeIntent(value.intent),
@@ -422,6 +430,7 @@ async function writeClipboardItem(text: string, serializedDraft: string | null) 
 }
 
 export function buildUserMessageDraft(message: ChatMessage): UserMessageDraft {
+  const inlineSessions = extractSessionReferences(displayUserMessageContent(message.content));
   const knowledgeQuotes = userMessageKnowledgeQuoteEntries(message.content).map((quote) => ({
     path: quote.path,
     name: quote.name || undefined,
@@ -429,10 +438,12 @@ export function buildUserMessageDraft(message: ChatMessage): UserMessageDraft {
   }));
   const quotedPaths = new Set(knowledgeQuotes.map((quote) => normalizeKnowledgeRefPath(quote.path)));
   return {
-    text: displayUserMessageContent(message.content),
+    text: inlineSessions.sessionRefs.length ? inlineSessions.text.trim() : inlineSessions.text,
+    ...(inlineSessions.sessionRefs.length ? { sessionRefs: inlineSessions.sessionRefs } : {}),
     images: (message.images ?? []).map((image) => ({
       data: image.data,
       mimeType: image.mimeType,
+      capture: image.capture ? { ...image.capture } : undefined,
     })),
     assetRefs: userMessageAssetRefs(message).filter((assetRef) => (
       assetRef.kind !== "knowledge" || !quotedPaths.has(normalizeKnowledgeRefPath(assetRef.path))

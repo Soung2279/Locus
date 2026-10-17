@@ -2,9 +2,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from ._models import SessionMessage
+
+
+def normalize_session_reference(value: str) -> str:
+    """Accept an ID or the stable URL produced by the composer's @ picker."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("session_id must be a nonempty session ID or locus://session/<id> URL")
+    value = value.strip()
+    if value.startswith("locus:"):
+        match = re.fullmatch(r"locus://session/([A-Za-z0-9_-]+)", value)
+        if match is None:
+            raise ValueError("invalid session reference; expected locus://session/<id>")
+        return match.group(1)
+    return value
 
 
 def positive_int(value: int, name: str, maximum: int) -> None:

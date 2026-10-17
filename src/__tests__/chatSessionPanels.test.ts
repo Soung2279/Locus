@@ -3,6 +3,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { useUiStore } from "../stores/ui";
+import { useChatInputSettings } from "../composables/useChatInputSettings";
 import type { FileDiffPayload, TodoItem, TodoSnapshot } from "../types";
 
 const sessionServiceMocks = vi.hoisted(() => ({
@@ -34,6 +35,7 @@ const sessionServiceMocks = vi.hoisted(() => ({
   saveSessionExecutionState: vi.fn(),
   staleKnowledgeProposals: vi.fn(),
   rollbackSessionToMessage: vi.fn(),
+  synchronizeSessionRemoteHistory: vi.fn(),
   undoLatestConversationTurn: vi.fn(),
 }));
 
@@ -129,6 +131,11 @@ vi.mock("../composables/useDisplaySettings", () => ({
 vi.mock("../stores/agent", () => ({
   useAgentStore: () => agentStoreMocks,
 }));
+const newSessionSelectionMocks = vi.hoisted(() => ({
+  applyNewSessionSelection: vi.fn(),
+  rememberChatSelection: vi.fn(),
+}));
+vi.mock("../composables/newSessionSelection", () => newSessionSelectionMocks);
 vi.mock("../stores/model", () => ({
   useModelStore: () => modelStoreMocks,
 }));
@@ -234,6 +241,10 @@ describe("chat session panel state", () => {
     modelStoreMocks.resolveSelectedModel.mockImplementation(() => {
       modelStoreMocks.selectedModelId = modelStoreMocks.modelDefaults.mainModel;
     });
+    newSessionSelectionMocks.applyNewSessionSelection.mockImplementation(() => {
+      modelStoreMocks.selectedModelId = modelStoreMocks.modelDefaults.mainModel;
+      modelStoreMocks.codexFastMode = modelStoreMocks.defaultCodexFastMode;
+    });
 
     displaySettingsState.todoAutoOpen = true;
     displaySettingsState.showWelcomeSubtitle = true;
@@ -296,6 +307,7 @@ describe("chat session panel state", () => {
       oldestMessageRowId: null,
       hasMoreHistory: false,
     });
+    sessionServiceMocks.synchronizeSessionRemoteHistory.mockResolvedValue({ changed: false, warning: null });
     sessionServiceMocks.loadSessionTurnPreview.mockImplementation(async (
       _sessionId: string,
       messageId: string,
@@ -600,6 +612,95 @@ describe("chat session panel state", () => {
     expect(chatStore.activeSessionId).toBe("s1");
   });
 
+  function sessionViewWith(sessionId: string, messages: Array<{ id: string; role: string; content: string }>) {
+    return {
+      session: {
+        id: sessionId,
+        title: `Session ${sessionId}`,
+        messages: messages.map((message, index) => ({ ...message, createdAt: index + 1 })),
+        agentId: null,
+        sessionType: "chat",
+        parentSessionId: null,
+        latestCompletedRunId: null,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+      userMessageIds: messages.filter((message) => message.role === "user").map((message) => message.id),
+      oldestMessageRowId: 1,
+      hasMoreHistory: false,
+    };
+  }
+
+  async function flushBackgroundWork() {
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it("switches to the saved transcript without waiting for remote history and keeps an unchanged view", async () => {
+    const chatStore = useChatStore();
+    const sync = deferred<{ changed: boolean; warning: string | null }>();
+    sessionServiceMocks.synchronizeSessionRemoteHistory.mockReturnValueOnce(sync.promise);
+    sessionServiceMocks.loadSessionView.mockResolvedValueOnce(sessionViewWith("s1", [
+      { id: "local", role: "assistant", content: "saved" },
+    ]));
+
+    await chatStore.selectSession("s1");
+
+    expect(chatStore.activeSessionId).toBe("s1");
+    expect(chatStore.messages.map((message) => message.id)).toEqual(["local"]);
+    expect(sessionServiceMocks.loadSessionView).toHaveBeenCalledWith("s1", 120, false);
+    expect(sessionServiceMocks.synchronizeSessionRemoteHistory).toHaveBeenCalledWith("s1");
+    const rendered = chatStore.messages;
+
+    sync.resolve({ changed: false, warning: null });
+    await flushBackgroundWork();
+
+    expect(sessionServiceMocks.loadSessionView).toHaveBeenCalledTimes(1);
+    expect(chatStore.messages).toBe(rendered);
+    expect(notificationStoreMocks.addNotice).not.toHaveBeenCalled();
+  });
+
+  it("reloads the saved transcript once after remote history changed it", async () => {
+    const chatStore = useChatStore();
+    const sync = deferred<{ changed: boolean; warning: string | null }>();
+    sessionServiceMocks.synchronizeSessionRemoteHistory.mockReturnValueOnce(sync.promise);
+    sessionServiceMocks.loadSessionView
+      .mockResolvedValueOnce(sessionViewWith("s1", [{ id: "local", role: "user", content: "hi" }]))
+      .mockResolvedValueOnce(sessionViewWith("s1", [
+        { id: "local", role: "user", content: "hi" },
+        { id: "remote", role: "assistant", content: "remote reply" },
+      ]));
+
+    await chatStore.selectSession("s1");
+    expect(chatStore.messages.map((message) => message.id)).toEqual(["local"]);
+
+    sync.resolve({ changed: true, warning: "partial resume context" });
+    await vi.waitFor(() => expect(chatStore.messages.map((message) => message.id)).toEqual(["local", "remote"]));
+
+    expect(sessionServiceMocks.loadSessionView).toHaveBeenCalledTimes(2);
+    expect(sessionServiceMocks.loadSessionView).toHaveBeenLastCalledWith("s1", 120, false);
+    expect(sessionServiceMocks.synchronizeSessionRemoteHistory).toHaveBeenCalledTimes(1);
+    expect(notificationStoreMocks.addNotice).toHaveBeenCalledWith("warning", "partial resume context", {
+      operation: "syncClaudeHistory", replaceOperation: true,
+    });
+  });
+
+  it("ignores a remote history result for a session the user already left", async () => {
+    const chatStore = useChatStore();
+    const sync = deferred<{ changed: boolean; warning: string | null }>();
+    sessionServiceMocks.synchronizeSessionRemoteHistory.mockReturnValueOnce(sync.promise);
+
+    await chatStore.selectSession("s1");
+    await chatStore.selectSession("s2");
+    sessionServiceMocks.loadSessionView.mockClear();
+
+    sync.resolve({ changed: true, warning: "stale warning" });
+    await flushBackgroundWork();
+
+    expect(chatStore.activeSessionId).toBe("s2");
+    expect(sessionServiceMocks.loadSessionView).not.toHaveBeenCalled();
+    expect(notificationStoreMocks.addNotice).not.toHaveBeenCalled();
+  });
+
   it("prepends older message pages without replacing the visible transcript", async () => {
     const chatStore = useChatStore();
     sessionServiceMocks.loadSessionView.mockResolvedValueOnce({
@@ -625,7 +726,7 @@ describe("chat session panel state", () => {
     });
 
     await chatStore.selectSession("s1");
-    expect(sessionServiceMocks.loadSessionView).toHaveBeenCalledWith("s1", 120);
+    expect(sessionServiceMocks.loadSessionView).toHaveBeenCalledWith("s1", 120, false);
     expect(chatStore.messages.map((message) => message.id)).toEqual(["new"]);
     expect(chatStore.sessionUserMessageIds).toEqual(["old"]);
 
@@ -721,7 +822,7 @@ describe("chat session panel state", () => {
 
     chatStore.newChat();
 
-    expect(modelStoreMocks.resolveSelectedModel).toHaveBeenCalledWith(true);
+    expect(newSessionSelectionMocks.applyNewSessionSelection).toHaveBeenCalled();
     expect(modelStoreMocks.selectedModelId).toBe("model-a");
   });
 
@@ -2206,6 +2307,17 @@ describe("chat session panel state", () => {
     expect(chatStore.visibleTodos).toEqual([]);
   });
 
+  it("shows recovered native tasks without a matching local run and keeps them across noop turns", async () => {
+    const chatStore = useChatStore();
+    todoData.s1 = { items: [makeTodo('Remote native task')], latestRunId: null, sessionScoped: true };
+    latestCompletedRunIdData.s1 = 'different-local-run';
+    await chatStore.selectSession('s1');
+    expect(chatStore.visibleTodos).toHaveLength(1);
+    chatStore.isStreaming = true;
+    chatStore.handleStreamEvent({ runId: 'new-run', type: 'runStart', sessionId: 's1' });
+    expect(chatStore.visibleTodos[0]?.content).toBe('Remote native task');
+  });
+
   it("clears current-round tasks during a new noop run while keeping the task panel pinned to current", async () => {
     const chatStore = useChatStore();
 
@@ -2775,7 +2887,8 @@ describe("chat session panel state", () => {
     expect(userMessage?.thinkingSignature).toContain(userMessage?.id ?? "");
   });
 
-  it("queues and merges follow-up messages while a run is active", async () => {
+  it.each(["after-run", "insert"] as const)("queues and merges follow-up messages using %s while a run is active", async (mode) => {
+    useChatInputSettings().setRunningSendMode(mode);
     const chatStore = useChatStore();
     const pendingByGroup = new Map<string, any>();
     sessionServiceMocks.queueChatInput.mockImplementation(async (params: any) => {
@@ -2820,7 +2933,7 @@ describe("chat session panel state", () => {
     expect(sessionServiceMocks.queueChatInput).toHaveBeenCalledTimes(2);
     const firstCall = sessionServiceMocks.queueChatInput.mock.calls[0]![0];
     const secondCall = sessionServiceMocks.queueChatInput.mock.calls[1]![0];
-    expect(firstCall.delivery).toBe("after_run");
+    expect(firstCall.delivery).toBe(mode === "insert" ? "immediate" : "after_run");
     expect(secondCall.mergeGroupId).toBe(firstCall.mergeGroupId);
     expect(chatStore.activeQueuedFollowUp?.displayText).toBe("first\nsecond");
 

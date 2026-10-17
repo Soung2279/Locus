@@ -84,6 +84,27 @@ class SessionHistoryTests(unittest.IsolatedAsyncioTestCase):
             await locus.read_session("s", before_row_id=9)
             self.assertEqual(self.client.rpc.call_args.args[1]["beforeRowId"], 9)
 
+    async def test_reference_urls_use_the_existing_scoped_read_and_search(self):
+        with patch("locus._default_client", self.client):
+            self.client.rpc.return_value = {"messages": [], "hasMoreHistory": False}
+            await locus.read_session(" locus://session/session-a ", limit=30, before_row_id=42)
+            self.client.rpc.assert_awaited_with("sessions.read", {
+                "workspaceRef": self.reference, "sessionId": "session-a", "beforeRowId": 42, "limit": 30,
+            })
+            self.client.rpc.return_value = {"matches": [], "nextCursor": None}
+            await locus.search_sessions("shader", session_id="locus://session/session-a", archived=True)
+            self.assertEqual(self.client.rpc.call_args.args[1]["sessionId"], "session-a")
+            self.assertEqual(self.client.rpc.call_args.args[1]["workspaceRef"], self.reference)
+
+    async def test_rejects_malformed_reference_urls_before_rpc(self):
+        for value in [None, 1, "locus://session/", "locus://session/s/extra", "locus://session/s?x=1", "locus://other/s", "locus://session/../s"]:
+            with self.assertRaises(ValueError):
+                await self.client.read_session(value)
+            if value is not None:
+                with self.assertRaises(ValueError):
+                    await self.client.search_sessions("text", session_id=value)
+        self.client.rpc.assert_not_called()
+
     async def test_rejects_invalid_parameters_before_rpc(self):
         for query in ["", "  ", "x" * 1001, "a\0b"]:
             with self.assertRaises(ValueError):

@@ -28,7 +28,7 @@ describe("RichChatInput image attachment layout", () => {
     expect(source).toContain("const hasTopAttachments = computed(() =>");
     expect(source).toMatch(/<template #overlay>[\s\S]*class="composer-attachment-list"/);
     expect(source).toContain('const file = item.kind === "file" ? item.getAsFile() : null;');
-    expect(source).toContain("imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType }))");
+    expect(source).toContain("imageAttachments.value.map((image) => ({ ...image }))");
     expect(source).not.toContain('class="image-preview-bar"');
     expect(source).toContain("flex-wrap: nowrap;");
     expect(source).toContain("overflow-x: auto;");

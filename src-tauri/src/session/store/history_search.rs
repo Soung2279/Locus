@@ -218,11 +218,7 @@ impl SessionStore {
                 Ok(value)
             })
             .transpose()?;
-        let conn =
-            Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| format!("Failed to open history reader: {e}"))?;
-        conn.busy_timeout(Duration::from_millis(250))
-            .map_err(|e| e.to_string())?;
+        let conn = self.read_conn()?;
         if let Some(id) = session_id {
             Self::require_history_session(&conn, checkout_id, id)?;
         }

@@ -1,11 +1,16 @@
 
 <script setup lang="ts">
+import { useWindowSurface } from "../../composables/useWindowSurface";
+const { ownerWindow } = useWindowSurface();
 import { computed, ref, watch } from "vue";
+import { MessageSquare } from "lucide";
 import { t } from "../../i18n";
+import { formatWorkspaceUpdatedTime } from "../../composables/useFormatters";
 import LucideIcon from "../icons/LucideIcon.vue";
 import type { LocusFileDropRef } from "../../services/unity";
 import FileTreeList from "../explorer/FileTreeList.vue";
-import { mentionResultKey } from "./mentionSearchRanking";
+import { mentionResultKey, type MentionSearchEntryKind } from "./mentionSearchRanking";
+import { resolveLocusViewIcon } from "../icons/locusViewIcons";
 import {
   unityAssetIconClassForPath,
   unityAssetIconNodeForPath,
@@ -19,7 +24,9 @@ export interface MentionDisplayEntry {
   meta?: string;
   canNavigate?: boolean;
   isCurrentPath?: boolean;
-  entryKind?: "asset" | "knowledge" | "sceneObject";
+  entryKind?: MentionSearchEntryKind;
+  viewIcon?: string | null;
+  updatedAt?: number;
   localFile?: LocusFileDropRef;
 }
 
@@ -50,7 +57,22 @@ interface HighlightFragment {
 const popupRef = ref<HTMLElement | null>(null);
 const listRef = ref<InstanceType<typeof FileTreeList> | null>(null);
 const maxHeight = ref(520);
-const rows = computed(() => props.entries.map((entry) => ({ key: mentionResultKey(entry), entry })));
+const timeNow = ref(Date.now() / 1000);
+const rows = computed(() => props.entries.map((entry) => ({
+  key: mentionResultKey(entry),
+  entry,
+  updatedTime: entry.entryKind === "session" ? formatWorkspaceUpdatedTime(entry.updatedAt, timeNow.value) : "",
+})));
+watch(
+  () => props.visible && props.entries.some((entry) => entry.entryKind === "session"),
+  (visible, _, onCleanup) => {
+    if (!visible) return;
+    timeNow.value = Date.now() / 1000;
+    const timer = ownerWindow.setInterval(() => { timeNow.value = Date.now() / 1000; }, 60_000);
+    onCleanup(() => ownerWindow.clearInterval(timer));
+  },
+  { immediate: true },
+);
 const rowHeight = computed(() => props.entries.some((entry) => entry.meta || entry.parentPath) ? 48 : 36);
 const terms = computed(() => highlightTerms(props.query));
 const presentationCache = new WeakMap<MentionDisplayEntry, {
@@ -155,6 +177,8 @@ function presentation(entry: MentionDisplayEntry) {
 }
 
 function iconNodeForEntry(entry: MentionDisplayEntry) {
+  if (entry.entryKind === "session") return MessageSquare;
+  if (entry.entryKind === "view") return resolveLocusViewIcon(entry.viewIcon);
   return unityAssetIconNodeForPath(entry.relPath, {
     isFolder: entry.isDir,
     isSceneObject: entry.entryKind === "sceneObject",
@@ -163,6 +187,8 @@ function iconNodeForEntry(entry: MentionDisplayEntry) {
 }
 
 function iconClassForEntry(entry: MentionDisplayEntry) {
+  if (entry.entryKind === "session") return "";
+  if (entry.entryKind === "view") return "";
   return unityAssetIconClassForPath(entry.relPath, {
     isFolder: entry.isDir,
     isSceneObject: entry.entryKind === "sceneObject",
@@ -181,10 +207,10 @@ watch(popupRef, (popup, _, onCleanup) => {
   const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateAvailableHeight);
   observer?.observe(popup);
   if (popup.parentElement) observer?.observe(popup.parentElement);
-  window.addEventListener("resize", updateAvailableHeight);
+  ownerWindow.addEventListener("resize", updateAvailableHeight);
   onCleanup(() => {
     observer?.disconnect();
-    window.removeEventListener("resize", updateAvailableHeight);
+    ownerWindow.removeEventListener("resize", updateAvailableHeight);
   });
 }, { flush: "post" });
 
@@ -292,6 +318,7 @@ watch(
                 >{{ fragment.text }}</span>
               </span>
             </span>
+            <span v-if="item.updatedTime" class="mention-time">{{ item.updatedTime }}</span>
           </button>
           <button
             v-if="item.entry.isDir && item.entry.canNavigate"

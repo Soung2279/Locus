@@ -1,5 +1,35 @@
 use super::*;
 
+#[test]
+fn title_mentions_are_scoped_literal_bounded_and_include_archives() {
+    let (_dir, store, active, archived, other) = fixture();
+    let hits = store.search_session_titles("checkout-a", "sHaDeR", 120).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().any(|hit| hit.id == active && !hit.archived));
+    assert!(hits.iter().any(|hit| hit.id == archived && hit.archived));
+    assert!(!hits.iter().any(|hit| hit.id == other));
+    assert_eq!(store.search_session_titles("checkout-a", "调试", 120).unwrap()[0].id, active);
+    // A message body alone must not make a title match.
+    assert!(store.search_session_titles("checkout-a", "编译", 120).unwrap().is_empty());
+    assert!(store.search_session_titles("checkout-a", "%_", 120).unwrap().is_empty());
+    assert!(store.search_session_titles("checkout-a", "%' OR 1=1 --", 120).unwrap().is_empty());
+    assert_eq!(store.search_session_titles("checkout-a", "", 1).unwrap().len(), 1);
+    assert_eq!(store.search_session_titles("checkout-a", "  ", 120).unwrap().len(), 2);
+    assert!(store.search_session_titles("missing", "", 120).unwrap().is_empty());
+    for limit in [0, 121] {
+        assert!(store.search_session_titles("checkout-a", "Shader", limit).is_err());
+    }
+    for query in ["x".repeat(1001), "a\0b".into()] {
+        assert!(store.search_session_titles("checkout-a", &query, 120).is_err());
+    }
+    // References remain readable after a rename; deleted IDs fail explicitly.
+    store.rename_session(&active, "Renamed").unwrap();
+    assert!(!store.search_session_titles("checkout-a", "Shader", 120).unwrap().iter().any(|hit| hit.id == active));
+    assert_eq!(store.read_session_history("checkout-a", &active, None, 10).unwrap().messages.len(), 1);
+    store.delete_session(&active).unwrap();
+    assert!(store.read_session_history("checkout-a", &active, None, 10).is_err());
+}
+
 pub(super) fn fixture() -> (tempfile::TempDir, SessionStore, String, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path()).unwrap();

@@ -15,6 +15,7 @@ function attachmentDraft(): UserMessageDraft {
     images: [{ data: "cG5n", mimeType: "image/png" }],
     assetRefs: [{ path: "Assets/Player.prefab", kind: "asset", source: "manual" }],
     localFiles: [{ path: "C:/temp/report.txt", isDir: false, name: "report.txt" }],
+    sessionRefs: [{ sessionId: "previous", title: "Previous session" }],
     consoleTexts: [{ title: "Unity Console", source: "unity", level: "Error", text: "boom" }],
     intent: {
       mode: "plan",
@@ -35,7 +36,16 @@ describe("shared composer draft memory", () => {
     expect(restored).toEqual(attachmentDraft());
 
     restored!.images[0]!.data = "changed";
+    restored!.sessionRefs![0]!.title = "changed";
     expect(readSharedComposerDraft(TEST_KEY)?.images[0]?.data).toBe("cG5n");
+    expect(readSharedComposerDraft(TEST_KEY)?.sessionRefs?.[0]?.title).toBe("Previous session");
+  });
+
+  it("retains a draft consisting only of session references", () => {
+    const draft = { ...attachmentDraft(), text: "", images: [], assetRefs: [], localFiles: [], consoleTexts: [], intent: { mode: "build" as const, skills: [] } };
+    writeSharedComposerDraft(TEST_KEY, draft);
+    updateSharedComposerDraftText(TEST_KEY, "");
+    expect(readSharedComposerDraft(TEST_KEY)?.sessionRefs).toEqual(draft.sessionRefs);
   });
 
   it("updates shared text while retaining attachments and clears an empty draft", () => {

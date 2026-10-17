@@ -42,7 +42,7 @@ describe("chat composer draft persistence", () => {
     expect(chatView).toContain(':draft-state-key="composerDraftStateKey"');
     expect(richInput).toContain("readSharedComposerDraft(props.draftStateKey)");
     expect(richInput).toContain("writeSharedComposerDraft(props.draftStateKey, exportDraft())");
-    expect(richInput).toContain("updateSharedComposerDraftText(props.draftStateKey, text)");
+    expect(richInput).toContain("updateSharedComposerDraftText(props.draftStateKey, extracted.text)");
     expect(workbench).toContain("clearSharedComposerDraft(`workbench:${editorId}`)");
   });
 

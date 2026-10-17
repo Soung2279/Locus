@@ -1,6 +1,7 @@
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from "vue";
+import type { WorkbenchEditorTransferSnapshot } from "../types/workbench";
 import { Plus, Trash2 } from "lucide";
 import {
   type InternalDropDecision,
@@ -51,6 +52,7 @@ import { acquireSelectionLock } from "../composables/useSelectionLock";
 import { parseAgentToolDefinition } from "./agent/toolSchema";
 import { buildAgentPromptDashboard, type AgentPromptHealthLevel, type AgentPromptPartKey } from "./agent/agentPromptDashboard";
 import { useModelStore } from "../stores/model";
+import { useSelectionMemoryStore } from "../stores/selectionMemory";
 import type { WorkspaceRef } from "../services/project";
 import { agentProjectTypesLabel } from "../utils/agentProjectTypes";
 
@@ -66,14 +68,64 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{ openAgent: [agent: AgentInfo]; dirtyChange: [dirty: boolean] }>();
 const documentEditor = ref<InstanceType<typeof AgentDocumentEditor> | null>(null);
 const showDocumentDetails = ref(false);
-defineExpose({ saveFile: () => documentEditor.value?.saveFile() ?? Promise.resolve(true) });
+defineExpose({
+  saveFile: () => documentEditor.value?.saveFile() ?? Promise.resolve(true),
+  exportTransferSnapshot: (): WorkbenchEditorTransferSnapshot => ({ kind: "agent",
+    selection: selected.value ? JSON.parse(JSON.stringify(selected.value)) : null,
+    drafts: documentEditor.value?.exportWorkState() ?? [] }),
+  restoreWorkState: async (snapshot: WorkbenchEditorTransferSnapshot): Promise<boolean> => {
+    if (snapshot.kind !== "agent") return false;
+    selected.value = snapshot.selection as SelectedKind | null;
+    await nextTick();
+    return documentEditor.value?.restoreWorkState(snapshot.drafts) ?? false;
+  },
+});
 const modelStore = useModelStore();
+const selectionMemory = useSelectionMemoryStore();
 
 const selectedAgentId = ref<string>(props.agentId ?? "");
 const allAgents = ref<AgentInfo[]>([]);
 const agentSearch = ref("");
 const agentListLoading = ref(false);
 const agentListError = ref("");
+const agentDefaultError = ref("");
+const agentDefaultSaving = ref(false);
+const topLevelAgentIds = ref<string[]>([]);
+const agentContextMenu = ref<{ x: number; y: number; agentId: string } | null>(null);
+const contextAgent = computed(() => allAgents.value.find(agent => agent.id === agentContextMenu.value?.agentId));
+const workspaceScopeKey = computed(() => JSON.stringify([
+  props.workspaceRef?.checkoutId,
+  props.workspaceRef?.expectedGeneration,
+  props.workspaceRef?.expectedMaterializationEpoch,
+  props.workingDir,
+]));
+
+function openAgentContextMenu(event: MouseEvent, agent: AgentInfo) {
+  if (!props.workspaceRef || !topLevelAgentIds.value.includes(agent.id)) return;
+  closeRuleContextMenu();
+  agentContextMenu.value = { x: event.clientX, y: event.clientY, agentId: agent.id };
+}
+
+async function setDefaultAgentFromContext() {
+  const workspaceRef = props.workspaceRef;
+  const agent = contextAgent.value;
+  if (!workspaceRef || !agent || agent.isDefault || agentDefaultSaving.value
+    || !topLevelAgentIds.value.includes(agent.id)) return;
+  const scopeKey = workspaceScopeKey.value;
+  agentContextMenu.value = null;
+  agentDefaultError.value = "";
+  agentDefaultSaving.value = true;
+  try {
+    await selectionMemory.setWorkspaceDefaultAgent({ ...workspaceRef }, agent.id);
+    if (!agentViewUnmounted && scopeKey === workspaceScopeKey.value) await loadAllAgents();
+  } catch (e) {
+    if (!agentViewUnmounted && scopeKey === workspaceScopeKey.value) {
+      agentDefaultError.value = normalizeAppError(e).message;
+    }
+  } finally {
+    agentDefaultSaving.value = false;
+  }
+}
 const visibleAgents = computed(() => {
   const query = agentSearch.value.trim().toLocaleLowerCase();
   return allAgents.value.filter(agent => !query || `${agent.name} ${agent.id} ${agent.description}`.toLocaleLowerCase().includes(query));
@@ -699,12 +751,14 @@ async function loadAllAgents() {
   try {
     const workspaceRef = props.workspaceRef;
     let nextAgents: AgentInfo[];
+    let nextTopLevelIds: string[] = [];
     if (workspaceRef) {
       const [topLevel, subLevel] = await Promise.all([
         listWorkspaceAgents(workspaceRef),
         listWorkspaceSubagentDefs(workspaceRef),
       ]);
       nextAgents = mergeAgentLists(topLevel, subLevel);
+      nextTopLevelIds = topLevel.map(agent => agent.id);
     } else if (props.agentList.length > 0) {
       nextAgents = mergeAgentLists(props.agentList);
     } else {
@@ -713,6 +767,7 @@ async function loadAllAgents() {
     }
     if (requestId !== agentListRequestId) return;
     allAgents.value = nextAgents;
+    topLevelAgentIds.value = nextTopLevelIds;
     const selectedStillAvailable = allAgents.value.some(
       (agent) => agent.id === selectedAgentId.value,
     );
@@ -725,7 +780,7 @@ async function loadAllAgents() {
     }
   } catch (e) {
     if (requestId !== agentListRequestId) return;
-    if (props.agentList.length > 0) {
+    if (!props.workspaceRef && props.agentList.length > 0) {
       allAgents.value = mergeAgentLists(props.agentList);
     }
     console.error("loadAllAgents failed:", e);
@@ -1393,6 +1448,8 @@ onUnmounted(() => {
   unregisterRuleDropTarget?.();
   unregisterRuleDropTarget = null;
   agentViewUnmounted = true;
+  agentListRequestId += 1;
+  agentContextMenu.value = null;
   closeRuleContextMenu();
   document.removeEventListener("mousemove", onResizeMove);
   document.removeEventListener("mouseup", onResizeEnd);
@@ -1413,12 +1470,12 @@ watch(
 );
 
 watch(
-  () => [
-    props.workspaceRef?.checkoutId ?? "",
-    props.workspaceRef?.expectedGeneration ?? -1,
-    props.workingDir,
-  ] as const,
+  workspaceScopeKey,
   async () => {
+    agentContextMenu.value = null;
+    agentDefaultError.value = "";
+    allAgents.value = [];
+    topLevelAgentIds.value = [];
     resetAgentDetailState();
     await loadAllAgents();
     if (selectedAgentId.value) await loadAgentData();
@@ -1467,6 +1524,7 @@ watch(
       </div>
       <div v-if="agentListError" class="sidebar-empty" role="alert">{{ agentListError }}</div>
       <div v-else-if="visibleAgents.length === 0" class="sidebar-empty">{{ agentListLoading ? t("common.loading") : t("agent.editor.noResults") }}</div>
+      <div v-if="agentDefaultError" class="sidebar-empty" role="alert">{{ agentDefaultError }}</div>
       <button
         v-for="ag in visibleAgents"
         :key="ag.id"
@@ -1475,9 +1533,11 @@ watch(
         :title="ag.description"
         :class="{ active: selectedAgentId === ag.id }"
         @click="switchAgent(ag.id)"
+        @contextmenu.prevent.stop="openAgentContextMenu($event, ag)"
       >
         <div class="agent-tab-head">
           <div class="agent-tab-name">{{ ag.name }}</div>
+          <span v-if="workspaceRef && ag.isDefault" class="agent-tab-default" :title="t('agent.workspaceDefault')">{{ t('agent.selector.default') }}</span>
           <span v-if="!listOnly && agentProjectTypesLabel(ag)" class="agent-tab-project-types">
             {{ agentProjectTypesLabel(ag) }}
           </span>
@@ -1485,6 +1545,20 @@ watch(
         <div v-if="!listOnly" class="agent-tab-desc">{{ ag.description }}</div>
       </button>
     </div>
+    <BaseContextMenu
+      v-if="agentContextMenu"
+      class="agent-list-ctx-menu"
+      :x="agentContextMenu.x"
+      :y="agentContextMenu.y"
+      @close="agentContextMenu = null"
+    >
+      <button
+        type="button"
+        role="menuitem"
+        :disabled="agentDefaultSaving || !contextAgent || contextAgent.isDefault"
+        @click="setDefaultAgentFromContext"
+      >{{ t('agent.setWorkspaceDefault') }}</button>
+    </BaseContextMenu>
     <div v-if="!embedded && !listOnly" class="resize-handle" @mousedown="onResizeStart($event, 'sidebar')"></div>
 
     <template v-if="selectedAgentId && !listOnly">
@@ -2186,6 +2260,10 @@ watch(
 }
 
 .agent-tab-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 13px;
   font-weight: 600;
   color: var(--text-color);
@@ -2205,6 +2283,7 @@ watch(
 .agent-search { box-sizing: border-box; width: 100%; height: 28px; padding: 0 8px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-color); color: var(--text-color); font: inherit; font-size: 12px; }
 .agent-search:focus-visible { outline: 1px solid var(--accent-color); outline-offset: -1px; }
 
+.agent-tab-default,
 .agent-tab-project-types {
   margin-left: auto;
   color: var(--text-tertiary, var(--text-secondary));
@@ -2212,6 +2291,7 @@ watch(
   font-weight: 500;
   line-height: 1.3;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .agent-tab.active .agent-tab-name {

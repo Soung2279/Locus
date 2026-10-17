@@ -1,14 +1,23 @@
 <script setup lang="ts">
+import { useWindowSurface } from "../../composables/useWindowSurface";
+const { ownerWindow, ownerDocument } = useWindowSurface();
 import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, useSlots, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
-import { FileText, Layers, LoaderCircle, X } from "lucide";
+import { FileText, Layers, LoaderCircle, MessageSquare, X } from "lucide";
+import { registerScreenshotInput } from "../../services/screenshots";
 import { t } from "../../i18n";
 import {
   searchWorkspaceAssets,
-  searchWorkspaceSceneObjects,
+  searchLoadedSceneObjects,
   type WorkspaceSceneObjectSearchResult,
 } from "../../services/asset";
 import { knowledgeQuery } from "../../services/knowledge";
+import { viewList } from "../../services/view";
+import { searchSessionTitles } from "../../services/session";
+import {
+  appendSessionReferences, extractSessionReferences, normalizeSessionReferences,
+  sessionIdFromReference, sessionReferenceUrl, type SessionReferenceAttachment,
+} from "../../composables/sessionReferences";
 import {
   listDirEntriesPage,
   searchWorkspaceEntries,
@@ -85,7 +94,7 @@ import {
 } from "../../services/permissions";
 import AssetChip from "../AssetChip.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
-import MentionPopup from "./MentionPopup.vue";
+import MentionPopup, { type MentionDisplayEntry } from "./MentionPopup.vue";
 import ChatComposer from "./ChatComposer.vue";
 import ChatInputShell from "./ChatInputShell.vue";
 import {
@@ -93,21 +102,11 @@ import {
   type WorkbenchComposerFileAttachment,
 } from "../workbench/workbenchComposerDrop";
 import { mapWorkspaceMentionResults } from "./mentionWorkspaceSearch";
+import { mapViewMentionResult } from "./mentionViewSearch";
+import { mapSessionMentionResult } from "./mentionSessionSearch";
 import { mentionResultKey, rankMentionSearchResults } from "./mentionSearchRanking";
 import { createMentionSearchQueue } from "./mentionSearchQueue";
 import { useMentionWorkspaceCandidates, type MentionSearchResult } from "./useMentionWorkspaceCandidates";
-
-interface MentionDisplayEntry {
-  relPath: string;
-  name: string;
-  parentPath?: string;
-  isDir: boolean;
-  meta?: string;
-  canNavigate?: boolean;
-  isCurrentPath?: boolean;
-  entryKind?: "asset" | "knowledge" | "sceneObject";
-  localFile?: LocusFileDropRef;
-}
 
 const PASTE_THRESHOLD = 500;
 const ASSET_REF_COLLAPSE_THRESHOLD = 5;
@@ -164,6 +163,7 @@ const props = withDefaults(defineProps<{
   cancelling?: boolean;
   canResume?: boolean;
   sendLabel?: string;
+  beforeSend?: () => Promise<boolean>;
   cancelLabel?: string;
   resumeLabel?: string;
   allowImages?: boolean;
@@ -229,6 +229,8 @@ const emit = defineEmits<{
 const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
 const notificationStore = useNotificationStore();
 const slots = useSlots();
+const sendPending = ref(false);
+let composerDisposed = false;
 const { state: chatInputSettings } = useChatInputSettings();
 const restoredSharedDraft = readSharedComposerDraft(props.draftStateKey);
 
@@ -277,6 +279,12 @@ const {
 const pastedContent = ref("");
 const showPasteEditor = ref(false);
 const imageAttachments = ref<ImageAttachment[]>([]);
+const screenshotCommandPending = ref(false);
+const screenshotInput = registerScreenshotInput(() => props.draftStateKey, () => props.workspaceRef, (image) => {
+  if (!imageAttachments.value.some(item => item.capture?.id === image.capture?.id)) imageAttachments.value.push(image);
+  return true;
+});
+onUnmounted(() => screenshotInput.dispose());
 const assetRefAttachments = ref<AssetRefAttachment[]>([]);
 const showAssetRefDetails = ref(false);
 const knowledgeQuoteAttachments = ref<KnowledgeQuoteAttachment[]>([]);
@@ -284,6 +292,7 @@ const consoleTextAttachments = ref<ConsoleTextAttachment[]>([]);
 const showConsoleTextDetails = ref(false);
 const unityConsoleCommandPending = ref(false);
 const localFileAttachments = ref<LocalFileAttachment[]>([]);
+const sessionRefAttachments = ref<SessionReferenceAttachment[]>(normalizeSessionReferences(restoredSharedDraft?.sessionRefs));
 const localFileDragActive = ref(false);
 const showLocalFileDetails = ref(false);
 const previewImageIndex = ref<number | null>(null);
@@ -346,6 +355,8 @@ function createMentionProviderQueues() {
     assets: createMentionSearchQueue(),
     workspace: createMentionSearchQueue(),
     knowledge: createMentionSearchQueue(),
+    views: createMentionSearchQueue(),
+    sessions: createMentionSearchQueue(),
     scenes: createMentionSearchQueue(),
   };
 }
@@ -355,6 +366,8 @@ function emptyMentionProviderResults() {
     assets: [] as MentionSearchResult[],
     workspace: [] as MentionSearchResult[],
     knowledge: [] as MentionSearchResult[],
+    views: [] as MentionSearchResult[],
+    sessions: [] as MentionSearchResult[],
     scenes: [] as MentionSearchResult[],
   };
 }
@@ -388,6 +401,7 @@ const hasTopAttachments = computed(() =>
   || knowledgeQuoteAttachments.value.length > 0
   || consoleTextAttachments.value.length > 0
   || localFileAttachments.value.length > 0
+  || sessionRefAttachments.value.length > 0
   || props.managedLocalFiles.length > 0,
 );
 
@@ -397,6 +411,8 @@ const hasBlockingManagedLocalFile = computed(() =>
 
 const canSend = computed(() =>
   !hasBlockingManagedLocalFile.value
+  && imageAttachments.value.length <= props.maxImages
+  && !screenshotCommandPending.value
   && (
     !!props.modelValue.trim()
     || !!pastedContent.value
@@ -405,6 +421,7 @@ const canSend = computed(() =>
     || knowledgeQuoteAttachments.value.length > 0
     || consoleTextAttachments.value.length > 0
     || localFileAttachments.value.length > 0
+    || sessionRefAttachments.value.length > 0
     || props.managedLocalFiles.some((file) => file.status === "ready" && !!file.path?.trim())
   ),
 );
@@ -417,6 +434,7 @@ function isDraftEmpty() {
     && knowledgeQuoteAttachments.value.length === 0
     && consoleTextAttachments.value.length === 0
     && localFileAttachments.value.length === 0
+    && sessionRefAttachments.value.length === 0
     && props.managedLocalFiles.length === 0
     && !hasComposerIntent(composerIntent.value);
 }
@@ -442,6 +460,7 @@ const RUNTIME_SAFE_ACTION_COMMANDS: readonly IntentCommandType[] = [
   "export-context",
   "review-context",
 ];
+const SCREENSHOT_COMMANDS: readonly IntentCommandType[] = ["capture-scene", "capture-game"];
 const runtimeSafeActionCommands = computed<readonly IntentCommandType[]>(() => (
   props.allowRuntimeCompact
     ? ["compact", ...RUNTIME_SAFE_ACTION_COMMANDS]
@@ -457,8 +476,8 @@ const allowActionCommands = computed(() =>
 const actionCommandFilterOptions = computed(() => ({
   includeActions: allowActionCommands.value && !props.isStreaming,
   allowedActionTypes: allowActionCommands.value && props.isStreaming
-    ? runtimeSafeActionCommands.value
-    : undefined,
+    ? [...runtimeSafeActionCommands.value, ...SCREENSHOT_COMMANDS]
+    : SCREENSHOT_COMMANDS,
 }));
 
 const filteredCommands = computed(() =>
@@ -569,26 +588,6 @@ function mapSceneObjectSearchResult(result: WorkspaceSceneObjectSearchResult): M
   };
 }
 
-function searchableUnityScenePaths(status: {
-  connected: boolean;
-  scenePath?: string | null;
-  scenePaths?: string[] | null;
-}): string[] {
-  if (!status.connected) return [];
-  const candidates = [status?.scenePath, ...(status?.scenePaths ?? [])];
-  const seen = new Set<string>();
-  const scenePaths: string[] = [];
-  for (const candidate of candidates) {
-    const scenePath = candidate?.trim().replace(/\\/g, "/");
-    if (!scenePath || !scenePath.toLowerCase().endsWith(".unity")) continue;
-    const key = scenePath.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    scenePaths.push(scenePath);
-  }
-  return scenePaths;
-}
-
 const rankedMentionSearchResults = computed(() =>
   rankMentionSearchResults(
     [...localMentionCandidates.value, ...mentionSearchResults.value]
@@ -635,6 +634,8 @@ const mentionDisplayList = computed<MentionDisplayEntry[]>(() => {
       meta: result.meta,
       canNavigate: result.isDir && !result.localFile,
       entryKind: result.entryKind,
+      viewIcon: result.viewIcon,
+      updatedAt: result.updatedAt,
       localFile: result.localFile,
     }));
   }
@@ -869,6 +870,8 @@ async function searchAssets(query: string) {
     assets: assetResults,
     workspace: workspaceResults,
     knowledge: knowledgeResults,
+    views: viewResults,
+    sessions: sessionResults,
     scenes: sceneObjectResults,
   } = mentionProviderResults;
 
@@ -885,42 +888,33 @@ async function searchAssets(query: string) {
     if (mentionProviderResults.assets === assetResults
       && mentionProviderResults.workspace === workspaceResults
       && mentionProviderResults.knowledge === knowledgeResults
+      && mentionProviderResults.views === viewResults
+      && mentionProviderResults.sessions === sessionResults
       && mentionProviderResults.scenes === sceneObjectResults) return;
     mentionProviderResults = {
       assets: assetResults, workspace: workspaceResults,
       knowledge: knowledgeResults, scenes: sceneObjectResults,
+      views: viewResults,
+      sessions: sessionResults,
     };
     mentionSearchResults.value = [
       ...assetResults,
       ...workspaceResults,
       ...sceneObjectResults,
       ...knowledgeResults,
+      ...viewResults,
+      ...sessionResults,
     ];
   }
 
-  async function searchOpenSceneObjectsFromDisk() {
-    const status = await checkUnityConnectionStatus(workspaceRef!);
+  async function searchOpenSceneObjects() {
+    // The connection-readiness DTO deliberately has no scene paths. Ask the
+    // editor's cached hierarchy directly, once for all loaded scenes.
+    const results = await searchLoadedSceneObjects(
+      query, MAX_SCENE_OBJECT_MENTION_RESULTS, workspaceRef!,
+    );
     if (!requestIsCurrent()) return;
-    const scenePaths = searchableUnityScenePaths(status);
-    if (scenePaths.length === 0) {
-      sceneObjectResults = [];
-      publishResults();
-      return;
-    }
-    const searches = await Promise.allSettled(scenePaths.map((scenePath) => (
-      searchWorkspaceSceneObjects(
-        scenePath,
-        query,
-        MAX_SCENE_OBJECT_MENTION_RESULTS,
-        workspaceRef!,
-      )
-    )));
-    if (!requestIsCurrent()) return;
-    sceneObjectResults = searches.flatMap((search) => (
-      search.status === "fulfilled"
-        ? search.value.map(mapSceneObjectSearchResult)
-        : []
-    ));
+    sceneObjectResults = results.map(mapSceneObjectSearchResult);
     publishResults();
   }
 
@@ -965,11 +959,30 @@ async function searchAssets(query: string) {
         knowledgeResults = [];
         publishResults();
       });
+    const viewSearchPromise = mentionSearchQueues.views.run(() => viewList(workspaceRef))
+      .then((results) => {
+        if (!results || !requestIsCurrent()) return;
+        viewResults = results.map((view) => mapViewMentionResult(view, props.workspaceRoot));
+        publishResults();
+      }).catch(() => {
+        viewResults = [];
+        publishResults();
+      });
     await Promise.allSettled([
       assetSearchPromise,
       workspaceSearchPromise,
       knowledgeSearchPromise,
-      mentionSearchQueues.scenes.run(searchOpenSceneObjectsFromDisk).catch(() => {
+      viewSearchPromise,
+      mentionSearchQueues.sessions.run(() => searchSessionTitles(query, workspaceRef))
+        .then((results) => {
+          if (!results || !requestIsCurrent()) return;
+          sessionResults = results.map(mapSessionMentionResult);
+          publishResults();
+        }).catch(() => {
+          sessionResults = [];
+          publishResults();
+        }),
+      mentionSearchQueues.scenes.run(searchOpenSceneObjects).catch(() => {
         sceneObjectResults = [];
         publishResults();
       }),
@@ -1063,7 +1076,7 @@ function checkMentionTrigger(operator: ActiveOperator, preserveSelection = false
       mentionHighlightIndex.value = Math.min(mentionHighlightIndex.value, mentionDisplayList.value.length - 1);
     }
     if (fetchChanged) {
-      scheduleMentionFetch(() => { void searchAssets(operator.query); }, 60);
+      scheduleMentionFetch(() => { void searchAssets(operator.query); }, 25);
     }
   }
 
@@ -1211,6 +1224,10 @@ function executeCommandFromPopup(command: CommandDef) {
   showCommandPopup.value = false;
 
   if (command.commandKind === "action") {
+    if (SCREENSHOT_COMMANDS.includes(command.commandType)) {
+      executeActionCommand(command);
+      return;
+    }
     setInputValue(command.name);
     nextTick(() => {
       const end = command.name.length;
@@ -1279,6 +1296,21 @@ function buildMentionAttachment(entry: MentionDisplayEntry): WorkbenchComposerFi
 
 async function selectMentionEntry(entry: MentionDisplayEntry) {
   if (mentionSelectionPending.value) return;
+  if (entry.entryKind === "session") {
+    const sessionId = sessionIdFromReference(entry.relPath);
+    if (!sessionId) return;
+    const text = removeTextRange(props.modelValue, mentionAnchor.value, mentionTokenEnd.value);
+    const cursor = Math.max(0, Math.min(mentionAnchor.value, text.length));
+    dismissOperatorPopupForCursor(text, cursor);
+    setInputValue(text);
+    addSessionRefAttachments([{ sessionId, title: entry.name }]);
+    closeMentionPopup();
+    nextTick(() => {
+      focusComposerSelection(cursor);
+      syncOperatorState();
+    });
+    return;
+  }
   const mentionPath = entry.isDir && !entry.relPath.endsWith("/")
     ? `${entry.relPath}/`
     : entry.relPath;
@@ -1520,8 +1552,8 @@ function broadcastAssetRefDraft(assetRefs: AssetRefAttachment[], key = currentAs
   assetRefSyncChannel?.postMessage(message);
 
   try {
-    window.localStorage.setItem(ASSET_REF_SYNC_STORAGE_KEY, JSON.stringify(message));
-    window.localStorage.removeItem(ASSET_REF_SYNC_STORAGE_KEY);
+    ownerWindow.localStorage.setItem(ASSET_REF_SYNC_STORAGE_KEY, JSON.stringify(message));
+    ownerWindow.localStorage.removeItem(ASSET_REF_SYNC_STORAGE_KEY);
   } catch {
     // Local storage can be disabled; BroadcastChannel is the primary path.
   }
@@ -1569,11 +1601,11 @@ function setupAssetRefSync() {
       applyAssetRefSyncMessage(event.data);
     };
   }
-  window.addEventListener("storage", handleAssetRefSyncStorage);
+  ownerWindow.addEventListener("storage", handleAssetRefSyncStorage);
 }
 
 function teardownAssetRefSync() {
-  window.removeEventListener("storage", handleAssetRefSyncStorage);
+  ownerWindow.removeEventListener("storage", handleAssetRefSyncStorage);
   assetRefSyncChannel?.close();
   assetRefSyncChannel = null;
 }
@@ -2026,6 +2058,14 @@ function appendAssetRefsPromptBlock(text: string, assetRefs: AssetRefAttachment[
   return text.trim() ? `${text}\n\n${block}` : block;
 }
 
+function addSessionRefAttachments(references: SessionReferenceAttachment[]) {
+  sessionRefAttachments.value = normalizeSessionReferences([...sessionRefAttachments.value, ...references]);
+}
+
+function removeSessionRefAttachment(index: number) {
+  sessionRefAttachments.value = sessionRefAttachments.value.filter((_, itemIndex) => itemIndex !== index);
+}
+
 function resetDraft() {
   setInputValue("");
   pastedContent.value = "";
@@ -2033,6 +2073,7 @@ function resetDraft() {
   knowledgeQuoteAttachments.value = [];
   clearConsoleTextAttachments();
   clearLocalFileAttachments();
+  sessionRefAttachments.value = [];
   setAssetRefAttachments([]);
   closeImagePreview();
   composerIntent.value = emptyComposerIntent();
@@ -2071,9 +2112,10 @@ async function appendDraft(draft: UserMessageDraft) {
 function exportDraft(): UserMessageDraft {
   return {
     text: props.modelValue,
-    images: imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType })),
+    images: imageAttachments.value.map((image) => ({ ...image })),
     assetRefs: assetRefAttachments.value.map((item) => ({ ...item })),
     knowledgeQuotes: knowledgeQuoteAttachments.value.map(({ id: _id, ...quote }) => ({ ...quote })),
+    sessionRefs: sessionRefAttachments.value.map((reference) => ({ ...reference })),
     localFiles: localFileAttachments.value.map((item) => ({ ...item })),
     consoleTexts: consoleTextAttachments.value.map((item) => ({ ...item })),
     intent: JSON.parse(JSON.stringify(composerIntent.value)) as ComposerIntentState,
@@ -2098,13 +2140,16 @@ function appendDraftText(text: string) {
 }
 
 async function applyUserMessageDraft(draft: UserMessageDraft) {
-  const cursor = appendDraftText(draft.text);
+  const inlineSessions = extractSessionReferences(draft.text);
+  const cursor = appendDraftText(inlineSessions.text);
+  addSessionRefAttachments([...inlineSessions.sessionRefs, ...normalizeSessionReferences(draft.sessionRefs)]);
   const remainingImageSlots = Math.max(0, props.maxImages - imageAttachments.value.length);
   if (remainingImageSlots > 0) {
     imageAttachments.value.push(
       ...draft.images.slice(0, remainingImageSlots).map((image) => ({
         data: image.data,
         mimeType: image.mimeType,
+        capture: image.capture ? { ...image.capture } : undefined,
       })),
     );
   }
@@ -2222,21 +2267,57 @@ function buildSendPayload(
   };
 }
 
+async function attachScreenshotFromCommand(command: CommandDef) {
+  if (props.disabled || screenshotCommandPending.value) return;
+  if (imageAttachments.value.length >= props.maxImages) {
+    notificationStore.addNotice("warning", t("capture.imageLimit"));
+    return;
+  }
+  if (!props.workspaceRef) {
+    notificationStore.addNotice("error", t("capture.workspaceRequired"));
+    return;
+  }
+  const operator = activeOperator.value;
+  if (operator?.kind === "slash") {
+    setInputValue(removeTextRange(props.modelValue, operator.start, operator.end));
+  } else if (props.modelValue.trim().toLowerCase() === command.name) {
+    setInputValue("");
+  }
+  activeOperator.value = null;
+  dismissedOperatorKey.value = null;
+  showCommandPopup.value = false;
+  screenshotCommandPending.value = true;
+  try {
+    await screenshotInput.capture(command.commandType === "capture-scene" ? "scene" : "game");
+  } catch (error) {
+    notificationStore.addNotice("error", normalizeAppError(error).message, { operation: "screenshot", replaceOperation: true });
+  } finally {
+    screenshotCommandPending.value = false;
+  }
+}
+
 function canExecuteActionCommand(): boolean {
   return !unityConsoleCommandPending.value
+    && !screenshotCommandPending.value
     && !pastedContent.value
     && imageAttachments.value.length === 0
     && assetRefAttachments.value.length === 0
     && knowledgeQuoteAttachments.value.length === 0
     && consoleTextAttachments.value.length === 0
     && localFileAttachments.value.length === 0
+    && sessionRefAttachments.value.length === 0
     && !hasComposerIntent(composerIntent.value);
 }
 
 const { collect: collectDatabaseGarbage } = useGarbageCollection();
 
 function executeActionCommand(command: CommandDef): boolean {
-  if (command.commandKind !== "action" || !canExecuteActionCommand()) return false;
+  if (command.commandKind !== "action") return false;
+  if (SCREENSHOT_COMMANDS.includes(command.commandType)) {
+    void attachScreenshotFromCommand(command);
+    return true;
+  }
+  if (!canExecuteActionCommand()) return false;
   if (
     props.isStreaming
     && !runtimeSafeActionCommands.value.includes(command.commandType)
@@ -2300,7 +2381,7 @@ function executeActionCommand(command: CommandDef): boolean {
 
 function tryHandleExactActionCommand(): boolean {
   const typed = props.modelValue.trim();
-  if (!typed || !canExecuteActionCommand()) {
+  if (!typed) {
     return false;
   }
 
@@ -2308,7 +2389,14 @@ function tryHandleExactActionCommand(): boolean {
   return command ? executeActionCommand(command) : false;
 }
 
-function handleSend() {
+async function handleSend() {
+  if (props.disabled || sendPending.value) return;
+  if (screenshotCommandPending.value) return;
+  if (imageAttachments.value.length > props.maxImages) return;
+  if (!props.allowImages && imageAttachments.value.some(image => image.capture)) {
+    notificationStore.addNotice("warning", t("capture.visionRequired"));
+    return;
+  }
   if (unityConsoleCommandPending.value) {
     return;
   }
@@ -2330,7 +2418,7 @@ function handleSend() {
   const inlineAssetRefs = extractInlineUnityAssetRefs(parsed.cleanedText);
   const cleanedInput = normalizeComposerText(inlineAssetRefs.text);
   const images: ImageAttachment[] = props.allowImages
-    ? imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType }))
+    ? imageAttachments.value.map((image) => ({ ...image }))
     : [];
   const explicitAssetRefs = dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);
   const quotes = [...knowledgeQuoteAttachments.value];
@@ -2351,6 +2439,7 @@ function handleSend() {
     && assetRefs.length === 0
     && consoleTexts.length === 0
     && localFiles.length === 0
+    && sessionRefAttachments.value.length === 0
   ) {
     if (hasComposerIntent(mergedIntent)) {
       showUserIntentMissingInputNotice();
@@ -2358,9 +2447,12 @@ function handleSend() {
     return;
   }
 
-  const text = pastedContent.value
-    ? (cleanedInput ? `${cleanedInput}\n\n${pastedContent.value}` : pastedContent.value)
-    : cleanedInput;
+  const text = appendSessionReferences(
+    pastedContent.value
+      ? (cleanedInput ? `${cleanedInput}\n\n${pastedContent.value}` : pastedContent.value)
+      : cleanedInput,
+    sessionRefAttachments.value,
+  );
 
   const textWithQuotes = appendKnowledgeQuotePromptBlock(text, quotes);
   const textWithConsole = appendConsoleTextPromptBlock(textWithQuotes, consoleTexts);
@@ -2371,6 +2463,23 @@ function handleSend() {
     localFiles,
   );
   const payload = buildSendPayload(sendText, images, assetRefs, mergedIntent, displayText);
+  if (props.beforeSend) {
+    const draftKey = props.draftStateKey;
+    const draft = JSON.stringify(exportDraft());
+    const managedFiles = JSON.stringify(props.managedLocalFiles);
+    const agentId = props.selectedAgentId;
+    sendPending.value = true;
+    try {
+      if (!await props.beforeSend()) return;
+      if (composerDisposed || draftKey !== props.draftStateKey || agentId !== props.selectedAgentId
+        || managedFiles !== JSON.stringify(props.managedLocalFiles) || draft !== JSON.stringify(exportDraft())) return;
+    } catch (error) {
+      notificationStore.addNotice("error", String(error));
+      return;
+    } finally {
+      sendPending.value = false;
+    }
+  }
   resetDraft();
   emit("send", payload);
 }
@@ -2568,7 +2677,7 @@ function setFileDragDropEffect(event: DragEvent) {
 
 function clearLocalFileDragStateTimer() {
   if (!localFileDragStateClearTimer) return;
-  window.clearTimeout(localFileDragStateClearTimer);
+  ownerWindow.clearTimeout(localFileDragStateClearTimer);
   localFileDragStateClearTimer = 0;
 }
 
@@ -2580,7 +2689,7 @@ function resetLocalFileDragState() {
 
 function scheduleLocalFileDragStateExpiry() {
   clearLocalFileDragStateTimer();
-  localFileDragStateClearTimer = window.setTimeout(() => {
+  localFileDragStateClearTimer = ownerWindow.setTimeout(() => {
     localFileDragStateClearTimer = 0;
     localFileDragDepth = 0;
     localFileDragActive.value = false;
@@ -2773,7 +2882,16 @@ watch(() => props.modelValue, () => {
 
 watch(
   () => props.modelValue,
-  (text) => updateSharedComposerDraftText(props.draftStateKey, text),
+  (text) => {
+    // Also upgrade existing drafts and pasted references to the attachment UI.
+    const extracted = extractSessionReferences(text);
+    if (extracted.sessionRefs.length) {
+      addSessionRefAttachments(extracted.sessionRefs);
+      setInputValue(extracted.text);
+      writeSharedComposerDraft(props.draftStateKey, { ...exportDraft(), text: extracted.text });
+    }
+    updateSharedComposerDraftText(props.draftStateKey, extracted.text);
+  },
   { flush: "sync", immediate: true },
 );
 
@@ -2784,6 +2902,7 @@ watch(
     knowledgeQuoteAttachments,
     consoleTextAttachments,
     localFileAttachments,
+    sessionRefAttachments,
     composerIntent,
   ],
   persistSharedComposerDraft,
@@ -2855,11 +2974,11 @@ onMounted(() => {
   locusFileDropSubscriptionDisposed = false;
   locusFileDragStateSubscriptionDisposed = false;
   setupAssetRefSync();
-  document.addEventListener("keydown", handleDocumentKeydown);
-  document.addEventListener("mousedown", handleDocumentMouseDown);
-  document.addEventListener("drop", handleDocumentLocalFileDrop);
-  document.addEventListener("dragend", handleDocumentLocalFileDragEnd);
-  window.addEventListener("blur", handleWindowLocalFileDragBlur);
+  ownerDocument.addEventListener("keydown", handleDocumentKeydown);
+  ownerDocument.addEventListener("mousedown", handleDocumentMouseDown);
+  ownerDocument.addEventListener("drop", handleDocumentLocalFileDrop);
+  ownerDocument.addEventListener("dragend", handleDocumentLocalFileDragEnd);
+  ownerWindow.addEventListener("blur", handleWindowLocalFileDragBlur);
   if (!props.managedNativeDrops) {
     subscribeUnityEmbedAssetDrop((payload) => {
       void handleUnityEmbedAssetDrop(payload).catch((error) => {
@@ -2922,15 +3041,16 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  composerDisposed = true;
   unityAssetDropSubscriptionDisposed = true;
   unityTextDropSubscriptionDisposed = true;
   locusFileDropSubscriptionDisposed = true;
   locusFileDragStateSubscriptionDisposed = true;
-  document.removeEventListener("keydown", handleDocumentKeydown);
-  document.removeEventListener("mousedown", handleDocumentMouseDown);
-  document.removeEventListener("drop", handleDocumentLocalFileDrop);
-  document.removeEventListener("dragend", handleDocumentLocalFileDragEnd);
-  window.removeEventListener("blur", handleWindowLocalFileDragBlur);
+  ownerDocument.removeEventListener("keydown", handleDocumentKeydown);
+  ownerDocument.removeEventListener("mousedown", handleDocumentMouseDown);
+  ownerDocument.removeEventListener("drop", handleDocumentLocalFileDrop);
+  ownerDocument.removeEventListener("dragend", handleDocumentLocalFileDragEnd);
+  ownerWindow.removeEventListener("blur", handleWindowLocalFileDragBlur);
   teardownAssetRefSync();
   releaseUnityAssetDrop?.();
   releaseUnityAssetDrop = null;
@@ -2946,6 +3066,7 @@ onUnmounted(() => {
 });
 
 defineExpose({
+  send: handleSend,
   focus() {
     composerRef.value?.focus();
   },
@@ -3173,7 +3294,7 @@ defineExpose({
       ref="composerRef"
       :model-value="modelValue"
       :placeholder="placeholder"
-      :disabled="disabled"
+      :disabled="disabled || sendPending"
       :is-streaming="isStreaming"
       :cancelling="cancelling"
       :can-send="canSend"
@@ -3204,6 +3325,9 @@ defineExpose({
       @cancel="emit('cancel')"
       @resume="emit('resume')"
     >
+      <template v-if="slots['before-input']" #before-input>
+        <slot name="before-input" />
+      </template>
       <template #overlay>
         <div v-if="hasTopAttachments" class="composer-attachment-list">
           <div
@@ -3323,6 +3447,23 @@ defineExpose({
             >
               <LucideIcon :icon="X" :size="13" />
             </button>
+          </div>
+          <div
+            v-for="(reference, index) in sessionRefAttachments"
+            :key="reference.sessionId"
+            class="local-file-chip session-ref-attachment"
+            :title="sessionReferenceUrl(reference.sessionId)"
+          >
+            <LucideIcon class="local-file-chip-icon" :icon="MessageSquare" :size="14" />
+            <span class="local-file-chip-name">{{ reference.title }}</span>
+            <span class="local-file-chip-meta">{{ t("chat.mention.session") }}</span>
+            <button
+              type="button"
+              class="local-file-chip-remove ui-select-none"
+              :aria-label="t('chat.sessionRef.remove')"
+              :title="t('chat.sessionRef.remove')"
+              @click.stop="removeSessionRefAttachment(index)"
+            ><LucideIcon :icon="X" :size="13" /></button>
           </div>
           <div
             v-if="shouldCollapseAssetRefs"
@@ -3753,6 +3894,18 @@ defineExpose({
   overflow: hidden;
   text-overflow: ellipsis;
   font-family: var(--font-mono-identifier);
+}
+
+:deep(.mention-time) {
+  flex: 0 0 auto;
+  max-width: 88px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 :deep(.mention-name-fragment),

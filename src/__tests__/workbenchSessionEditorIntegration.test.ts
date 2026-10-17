@@ -1,10 +1,14 @@
 // @vitest-environment jsdom
 import { createApp, defineComponent, h, nextTick, reactive, ref } from "vue";
+import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceRef } from "../services/project";
 import { saveSessionExecutionState, unarchiveSession } from "../services/session";
 import { broadcastSessionExecutionState } from "../services/sessionExecutionState";
 import type { WorkbenchEditorInput } from "../types/workbench";
+import { useWorkspaceNavigationMode } from "../composables/useWorkspaceNavigationMode";
+import { useNewSessionSettings } from "../composables/useNewSessionSettings";
+import { useSurfaceContentReadiness } from "../composables/surfaceContentReadiness";
 
 const compact = vi.fn();
 const resumeInterrupted = vi.fn();
@@ -16,6 +20,14 @@ const loadSessionTurnPreview = vi.fn();
 const loadSessionHistoryThroughMessage = vi.fn();
 const addNotice = vi.fn();
 const changesState = reactive({ panelVisible: false });
+const agentStore = reactive({
+  selectedAgentId: "agent-a",
+  workspaceCheckoutId: "checkout-pane",
+  agents: [
+    { id: "agent-a", name: "Agent A", isDefault: true, defaultEffort: "high" },
+    { id: "agent-child", name: "Child Agent", isDefault: false, defaultEffort: "low" },
+  ],
+});
 
 const controller = {
   inputText: ref(""),
@@ -92,6 +104,8 @@ let thinkingPanelProps: Record<string, unknown> | null = null;
 let sidebarProps: Record<string, unknown> | null = null;
 let requestedSession: { value: string | null } | null = null;
 let beforeSessionLaunch: ((sessionId: string) => Promise<void>) | undefined;
+let holdChatContentOnMount = false;
+let releaseChatContent: (() => void) | null = null;
 
 vi.mock("../composables/useEmbeddedChatSession", () => ({
   useEmbeddedChatSession: (options: { initialSessionId: { value: string | null }; beforeSessionLaunch: (sessionId: string) => Promise<void> }) => {
@@ -126,24 +140,16 @@ vi.mock("../composables/useWorkspaceUnityStatus", () => ({
   }),
 }));
 vi.mock("../services/session", () => ({ saveSessionExecutionState: vi.fn(), unarchiveSession: vi.fn() }));
+const selectionMemoryService = vi.hoisted(() => ({
+  getWorkspaceSelection: vi.fn(),
+  saveWorkspaceSelection: vi.fn(),
+}));
+vi.mock("../services/selectionMemory", () => selectionMemoryService);
 vi.mock("../services/sessionExecutionState", () => ({
   broadcastSessionExecutionState: vi.fn(),
 }));
 vi.mock("../stores/agent", () => ({
-  useAgentStore: () => ({
-    selectedAgentId: "agent-a",
-    agents: [{
-      id: "agent-a",
-      name: "Agent A",
-      isDefault: true,
-      defaultEffort: "high",
-    }, {
-      id: "agent-child",
-      name: "Child Agent",
-      isDefault: false,
-      defaultEffort: "low",
-    }],
-  }),
+  useAgentStore: () => agentStore,
 }));
 vi.mock("../stores/auth", () => ({
   useAuthStore: () => ({ codexAuthenticated: true }),
@@ -156,8 +162,19 @@ vi.mock("../stores/chatChanges", () => ({
     refresh: vi.fn(async () => undefined),
   }),
 }));
+const modelStoreState = reactive({
+  modelDefaults: { mainModel: "" },
+  agentModelPreferences: {} as Record<string, { modelId: string; effort: string }>,
+  lastModelId: "",
+});
 vi.mock("../stores/model", () => ({
   useModelStore: () => ({
+    get modelDefaults() { return modelStoreState.modelDefaults; },
+    get agentModelPreferences() { return modelStoreState.agentModelPreferences; },
+    get lastModelId() { return modelStoreState.lastModelId; },
+    defaultCodexFastMode: true,
+    effortsForModel: (modelId: string) => (modelId.startsWith("model-") ? ["low", "high"] : []),
+    noteRememberedSelection: (_agentId: string, modelId: string) => { modelStoreState.lastModelId = modelId; },
     selectedModelId: "model-a",
     effort: "high",
     effectiveCodexFastMode: true,
@@ -216,8 +233,10 @@ vi.mock("../components/ChatView.vue", () => ({
       loadSessionTurnPreview: Function,
       loadSessionHistoryThroughMessage: Function,
       forkFromMessage: Function,
+      presented: { type: Boolean, default: undefined },
     },
     emits: [
+      "newChat",
       "compact",
       "fork",
       "resume",
@@ -226,9 +245,12 @@ vi.mock("../components/ChatView.vue", () => ({
       "reviewSessionContext",
       "openThinking",
       "selectMultiAgent",
+      "selectAgent",
+      "selectModel",
     ],
-    setup(props, { emit, expose }) {
+    setup(props, { emit, expose, slots }) {
       chatViewProps = props as unknown as Record<string, unknown>;
+      if (holdChatContentOnMount) releaseChatContent = useSurfaceContentReadiness()?.hold() ?? null;
       expose({
         applyDraftPrefill: vi.fn(),
         appendComposerDraft: vi.fn(),
@@ -236,7 +258,11 @@ vi.mock("../components/ChatView.vue", () => ({
         focusComposerInput: vi.fn(),
       });
       return () => h("div", { class: "chat-view-stub" }, [
+        slots["session-picker"]?.(),
+        h("button", { class: "new-chat", onClick: () => emit("newChat", { source: "control" }) }, "new chat"),
         h("button", { class: "multi-agent", onClick: () => emit("selectMultiAgent", !props.multiAgentEnabled) }, "multi agent"),
+        h("button", { class: "select-child-agent", onClick: () => emit("selectAgent", "agent-child") }, "child agent"),
+        h("button", { class: "select-child-model", onClick: () => emit("selectModel", "model-child") }, "child model"),
         h("button", { class: "compact", onClick: () => emit("compact") }, "compact"),
         h("button", { class: "resume", onClick: () => emit("resume") }, "resume"),
         h("button", { class: "plan", onClick: () => emit("requestPlanMode", true) }, "plan"),
@@ -332,6 +358,27 @@ function mountEditor(listeners: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  setActivePinia(createPinia());
+  modelStoreState.modelDefaults = { mainModel: "" };
+  modelStoreState.agentModelPreferences = {};
+  modelStoreState.lastModelId = "";
+  selectionMemoryService.getWorkspaceSelection.mockResolvedValue({
+    projectId: "project-a",
+    memory: { agentId: "", modelId: "", effort: "", agents: {}, updatedAtMs: 0 },
+    lastAgentId: "",
+    workspaceDefaultAgentId: null,
+  });
+  selectionMemoryService.saveWorkspaceSelection.mockImplementation(async () => undefined);
+  controller.setExecutionSelection.mockReset();
+  controller.sessionId.value = "session-source";
+  agentStore.selectedAgentId = "agent-a";
+  agentStore.workspaceCheckoutId = "checkout-pane";
+  agentStore.agents = [
+    { id: "agent-a", name: "Agent A", isDefault: true, defaultEffort: "high" },
+    { id: "agent-child", name: "Child Agent", isDefault: false, defaultEffort: "low" },
+  ];
+  useNewSessionSettings().reset();
+  useWorkspaceNavigationMode().setMode(workspaceRef.checkoutId, "sessions");
   controller.isLoading.value = false;
   controller.sessionAgentId.value = "agent-a";
   controller.sessionModelId.value = "model-a";
@@ -347,6 +394,221 @@ beforeEach(() => {
 });
 
 describe("WorkbenchSessionEditor scoped host", () => {
+  it("waits for the new Unity workspace catalog instead of pinning the previous Simple default", async () => {
+    agentStore.workspaceCheckoutId = "previous-generic-workspace";
+    agentStore.selectedAgentId = "simple";
+    agentStore.agents = [
+      { id: "simple", name: "Simple", isDefault: true, defaultEffort: "high" },
+      { id: "unity", name: "Unity", isDefault: false, defaultEffort: "high" },
+    ];
+    controller.sessionId.value = null;
+    controller.sessionAgentId.value = null;
+    // Match the real embedded controller's reactive execution-selection echo.
+    controller.setExecutionSelection.mockImplementation(({ agentId }: { agentId: string }) => {
+      controller.sessionAgentId.value = agentId;
+    });
+    const { app, host } = mountEditor({
+      editor: { ...editor, resource: { kind: "newSession", projectId: "project-a" } },
+    });
+    try {
+      await flushUi();
+      expect(chatViewProps?.selectedAgentId).toBe("");
+      agentStore.agents = agentStore.agents.map(agent => ({ ...agent, isDefault: agent.id === "unity" }));
+      agentStore.workspaceCheckoutId = workspaceRef.checkoutId;
+      await flushUi();
+      expect(chatViewProps?.selectedAgentId).toBe("unity");
+      expect(controller.sessionAgentId.value).toBe("unity");
+      expect(controller.setExecutionSelection).not.toHaveBeenCalledWith(expect.objectContaining({ agentId: "simple" }));
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it("uses the configured Agent in new tabs instead of the global current selection", async () => {
+    useNewSessionSettings().setDefaultAgentId("agent-child");
+    controller.sessionAgentId.value = null;
+    const { app, host } = mountEditor({
+      editor: { ...editor, resource: { kind: "newSession", projectId: "project-a" } },
+    });
+    try {
+      await flushUi();
+      expect(chatViewProps?.selectedAgentId).toBe("agent-child");
+      expect(controller.setExecutionSelection).toHaveBeenLastCalledWith(
+        expect.objectContaining({ agentId: "agent-child" }),
+      );
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it("preserves a recorded Agent when the new-session default changes", async () => {
+    useNewSessionSettings().setDefaultAgentId("agent-child");
+    const { app, host } = mountEditor();
+    try {
+      await flushUi();
+      expect(chatViewProps?.selectedAgentId).toBe("agent-a");
+      useNewSessionSettings().setDefaultAgentId("unavailable");
+      await flushUi();
+      expect(chatViewProps?.selectedAgentId).toBe("agent-a");
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it("uses the configured Agent when starting a new session in the current tab", async () => {
+    useNewSessionSettings().setDefaultAgentId("agent-child");
+    const onNewSessionRequested = vi.fn();
+    const { app, host } = mountEditor({ onNewSessionRequested });
+    try {
+      await flushUi();
+      expect(chatViewProps?.selectedAgentId).toBe("agent-a");
+      host.querySelector<HTMLButtonElement>(".new-chat")!.click();
+      await flushUi();
+      expect(controller.resetSession).toHaveBeenCalledOnce();
+      expect(onNewSessionRequested).toHaveBeenCalledWith({ editorId: editor.editorId, source: "control" });
+      expect(chatViewProps?.selectedAgentId).toBe("agent-child");
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it("remembers a manual model switch for the next new tab in the workspace", async () => {
+    controller.sessionId.value = null;
+    controller.sessionAgentId.value = null;
+    controller.sessionModelId.value = null;
+    const newTab = { ...editor, resource: { kind: "newSession" as const, projectId: "project-a" } };
+    const first = mountEditor({ editor: newTab });
+    try {
+      await flushUi();
+      expect(chatViewProps?.selectedModelId).toBe("model-a");
+      first.host.querySelector<HTMLButtonElement>(".select-child-model")!.click();
+      await flushUi();
+      expect(chatViewProps?.selectedModelId).toBe("model-child");
+      expect(selectionMemoryService.saveWorkspaceSelection).toHaveBeenCalledWith(workspaceRef, {
+        agentId: "agent-a",
+        modelId: "model-child",
+        effort: "high",
+        fastMode: true,
+      });
+    } finally {
+      first.app.unmount();
+      first.host.remove();
+    }
+
+    const second = mountEditor({ editor: { ...newTab, editorId: "editor-second" } });
+    try {
+      await flushUi();
+      expect(chatViewProps?.selectedModelId).toBe("model-child");
+    } finally {
+      second.app.unmount();
+      second.host.remove();
+    }
+  });
+
+  it("switches a new tab to the model the chosen Agent last used in this workspace", async () => {
+    selectionMemoryService.getWorkspaceSelection.mockResolvedValue({
+      projectId: "project-a",
+      memory: {
+        agentId: "agent-a",
+        modelId: "model-a",
+        effort: "high",
+        agents: { "agent-child": { modelId: "model-child", effort: "low" } },
+        updatedAtMs: 1,
+      },
+      lastAgentId: "agent-a",
+      workspaceDefaultAgentId: null,
+    });
+    controller.sessionId.value = null;
+    controller.sessionAgentId.value = null;
+    controller.sessionModelId.value = null;
+    const { app, host } = mountEditor({
+      editor: { ...editor, resource: { kind: "newSession", projectId: "project-a" } },
+    });
+    try {
+      await flushUi();
+      expect(chatViewProps?.selectedAgentId).toBe("agent-a");
+      expect(chatViewProps?.selectedModelId).toBe("model-a");
+      host.querySelector<HTMLButtonElement>(".select-child-agent")!.click();
+      await flushUi();
+      expect(chatViewProps?.selectedAgentId).toBe("agent-child");
+      expect(chatViewProps?.selectedModelId).toBe("model-child");
+      expect(chatViewProps?.effort).toBe("low");
+      expect(selectionMemoryService.saveWorkspaceSelection).toHaveBeenLastCalledWith(workspaceRef, {
+        agentId: "agent-child",
+        modelId: "model-child",
+        effort: "low",
+        fastMode: true,
+      });
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it("starts new tabs with a pinned main model instead of the remembered one", async () => {
+    modelStoreState.modelDefaults = { mainModel: "model-child" };
+    selectionMemoryService.getWorkspaceSelection.mockResolvedValue({
+      projectId: "project-a",
+      memory: { agentId: "agent-a", modelId: "model-a", effort: "high", agents: {}, updatedAtMs: 1 },
+      lastAgentId: "agent-a",
+      workspaceDefaultAgentId: null,
+    });
+    controller.sessionId.value = null;
+    controller.sessionAgentId.value = null;
+    controller.sessionModelId.value = null;
+    const { app, host } = mountEditor({
+      editor: { ...editor, resource: { kind: "newSession", projectId: "project-a" } },
+    });
+    try {
+      await flushUi();
+      expect(chatViewProps?.selectedModelId).toBe("model-child");
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it("restores a Claude gateway model without retaining the previous API selection", async () => {
+    const { app, host } = mountEditor();
+    try {
+      controller.sessionModelId.value = "claude_code/vendor/model-not-in-catalog";
+      await flushUi();
+      expect(chatViewProps?.selectedModelId).toBe("claude_code/vendor/model-not-in-catalog");
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+  it("shows the composer session picker only in file mode and identifies the originating tab", async () => {
+    Object.defineProperty(Element.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+    const selected = vi.fn();
+    const { app, host } = mountEditor({
+      sessions: [{ id: "session-target", title: "Target", updatedAt: 1, sessionType: "chat" }],
+      onSessionSelected: selected,
+    });
+    try {
+      expect(host.querySelector(".session-composer-trigger")).toBeNull();
+      useWorkspaceNavigationMode().setMode(workspaceRef.checkoutId, "files");
+      await flushUi();
+      host.querySelector<HTMLButtonElement>(".session-composer-trigger")!.click();
+      await flushUi();
+      document.querySelector<HTMLButtonElement>(".session-composer-option")!.click();
+      expect(selected).toHaveBeenCalledExactlyOnceWith({ editorId: "editor-pane", sessionId: "session-target" });
+      useWorkspaceNavigationMode().setMode(workspaceRef.checkoutId, "sessions");
+      await flushUi();
+      expect(host.querySelector(".session-composer-trigger")).toBeNull();
+      expect(document.querySelector(".session-composer-panel")).toBeNull();
+    } finally {
+      app.unmount();
+      host.remove();
+      Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+    }
+  });
+
   it("loads archived sessions through the same controller and unarchives before continuing", async () => {
     const restore = vi.fn();
     const archivedEditor = reactive({
@@ -381,6 +643,52 @@ describe("WorkbenchSessionEditor scoped host", () => {
       controller.isLoading.value = false;
       await flushUi();
       expect(ready).toHaveBeenCalledOnce();
+    } finally {
+      app.unmount();
+    }
+  });
+
+  it("holds readiness while content inside the surface is still resolving", async () => {
+    holdChatContentOnMount = true;
+    const ready = vi.fn();
+    const { app } = mountEditor({ onReady: ready });
+    try {
+      await flushUi();
+      expect(releaseChatContent).toBeTypeOf("function");
+      expect(ready).not.toHaveBeenCalled();
+      releaseChatContent?.();
+      await flushUi();
+      expect(ready).toHaveBeenCalledOnce();
+    } finally {
+      holdChatContentOnMount = false;
+      releaseChatContent = null;
+      app.unmount();
+    }
+  });
+
+  it("does not let stalled content block the session switch", async () => {
+    vi.useFakeTimers();
+    holdChatContentOnMount = true;
+    const ready = vi.fn();
+    const { app } = mountEditor({ onReady: ready });
+    try {
+      await flushUi();
+      expect(ready).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(ready).toHaveBeenCalledOnce();
+    } finally {
+      holdChatContentOnMount = false;
+      releaseChatContent = null;
+      app.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("passes the stack presentation state to the chat surface", async () => {
+    const { app } = mountEditor({ presented: false });
+    try {
+      await flushUi();
+      expect(chatViewProps?.presented).toBe(false);
     } finally {
       app.unmount();
     }

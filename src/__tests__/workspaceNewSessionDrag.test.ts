@@ -46,7 +46,7 @@ function pointer(type: string, x = 320, y = 20) {
   return event;
 }
 
-async function fixture(checkoutScoped = false, initialCheckout = "checkout") {
+async function fixture(checkoutScoped = false, initialCheckout = "checkout", dropAvailable = false) {
   setActivePinia(createPinia());
   const store = useWorkbenchStore();
   const state = store.ensureWindow("main");
@@ -112,7 +112,10 @@ async function fixture(checkoutScoped = false, initialCheckout = "checkout") {
     workspaceContextStore: { focusedCheckout: { projectId: "project", checkoutId: "checkout" } },
     explorerStore: { snapshots: { project: snapshot }, resources: { project: { knowledge: [] } }, applyOperations },
     renderedExplorerSnapshot: () => snapshot, isExplorerNodeVisible: () => true,
-    isNewSessionDropAvailable: () => false, newSessionDropDraft: () => null,
+    isNewSessionDropAvailable: () => dropAvailable, newSessionDropDraft: () => null,
+    fileOrderDragItem: () => null, isSecondarySessionTreeHit: () => false,
+    secondarySessionItems: ref([]), archivedTreeItems: ref([]),
+    workspaceNavigation: { getMode: () => "sessions" }, navigationCheckout: () => null,
     isKnowledgeTypeFolder: () => false, itemIcon: () => undefined, itemIconClass: () => undefined,
     workspaceSecondarySection, workbenchSplitDirectionAtPoint, workbenchTabInsertionIndexAtPoint,
     t: (key: string) => key,
@@ -150,6 +153,14 @@ async function fixture(checkoutScoped = false, initialCheckout = "checkout") {
 }
 
 describe("workspace New Session drag", () => {
+  it("retains the New Session label and icon when attachments can be dropped", async () => {
+    const f = await fixture(false, "checkout", true);
+    expect(f.row.textContent?.trim()).toBe("chat.session.newSession");
+    expect(f.row.title).toBe("");
+    expect(f.row.closest(".is-new-session-drop-zone")).not.toBeNull();
+    expect(f.row.querySelector(".workspace-tree-icon")).not.toBeNull();
+  });
+
   it.each([false, true])("creates independent tabs in the hovered group (checkout scoped: %s)", async (checkoutScoped) => {
     const f = await fixture(checkoutScoped);
     for (let i = 0; i < 2; i++) {

@@ -17,7 +17,7 @@ const STORAGE_KEY = "locus-chat-input-settings";
 
 const defaults: ChatInputSettings = {
   submitMode: "enter-send",
-  runningSendMode: "after-run",
+  runningSendMode: "insert",
 };
 
 function normalizeSubmitMode(value: unknown): ChatSubmitMode {
@@ -25,7 +25,7 @@ function normalizeSubmitMode(value: unknown): ChatSubmitMode {
 }
 
 function normalizeRunningSendMode(value: unknown): RunningSendMode {
-  return value === "insert" ? "insert" : "after-run";
+  return value === "after-run" ? "after-run" : defaults.runningSendMode;
 }
 
 function load(): ChatInputSettings {

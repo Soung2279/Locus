@@ -9,8 +9,27 @@ import {
   readUserMessageDraftFromClipboardData,
 } from "../composables/chatMessageDraft";
 import type { PendingSessionInput } from "../types";
+import { appendSessionReferences } from "../composables/sessionReferences";
 
 describe("chatMessageDraft", () => {
+  it("restores sent session references as attachments for editing, clipboard paste and queued input", () => {
+    const sessionRefs = [{ sessionId: "previous-session", title: "翻越 [Shader]" }];
+    const content = appendSessionReferences("分析这个会话", sessionRefs);
+    const message: ChatMessage = { id: "reference-message", role: "user", content, createdAt: 1 };
+    const draft = buildUserMessageDraft(message);
+    expect(draft.text).toBe("分析这个会话");
+    expect(draft.sessionRefs).toEqual(sessionRefs);
+    expect(draft.localFiles).toEqual([]);
+    const payload = buildChatMessageClipboardPayload(message);
+    const clipboard = { getData: (type: string) => type === LOCUS_CHAT_MESSAGE_DRAFT_MIME ? payload.serializedDraft ?? "" : "" } as DataTransfer;
+    expect(readUserMessageDraftFromClipboardData(clipboard)).toMatchObject({ text: "分析这个会话", sessionRefs });
+    const pending: PendingSessionInput = {
+      id: "pending", sessionId: "current", runId: "run", mergeGroupId: "group", status: "queued",
+      delivery: "after_run", text: content, displayText: content, createdAt: 1, updatedAt: 1,
+    };
+    expect(buildPendingSessionInputDraft([pending])).toMatchObject({ text: "分析这个会话", sessionRefs });
+  });
+
   const userMessage: ChatMessage = {
     id: "user-1",
     role: "user",

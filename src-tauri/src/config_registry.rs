@@ -453,7 +453,7 @@ fn collect_models(out: &mut Vec<ConfigEntry>) {
         category: "models".into(),
         label: "Main Model".into(),
         description:
-            "Default model for the main chat session. Empty means reuse the last selected model, or fall back to the first available model."
+            "Pinned model for new chat sessions. Empty means remember each workspace's last explicit choice (persistent_config_dir/workspace_selections.json), then the last selected model, then the first available model."
                 .into(),
         storage: "persistent_config_dir/model_defaults.json → mainModel".into(),
         current_value: if main_model.is_empty() {
@@ -514,7 +514,7 @@ fn collect_models(out: &mut Vec<ConfigEntry>) {
         key: "models.last_model".into(),
         category: "models".into(),
         label: "Last Used Model".into(),
-        description: "The model ID selected in the most recent chat session.".into(),
+        description: "The model ID most recently selected in any workspace; used for workspaces without a remembered choice.".into(),
         storage: "persistent_config_dir/last_model.txt".into(),
         current_value: if last_model.is_empty() {
             "(none)".into()

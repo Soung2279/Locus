@@ -1,16 +1,20 @@
 // @vitest-environment jsdom
-import { createApp, defineComponent, h } from "vue";
+import { createApp, defineComponent, h, watch } from "vue";
+import { createPinia, setActivePinia } from "pinia";
+import { useNotificationStore } from "../stores/notification";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   publishSessionAsyncTaskUpdate,
   publishSessionExecutionState,
+  publishSessionContentChange,
   publishSessionStreamEvent,
 } from "../services/sessionStreamEventHub";
-import { useEmbeddedChatSession } from "../composables/useEmbeddedChatSession";
+import { preloadEmbeddedChatSession, useEmbeddedChatSession } from "../composables/useEmbeddedChatSession";
 
 const mocks = vi.hoisted(() => ({
   loadSession: vi.fn(),
   loadSessionView: vi.fn(),
+  synchronizeSessionRemoteHistory: vi.fn(),
   loadSessionMessagePage: vi.fn(),
   loadSessionTurnPreview: vi.fn(),
   getSessionUsage: vi.fn(),
@@ -56,6 +60,7 @@ vi.mock("../services/session", async (importOriginal) => {
     ...actual,
     loadSession: mocks.loadSession,
     loadSessionView: mocks.loadSessionView,
+    synchronizeSessionRemoteHistory: mocks.synchronizeSessionRemoteHistory,
     loadSessionMessagePage: mocks.loadSessionMessagePage,
     loadSessionTurnPreview: mocks.loadSessionTurnPreview,
     getSessionUsage: mocks.getSessionUsage,
@@ -90,6 +95,7 @@ vi.mock("../services/undo", () => ({
 
 describe("embedded chat session distribution", () => {
   beforeEach(() => {
+    setActivePinia(createPinia());
     mocks.loadSessionView.mockImplementation(async (sessionId: string) => {
       const session = await mocks.loadSession(sessionId);
       return {
@@ -101,6 +107,7 @@ describe("embedded chat session distribution", () => {
         hasMoreHistory: false,
       };
     });
+    mocks.synchronizeSessionRemoteHistory.mockResolvedValue({ changed: false, warning: null });
     mocks.getSessionUsage.mockResolvedValue(null);
     mocks.getTodos.mockResolvedValue({ items: [], latestRunId: null });
     mocks.getSessionResumeAvailable.mockResolvedValue(false);
@@ -1121,6 +1128,76 @@ describe("embedded chat session distribution", () => {
     app.unmount();
   });
 
+  it('shows the saved transcript first and reloads it only when remote history changed', async () => {
+    for (const changed of [false, true]) {
+      const id = `remote-history-${changed}`;
+      let finishSync!: (value: { changed: boolean; warning: null }) => void;
+      mocks.synchronizeSessionRemoteHistory.mockReturnValueOnce(new Promise((resolve) => { finishSync = resolve; }));
+      const detail = { id, title: 'Remote', sessionType: 'chat', parentSessionId: null, createdAt: 1, updatedAt: 2,
+        latestCompletedRunId: null, pendingInputs: [], messages: [{ id: 'saved', role: 'user', content: 'saved', createdAt: 1 }] };
+      mocks.loadSession.mockResolvedValue(detail);
+      mocks.loadSessionView.mockClear();
+      let session!: ReturnType<typeof useEmbeddedChatSession>;
+      const app = createApp(defineComponent({ setup() {
+        session = useEmbeddedChatSession({ sessionKey: id, initialSessionId: id,
+          workspaceRef: { checkoutId: 'remote-checkout', expectedGeneration: 1 },
+          selectedModelId: 'model-a', buildRequest: (text: string) => ({ text }) });
+        return () => h('div');
+      } }));
+      app.mount(document.createElement('div'));
+      try {
+        await vi.waitFor(() => expect(session.messages.value.map((message) => message.id)).toEqual(['saved']));
+        expect(mocks.loadSessionView).toHaveBeenCalledTimes(1);
+        expect(mocks.loadSessionView).toHaveBeenCalledWith(id, expect.any(Number), false);
+        const rendered = session.messages.value;
+        mocks.loadSession.mockResolvedValue({ ...detail, messages: [...detail.messages,
+          { id: 'remote', role: 'assistant', content: 'remote reply', createdAt: 2 }] });
+        finishSync({ changed, warning: null });
+        if (changed) {
+          await vi.waitFor(() => expect(session.messages.value.map((message) => message.id)).toEqual(['saved', 'remote']));
+          expect(mocks.loadSessionView).toHaveBeenCalledTimes(2);
+          expect(mocks.loadSessionView).toHaveBeenLastCalledWith(id, expect.any(Number), false);
+        } else {
+          for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+          expect(mocks.loadSessionView).toHaveBeenCalledTimes(1);
+          expect(session.messages.value).toBe(rendered);
+        }
+      } finally { app.unmount(); }
+    }
+  });
+
+  it('refreshes saved native history and session tasks in every shared pane without another remote sync', async () => {
+    vi.useFakeTimers();
+    const id='native-content-refresh';
+    const detail={id,title:'Native',sessionType:'chat',parentSessionId:null,createdAt:1,updatedAt:2,latestCompletedRunId:null,pendingInputs:[],messages:[{id:'old',role:'user',content:'old',createdAt:1}]};
+    mocks.loadSession.mockResolvedValue(detail);
+    let first!:ReturnType<typeof useEmbeddedChatSession>,second!:ReturnType<typeof useEmbeddedChatSession>;
+    const app=createApp(defineComponent({setup(){
+      const options={initialSessionId:id,workspaceRef:{checkoutId:'native-checkout',expectedGeneration:1},selectedModelId:'model-a',buildRequest:(text:string)=>({text})};
+      first=useEmbeddedChatSession({...options,sessionKey:'native-pane-a'});
+      second=useEmbeddedChatSession({...options,sessionKey:'native-pane-b'});
+      return ()=>h('div');
+    }}));
+    app.mount(document.createElement('div'));
+    try {
+      await vi.advanceTimersByTimeAsync(100);
+      mocks.loadSessionView.mockClear();
+      const source={kind:'workspace' as const,projectId:'project',checkoutId:'native-checkout',workspaceGeneration:1,streamRevision:1};
+      publishSessionContentChange({sessionId:id,source:{...source,checkoutId:'unrelated'}});
+      expect(mocks.loadSessionView).not.toHaveBeenCalled();
+      mocks.loadSession.mockResolvedValue({...detail,messages:[...detail.messages,{id:'recovered',role:'assistant',content:'remote reply',createdAt:2}]});
+      mocks.getTodos.mockResolvedValue({latestRunId:null,sessionScoped:true,items:[{content:'remote task',status:'completed',priority:'medium'}]});
+      publishSessionContentChange({sessionId:id,source});
+      await vi.advanceTimersByTimeAsync(100);
+      expect(mocks.loadSessionView).toHaveBeenCalledTimes(1);
+      expect(mocks.loadSessionView).toHaveBeenCalledWith(id,expect.any(Number),false);
+      expect(first.messages.value.slice(-1)[0]?.content).toBe('remote reply');
+      expect(second.messages.value.slice(-1)[0]?.content).toBe('remote reply');
+      expect(first.visibleTodos.value[0]?.status).toBe('completed');
+      expect(second.visibleTodos.value[0]?.status).toBe('completed');
+    } finally {app.unmount();vi.useRealTimers();}
+  });
+
   it.each([false, true])("shows the transcript before slow metadata and preserves newer stream state (%s)", async (streamWhileLoading) => {
     const sessionId = `transcript-before-metadata-${streamWhileLoading}`;
     let finishUsage!: (value: null) => void;
@@ -1173,6 +1250,128 @@ describe("embedded chat session distribution", () => {
     }
   });
 
+  function loadedSession(sessionId: string, content = "Loaded transcript") {
+    return {
+      id: sessionId, title: "Loaded", sessionType: "chat", parentSessionId: null,
+      createdAt: 1, updatedAt: 2, latestCompletedRunId: null, pendingInputs: [],
+      messages: [{ id: `${sessionId}-message`, role: "user", content, createdAt: 1 }],
+    };
+  }
+
+  function mountSession(sessionId: string, workspaceRef = { checkoutId: "checkout-preload", expectedGeneration: 1 }) {
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const app = createApp(defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: `key-${sessionId}`, initialSessionId: sessionId, workspaceRef,
+          selectedModelId: "model-a", buildRequest: (text) => ({ text }),
+        });
+        return () => h("div");
+      },
+    }));
+    app.mount(document.createElement("div"));
+    return { app, session: () => session };
+  }
+
+  it("shares one stream error notice with the global chat and marks it already reported to the pane", async () => {
+    const id = "queued-input-error-notice";
+    mocks.loadSession.mockResolvedValue(loadedSession(id));
+    const { app, session } = mountSession(id);
+    try {
+      await vi.waitFor(() => expect(session().isLoading.value).toBe(false));
+      const notices = useNotificationStore();
+      // The ordinary Chat listener and embedded pane receive the same event.
+      notices.addNotice("error", "unverified history", { code: "chat.stream_failed", operation: "chat" });
+      const source = { kind: "workspace" as const, projectId: "project-notice", checkoutId: "checkout-preload", workspaceGeneration: 1, streamRevision: 1 };
+      publishSessionStreamEvent({ event: { type: "runStart", sessionId: id, runId: "run-notice" }, source });
+      publishSessionStreamEvent({ event: { type: "error", sessionId: id, runId: "run-notice", error: {
+        code: "chat.stream_failed", message: "unverified history", retryable: false, severity: "error",
+      } }, source });
+      await vi.waitFor(() => expect(session().errorMessage.value).toBe("unverified history"));
+      expect(session().errorNotificationHandled.value).toBe(true);
+      expect(notices.notices.filter(notice => notice.message === "unverified history")).toHaveLength(1);
+    } finally { app.unmount(); }
+  });
+
+  it("applies metadata that is already loaded together with the transcript", async () => {
+    const sessionId = "metadata-first-frame";
+    let finishView!: () => void;
+    const viewReady = new Promise<void>((resolve) => { finishView = resolve; });
+    mocks.loadSession.mockImplementationOnce(async () => {
+      await viewReady;
+      return loadedSession(sessionId);
+    });
+    mocks.getTodos.mockResolvedValueOnce({ latestRunId: null, items: [
+      { content: "Ready todo", status: "pending", priority: "medium" },
+    ] });
+    const { app, session } = mountSession(sessionId);
+    try {
+      const todosWhenTranscriptAppeared: number[] = [];
+      watch(() => session().messages.value.length, (length) => {
+        if (length > 0) todosWhenTranscriptAppeared.push(session().todos.value.length);
+      }, { flush: "post" });
+      await vi.waitFor(() => expect(mocks.getTodos).toHaveBeenCalledWith(sessionId));
+      await Promise.resolve();
+      finishView();
+      await vi.waitFor(() => expect(session().isLoading.value).toBe(false));
+      expect(todosWhenTranscriptAppeared).toEqual([1]);
+    } finally {
+      app.unmount();
+    }
+  });
+
+  it("opens a session from its sidebar preload without loading it again", async () => {
+    const sessionId = "preloaded-session";
+    const workspaceRef = { checkoutId: "checkout-preload", expectedGeneration: 1 };
+    mocks.loadSession.mockResolvedValue(loadedSession(sessionId, "Preloaded transcript"));
+    preloadEmbeddedChatSession(sessionId, workspaceRef);
+    preloadEmbeddedChatSession(sessionId, workspaceRef);
+    expect(mocks.loadSessionView).toHaveBeenCalledTimes(1);
+    expect(mocks.getTodos).toHaveBeenCalledTimes(1);
+    const { app, session } = mountSession(sessionId, workspaceRef);
+    try {
+      await vi.waitFor(() => expect(session().isLoading.value).toBe(false));
+      expect(session().messages.value[0]?.content).toBe("Preloaded transcript");
+      expect(mocks.loadSessionView).toHaveBeenCalledTimes(1);
+      expect(mocks.getTodos).toHaveBeenCalledTimes(1);
+    } finally {
+      app.unmount();
+    }
+  });
+
+  it("drops a preload when its session receives an event before it is opened", async () => {
+    const sessionId = "preload-invalidated-session";
+    mocks.loadSession.mockResolvedValue(loadedSession(sessionId));
+    preloadEmbeddedChatSession(sessionId, null);
+    publishSessionStreamEvent({
+      event: { type: "runStart", sessionId, runId: "run-after-preload" },
+      source: { kind: "legacy" },
+    });
+    const { app, session } = mountSession(sessionId);
+    try {
+      await vi.waitFor(() => expect(session().isLoading.value).toBe(false));
+      expect(mocks.loadSessionView).toHaveBeenCalledTimes(2);
+    } finally {
+      app.unmount();
+    }
+  });
+
+  it("does not open a session from an expired preload", async () => {
+    const sessionId = "preload-expired-session";
+    mocks.loadSession.mockResolvedValue(loadedSession(sessionId));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    preloadEmbeddedChatSession(sessionId, null);
+    vi.setSystemTime(Date.now() + 2_500);
+    const { app, session } = mountSession(sessionId);
+    try {
+      await vi.waitFor(() => expect(session().isLoading.value).toBe(false));
+      expect(mocks.loadSessionView).toHaveBeenCalledTimes(2);
+    } finally {
+      app.unmount();
+      vi.useRealTimers();
+    }
+  });
+
   it("hydrates pane-owned Plan, Resume, Todo and Undo state and accepts synthetic Plan events", async () => {
     const sessionId = "scoped-auxiliary-state-session";
     const workspaceRef = { checkoutId: "checkout-auxiliary", expectedGeneration: 12 };
@@ -1218,7 +1417,7 @@ describe("embedded chat session distribution", () => {
     });
     const app = createApp(Root);
     app.mount(document.createElement("div"));
-    await vi.waitFor(() => expect(mocks.loadSessionView).toHaveBeenCalledWith(sessionId, expect.any(Number)));
+    await vi.waitFor(() => expect(mocks.loadSessionView).toHaveBeenCalledWith(sessionId, expect.any(Number), false));
     await vi.waitFor(() => expect(session.errorMessage.value).toBeNull());
     await vi.waitFor(() => expect(session.parentSessionId.value).toBe("parent-session"));
 

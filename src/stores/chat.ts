@@ -42,6 +42,7 @@ import { useChatChangesStore } from "./chatChanges";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import { useChatInputSettings } from "../composables/useChatInputSettings";
+import { applyNewSessionSelection } from "../composables/newSessionSelection";
 import { isToolCollapseTraceEnabled, logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import type {
   SessionSummary, SessionDetail, ChatMessage, TokenUsage,
@@ -408,6 +409,7 @@ export const useChatStore = defineStore("chat", () => {
   const activeToolCalls = ref<ToolCallDisplay[]>([]);
   const tokenUsage = ref<TokenUsage>(emptyTokenUsage());
   const todos = ref<TodoItem[]>([]);
+  const todosSessionScoped = ref(false);
   const todoWriteVersion = ref(0);
   const showTodoPanel = ref(false);
   const todoPanelVisibility = ref(new Map<string, boolean>());
@@ -464,6 +466,7 @@ export const useChatStore = defineStore("chat", () => {
     return sessionLatestTodoRunIds.value.get(sessionId) ?? null;
   });
   const currentTodos = computed(() => {
+    if (todosSessionScoped.value) return todos.value;
     if (!todoRunBoundaryId.value) return [];
     if (latestTodoRunId.value !== todoRunBoundaryId.value) return [];
     return todos.value;
@@ -560,6 +563,7 @@ export const useChatStore = defineStore("chat", () => {
   let pendingSessionId: string | null = null;
   let pendingMessageSeq = 0;
   let sessionLoadSeq = 0;
+  let remoteHistorySyncEpoch = 0;
   let sessionRefreshEpoch = 0;
   let chatLaunchEpoch = 0;
   let pendingManagedSessionId: string | null = null;
@@ -770,7 +774,7 @@ export const useChatStore = defineStore("chat", () => {
     if (detail.agentId) {
       useAgentStore().selectAgent(detail.agentId);
     } else {
-      useAgentStore().resetToDefault();
+      useAgentStore().resetToDefault({ forNewSession: false });
     }
     applySessionRuntimeSnapshot(detail);
   }
@@ -799,6 +803,7 @@ export const useChatStore = defineStore("chat", () => {
   function clearSessionAuxiliaryDataForSwitch() {
     tokenUsage.value = emptyTokenUsage();
     todos.value = [];
+    todosSessionScoped.value = false;
     todoWriteVersion.value = 0;
     showTodoPanel.value = false;
     todoMode.value = "current";
@@ -813,6 +818,7 @@ export const useChatStore = defineStore("chat", () => {
   ) {
     tokenUsage.value = usage;
     todos.value = sessionTodos.items;
+    todosSessionScoped.value = sessionTodos.sessionScoped === true;
     sessionLatestTodoRunIds.value.set(sessionId, sessionTodos.latestRunId);
     restoreTodoPanelState(sessionId, sessionTodos.items.length > 0);
     undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
@@ -1203,12 +1209,17 @@ export const useChatStore = defineStore("chat", () => {
       commitSelection?: boolean;
       persist?: boolean;
       preserveLocalMessages?: boolean;
+      synchronizeRemote?: boolean;
       canCommit?: () => boolean;
     } = {},
   ): Promise<boolean> {
     const loadSeq = ++sessionLoadSeq;
     const expectedWorkspaceScopeKey = workspaceScopeKey(captureFocusedWorkspaceRef());
     const commitSelection = options.commitSelection === true;
+    // Switching to a session must not wait for a remote (SSH) history sync:
+    // show the saved transcript first and reconcile in the background.
+    const backgroundRemoteSync = commitSelection && options.synchronizeRemote !== false;
+    const synchronizeRemote = backgroundRemoteSync ? false : options.synchronizeRemote;
     if (commitSelection) {
       pendingSelectionSessionId.value = id;
     }
@@ -1216,7 +1227,8 @@ export const useChatStore = defineStore("chat", () => {
     try {
       const messageLimit = useDisplaySettings().state.sessionMessagePageSize;
       const [snapshot, resumeAvailable] = await Promise.all([
-        sessionService.loadSessionView(id, messageLimit),
+        synchronizeRemote === undefined ? sessionService.loadSessionView(id, messageLimit)
+          : sessionService.loadSessionView(id, messageLimit, synchronizeRemote),
         sessionService.getSessionResumeAvailable(id).catch((error) => {
           console.warn("get_session_resume_available failed:", error);
           return false;
@@ -1236,6 +1248,11 @@ export const useChatStore = defineStore("chat", () => {
       }
 
       resetStreamRuntimeState();
+      if (snapshot.remoteSyncWarning) {
+        useNotificationStore().addNotice("warning", snapshot.remoteSyncWarning, {
+          operation: "syncClaudeHistory", replaceOperation: true,
+        });
+      }
       currentRunId.value = sessionRunIds.value.get(id) ?? null;
       showThinkingPanel.value = false;
       thinkingPanelContent.value = "";
@@ -1269,6 +1286,9 @@ export const useChatStore = defineStore("chat", () => {
       if (commitSelection && pendingSelectionSessionId.value === id) {
         pendingSelectionSessionId.value = null;
       }
+      if (backgroundRemoteSync) {
+        void synchronizeRemoteHistoryInBackground(id, expectedWorkspaceScopeKey);
+      }
       const auxiliaryLoad = loadSessionAuxiliaryState(
         id,
         loadSeq,
@@ -1292,6 +1312,40 @@ export const useChatStore = defineStore("chat", () => {
       }
       return false;
     }
+  }
+
+  async function synchronizeRemoteHistoryInBackground(
+    id: string,
+    expectedWorkspaceScopeKey: string | null,
+  ): Promise<void> {
+    const epoch = ++remoteHistorySyncEpoch;
+    let result: sessionService.SessionRemoteHistorySync;
+    try {
+      result = await sessionService.synchronizeSessionRemoteHistory(id);
+    } catch (error) {
+      console.warn("synchronize_session_remote_history failed:", error);
+      return;
+    }
+    if (
+      epoch !== remoteHistorySyncEpoch
+      || activeSessionId.value !== id
+      || pendingSelectionSessionId.value !== null
+      || !isWorkspaceScopeCurrent(expectedWorkspaceScopeKey)
+    ) return;
+    if (result.warning) {
+      useNotificationStore().addNotice("warning", result.warning, {
+        operation: "syncClaudeHistory", replaceOperation: true,
+      });
+    }
+    // An unchanged remote leaves the rendered transcript untouched (no flicker).
+    if (!result.changed) return;
+    // A run started meanwhile reloads the saved transcript when it ends.
+    if (
+      isStreaming.value
+      || sessionRunIds.value.has(id)
+      || messages.value.some(isLocalPendingUserMessage)
+    ) return;
+    await loadSessionState(id, { synchronizeRemote: false });
   }
 
   async function loadOlderSessionHistory(): Promise<boolean> {
@@ -1861,6 +1915,7 @@ export const useChatStore = defineStore("chat", () => {
         undoableMessageIds.value.add(m.messageId);
         break;
       case "setTodos":
+        todosSessionScoped.value = m.sessionScoped === true;
         todos.value = m.todos;
         if (activeSessionId.value) {
           sessionLatestTodoRunIds.value.set(activeSessionId.value, m.runId);
@@ -2465,9 +2520,7 @@ export const useChatStore = defineStore("chat", () => {
     sessionHistoryLoading.value = false;
     sessionUserMessageIds.value = [];
     useAgentStore().resetToDefault();
-    const modelStore = useModelStore();
-    modelStore.resolveSelectedModel(true);
-    modelStore.restoreDefaultCodexFastMode();
+    applyNewSessionSelection();
 
     // Clear chat changes for the old session
     useChatChangesStore().clear(oldSessionId);
@@ -2521,9 +2574,7 @@ export const useChatStore = defineStore("chat", () => {
     sessionFastMode.value = null;
     sessionMultiAgentEnabled.value = false;
     useAgentStore().resetToDefault();
-    const modelStore = useModelStore();
-    modelStore.resolveSelectedModel(true);
-    modelStore.restoreDefaultCodexFastMode();
+    applyNewSessionSelection();
     const chatChangesStore = useChatChangesStore();
     chatChangesStore.clear(oldSessionId);
     chatChangesStore.closeInlineDiff();
@@ -3484,7 +3535,7 @@ export const useChatStore = defineStore("chat", () => {
     await refreshSessions();
     if (activeSessionId.value !== sessionId) return;
     useChatChangesStore().closeInlineDiff();
-    await loadSessionState(sessionId, { preserveLocalMessages: false });
+    await loadSessionState(sessionId, { preserveLocalMessages: false, synchronizeRemote: false });
   }
 
   function applySessionTitleUpdate(sessionId: string, title: string): void {
@@ -3541,6 +3592,7 @@ export const useChatStore = defineStore("chat", () => {
       messages.value = hydrateMessages(detail.messages);
       undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
       activeSessionType.value = detail.sessionType;
+      await loadSessionAuxiliaryState(activeSessionId.value, sessionLoadSeq);
       return true;
     } catch (e) {
       console.error("undo_perform failed:", e);
@@ -3599,6 +3651,7 @@ export const useChatStore = defineStore("chat", () => {
       messages.value = hydrateMessages(detail.messages);
       undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
       activeSessionType.value = detail.sessionType;
+      await loadSessionAuxiliaryState(sessionId, sessionLoadSeq);
       await refreshSessions();
       return true;
     } catch (e) {
@@ -3631,6 +3684,7 @@ export const useChatStore = defineStore("chat", () => {
       messages.value = hydrateMessages(detail.messages);
       undoableMessageIds.value = new Set(undoEntries.map((e) => e.assistantMessageId));
       activeSessionType.value = detail.sessionType;
+      await loadSessionAuxiliaryState(sessionId, sessionLoadSeq);
       return true;
     } catch (e) {
       console.error("undo_latest_conversation_turn failed:", e);

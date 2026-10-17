@@ -208,6 +208,7 @@ watch(() => props.compact, () => {
       <slot name="header" />
     </div>
 
+    <slot name="before-input" />
     <div class="chat-composer-body">
       <textarea
         ref="textareaRef"

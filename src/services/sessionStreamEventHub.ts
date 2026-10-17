@@ -57,6 +57,28 @@ interface SessionExecutionStateConsumerSubscription {
 }
 
 const executionStateConsumerSubscriptions = new Set<SessionExecutionStateConsumerSubscription>();
+interface SessionContentUpdate { sessionId: string; source: SessionStreamEventSource }
+const contentConsumers = new Set<{
+  resolve: (update: SessionContentUpdate) => object | null;
+  listener: (update: SessionContentUpdate) => void;
+}>();
+export function publishSessionContentChange(update: SessionContentUpdate): void {
+  const delivered = new Set<object>();
+  for (const subscription of [...contentConsumers]) {
+    const consumer = subscription.resolve(update);
+    if (!consumer || delivered.has(consumer)) continue;
+    delivered.add(consumer);
+    subscription.listener(update);
+  }
+}
+export function subscribeSessionContentChangeConsumer(
+  resolve: (update: SessionContentUpdate) => object | null,
+  listener: (update: SessionContentUpdate) => void,
+): () => void {
+  const subscription = { resolve, listener };
+  contentConsumers.add(subscription);
+  return () => { contentConsumers.delete(subscription); };
+}
 
 function rememberPendingDispatch(
   dispatch: SessionStreamEventDispatch,
@@ -248,7 +270,7 @@ export function bindSessionStreamEventConsumer(sessionId: string): SessionStream
 }
 
 export function workspaceStreamEventSource(
-  event: RoutedWorkspaceEvent<StreamEvent>,
+  event: RoutedWorkspaceEvent,
 ): SessionStreamEventSource {
   return {
     kind: "workspace",

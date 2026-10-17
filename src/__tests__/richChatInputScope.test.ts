@@ -12,13 +12,16 @@ import {
 } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceRef } from "../services/project";
+import type { ViewPackageSummary } from "../services/view";
 
 const mocks = vi.hoisted(() => ({
   searchWorkspaceAssets: vi.fn(),
-  searchWorkspaceSceneObjects: vi.fn(),
+  searchLoadedSceneObjects: vi.fn(),
   listDirEntriesPage: vi.fn(),
   searchWorkspaceEntries: vi.fn(),
   knowledgeQuery: vi.fn(),
+  viewList: vi.fn(),
+  searchSessionTitles: vi.fn(),
   checkUnityConnectionStatus: vi.fn(),
   getUnityConsoleText: vi.fn(),
   validateUnitySceneObject: vi.fn(),
@@ -34,7 +37,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../services/asset", () => ({
   searchWorkspaceAssets: mocks.searchWorkspaceAssets,
-  searchWorkspaceSceneObjects: mocks.searchWorkspaceSceneObjects,
+  searchLoadedSceneObjects: mocks.searchLoadedSceneObjects,
 }));
 
 vi.mock("../services/project", async (importOriginal) => ({
@@ -47,9 +50,19 @@ vi.mock("../services/knowledge", () => ({
   knowledgeQuery: mocks.knowledgeQuery,
 }));
 
+vi.mock("../services/view", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/view")>(),
+  viewList: mocks.viewList,
+}));
+
 vi.mock("../services/permissions", () => ({
   getCachedFileToolWorkspaceBoundary: mocks.getCachedFileToolWorkspaceBoundary,
   getFileToolWorkspaceBoundary: mocks.getFileToolWorkspaceBoundary,
+}));
+
+vi.mock("../services/session", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/session")>(),
+  searchSessionTitles: mocks.searchSessionTitles,
 }));
 
 vi.mock("../services/unity", () => ({
@@ -88,6 +101,17 @@ import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 const CHECKOUT_A: WorkspaceRef = { checkoutId: "checkout-a", expectedGeneration: 3 };
 const CHECKOUT_B: WorkspaceRef = { checkoutId: "checkout-b", expectedGeneration: 8 };
+
+function mentionView(overrides: Partial<ViewPackageSummary> = {}): ViewPackageSummary {
+  return {
+    id: "combat", name: "战斗面板", apiVersion: "v0.3.0", version: "1.0.0",
+    displayPath: "Tools/Combat", packageRelPath: "combat", icon: "Table",
+    packageRoot: "C:/projects/a/Locus/View/combat",
+    manifestPath: "C:/projects/a/Locus/View/combat/combat.vue", updatedAt: 0,
+    capabilities: { unity: false }, requirements: { unityConnection: false },
+    ...overrides,
+  };
+}
 
 interface HarnessState {
   text: string;
@@ -131,7 +155,7 @@ async function flushAsync() {
   await nextTick();
 }
 
-async function mountInput(options: Partial<HarnessState> & { managedNativeDrops?: boolean } = {}) {
+async function mountInput(options: Partial<HarnessState> & { managedNativeDrops?: boolean; beforeSend?: () => Promise<boolean>; draftStateKey?: string } = {}) {
   const state = reactive<HarnessState>({
     text: "",
     workspaceRef: CHECKOUT_A,
@@ -159,6 +183,8 @@ async function mountInput(options: Partial<HarnessState> & { managedNativeDrops?
         workspaceRoot: state.workspaceRoot,
         planModeActive: state.planModeActive,
         managedNativeDrops: options.managedNativeDrops ?? true,
+        beforeSend: options.beforeSend,
+        draftStateKey: options.draftStateKey,
         onRequestPlanMode: requestPlanMode,
         onRequestNewSession: requestNewSession,
         onFork: fork,
@@ -254,10 +280,12 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.stubGlobal("BroadcastChannel", undefined);
   mocks.searchWorkspaceAssets.mockReset().mockResolvedValue([]);
-  mocks.searchWorkspaceSceneObjects.mockReset().mockResolvedValue([]);
+  mocks.searchLoadedSceneObjects.mockReset().mockResolvedValue([]);
   mocks.listDirEntriesPage.mockReset().mockResolvedValue({ entries: [], nextOffset: 0, hasMore: false });
   mocks.searchWorkspaceEntries.mockReset().mockResolvedValue([]);
   mocks.knowledgeQuery.mockReset().mockResolvedValue([]);
+  mocks.viewList.mockReset().mockResolvedValue([]);
+  mocks.searchSessionTitles.mockReset().mockResolvedValue([]);
   mocks.checkUnityConnectionStatus.mockReset().mockResolvedValue({ connected: false });
   mocks.getUnityConsoleText.mockReset().mockResolvedValue({ text: "", entries: [] });
   mocks.validateUnitySceneObject.mockReset().mockResolvedValue(undefined);
@@ -282,6 +310,203 @@ afterEach(() => {
 });
 
 describe("RichChatInput scoped controller", () => {
+  it.each(["mouse", "Enter", "Tab"])("references a historical session by title using %s, preserving it through send", async (selection) => {
+    mocks.searchSessionTitles.mockResolvedValue([{ id: "session-old", title: "旧会话", archived: true, updatedAt: 1 }]);
+    const mounted = await mountInput();
+    const textarea = await setComposerText(mounted.host, "参考 @旧会话");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mocks.searchSessionTitles).toHaveBeenCalledWith("旧会话", CHECKOUT_A);
+    expect(mentionNames(mounted)).toEqual(["旧会话"]);
+    if (selection === "mouse") mounted.host.querySelector<HTMLButtonElement>(".mention-select")!.click();
+    else textarea.dispatchEvent(new KeyboardEvent("keydown", { key: selection, bubbles: true, cancelable: true }));
+    await flushAsync();
+    expect(mounted.state.text).toBe("参考 ");
+    expect(mounted.input.value!.exportDraft().sessionRefs).toEqual([{ sessionId: "session-old", title: "旧会话" }]);
+    expect(mounted.host.querySelector(".session-ref-attachment.local-file-chip .local-file-chip-name")?.textContent).toBe("旧会话");
+    expect(textarea.value).not.toContain("locus://");
+    expect(mounted.input.value!.exportDraft().localFiles).toEqual([]);
+    expect(mounted.input.value!.exportDraft().assetRefs).toEqual([]);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mounted.host.querySelector(".mention-popup")).toBeNull();
+    await mounted.input.value!.send();
+    expect(mounted.send.mock.calls[0]![0].text).toContain("[旧会话](locus://session/session-old)");
+    await flushAsync();
+    expect(mounted.host.querySelector(".session-ref-attachment")).toBeNull();
+    expect(mounted.input.value!.isDraftEmpty()).toBe(true);
+  });
+
+  it("supports session-only attachments, deduplication, removal and sends the remaining reference", async () => {
+    const mounted = await mountInput();
+    const draft = mounted.input.value!.exportDraft();
+    await mounted.input.value!.appendDraft({ ...draft, sessionRefs: [
+      { sessionId: "s1", title: "Same title" }, { sessionId: "s2", title: "Same title" },
+      { sessionId: "s1", title: "Renamed title" },
+    ] });
+    expect(mounted.input.value!.isDraftEmpty()).toBe(false);
+    expect(mounted.state.text).toBe("");
+    expect(mounted.host.querySelectorAll(".session-ref-attachment")).toHaveLength(2);
+    mounted.host.querySelector<HTMLButtonElement>(".session-ref-attachment .local-file-chip-remove")!.click();
+    await flushAsync();
+    expect(mounted.input.value!.exportDraft().sessionRefs).toEqual([{ sessionId: "s2", title: "Same title" }]);
+    await mounted.input.value!.send();
+    expect(mounted.send).toHaveBeenCalledOnce();
+    expect(mounted.send.mock.calls[0]![0].text).toBe("[Same title](locus://session/s2)");
+    expect(mounted.send.mock.calls[0]![0].displayText).toBe("[Same title](locus://session/s2)");
+  });
+
+  it("upgrades an existing inline draft and restores attachments after remount", async () => {
+    const draftStateKey = "session-ref-upgrade";
+    const mounted = await mountInput({ text: "[旧会话](locus://session/old-id)", draftStateKey });
+    await flushAsync();
+    expect(mounted.state.text).toBe("");
+    expect(mounted.host.querySelector(".session-ref-attachment .local-file-chip-name")?.textContent).toBe("旧会话");
+    const restored = await mountInput({ draftStateKey });
+    expect(restored.input.value!.exportDraft().sessionRefs).toEqual([{ sessionId: "old-id", title: "旧会话" }]);
+    expect(restored.host.querySelector(".session-ref-attachment")).not.toBeNull();
+    restored.host.querySelector<HTMLButtonElement>(".session-ref-attachment .local-file-chip-remove")!.click();
+    await flushAsync();
+    expect(restored.input.value!.isDraftEmpty()).toBe(true);
+    const empty = await mountInput({ draftStateKey });
+    expect(empty.host.querySelector(".session-ref-attachment")).toBeNull();
+  });
+
+  it("preserves a session attachment when send preflight is declined", async () => {
+    const mounted = await mountInput({ beforeSend: async () => false });
+    await mounted.input.value!.appendDraft({ ...mounted.input.value!.exportDraft(), sessionRefs: [{ sessionId: "s", title: "Previous" }] });
+    await mounted.input.value!.send();
+    expect(mounted.send).not.toHaveBeenCalled();
+    expect(mounted.host.querySelector(".session-ref-attachment")).not.toBeNull();
+    expect(mounted.input.value!.exportDraft().sessionRefs).toEqual([{ sessionId: "s", title: "Previous" }]);
+  });
+
+  it("discards old checkout title results and isolates title-search failures", async () => {
+    const pending = deferred<import("../services/session").SessionTitleMatch[]>();
+    mocks.searchSessionTitles.mockReturnValueOnce(pending.promise).mockRejectedValue(new Error("offline"));
+    const mounted = await mountInput();
+    await setComposerText(mounted.host, "@旧会话");
+    await vi.advanceTimersByTimeAsync(60);
+    mounted.state.workspaceRef = CHECKOUT_B;
+    await flushAsync();
+    pending.resolve([{ id: "session-old", title: "旧会话", archived: false, updatedAt: 1 }]);
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mentionNames(mounted)).not.toContain("旧会话");
+    mocks.searchWorkspaceAssets.mockResolvedValue([{ path: "Assets/Shader.shader", name: "Shader.shader", matchScore: 1 }]);
+    await setComposerText(mounted.host, "@Shader");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mentionNames(mounted)).toContain("Shader.shader");
+  });
+
+  it('keeps the complete draft on declined or failed preflight and clears only after acceptance', async () => {
+    const beforeSend = vi.fn().mockResolvedValue(false);
+    const mounted = await mountInput({ beforeSend });
+    await mounted.input.value!.appendDraft({ ...mounted.input.value!.exportDraft(), text: 'keep draft', images: [{ data: 'aW1hZ2U=', mimeType: 'image/png' }], localFiles: [{ path: 'C:/projects/a/note.txt', name: 'note.txt', isDir: false }] });
+    await flushAsync();
+    const original = mounted.input.value!.exportDraft();
+    await mounted.input.value!.send();
+    expect(mounted.input.value!.exportDraft()).toEqual(original);
+    expect(mounted.send).not.toHaveBeenCalled();
+    beforeSend.mockRejectedValueOnce(new Error('offline'));
+    await mounted.input.value!.send();
+    expect(mounted.input.value!.exportDraft()).toEqual(original);
+    beforeSend.mockResolvedValue(true);
+    await mounted.input.value!.send();
+    await flushAsync();
+    expect(mounted.send).toHaveBeenCalledTimes(1);
+    expect(mounted.send.mock.calls[0]![0].text).toContain('note.txt');
+    expect(mounted.input.value!.isDraftEmpty()).toBe(true);
+  });
+  it('ignores a preflight completion after the draft changed', async () => {
+    const pending = deferred<boolean>();
+    const mounted = await mountInput({ text: 'old draft', beforeSend: () => pending.promise });
+    const sending = mounted.input.value!.send();
+    mounted.state.text = 'new draft';
+    await nextTick();
+    pending.resolve(true);
+    await sending;
+    expect(mounted.send).not.toHaveBeenCalled();
+    expect(mounted.state.text).toBe('new draft');
+  });
+  it.each(["mouse", "Enter", "Tab"])("searches Views by name or type and attaches their source with %s", async (selection) => {
+    mocks.viewList.mockResolvedValue([mentionView()]);
+    mocks.searchWorkspaceEntries.mockResolvedValue([{
+      relPath: "Locus/View/combat/combat.vue", name: "combat.vue", parentPath: "Locus/View/combat",
+      isDir: false, matchScore: 1000,
+    }]);
+    const mounted = await mountInput();
+    let textarea = await setComposerText(mounted.host, "检查 @战斗");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mentionNames(mounted)).toEqual(["战斗面板"]);
+    expect(mocks.viewList).toHaveBeenCalledWith(CHECKOUT_A);
+    textarea = await setComposerText(mounted.host, "检查 @view");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mentionNames(mounted)).toEqual(["战斗面板"]);
+    expect(mounted.host.querySelector(".mention-path")?.textContent).toBe("View · Tools/Combat");
+    if (selection === "mouse") mounted.host.querySelector<HTMLButtonElement>(".mention-select")!.click();
+    else textarea.dispatchEvent(new KeyboardEvent("keydown", { key: selection, bubbles: true, cancelable: true }));
+    await flushAsync();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mounted.state.text).toBe("检查 ");
+    expect(mounted.host.querySelector(".mention-popup")).toBeNull();
+    expect(mounted.input.value!.exportDraft().localFiles).toMatchObject([{
+      path: "C:/projects/a/Locus/View/combat/combat.vue", name: "战斗面板", isDir: false, typeLabel: "View",
+    }]);
+    // Sending carries the actual file path through the existing attachment protocol.
+    textarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await flushAsync();
+    expect(mounted.send).toHaveBeenCalledOnce();
+    expect(mounted.send.mock.calls[0]![0].text).toContain("file: `C:/projects/a/Locus/View/combat/combat.vue`; type: View");
+  });
+
+  it("shows cached View tabs and tree entries immediately with checkout and generation isolation", async () => {
+    const mounted = await mountInput();
+    const { workbench, explorer } = seedMentionWorkspace(mounted);
+    const views = [
+      { view: mentionView(), workspaceRef: CHECKOUT_A },
+      { view: mentionView({ id: "tree", name: "场景面板", manifestPath: "C:/projects/a/Locus/View/tree/tree.vue" }), workspaceRef: CHECKOUT_A },
+      { view: mentionView({ id: "other", name: "Other checkout" }), workspaceRef: CHECKOUT_B },
+      { view: mentionView({ id: "old", name: "Old generation" }), workspaceRef: { ...CHECKOUT_A, expectedGeneration: 2 } },
+      { view: mentionView({ id: "epoch", name: "Old materialization" }), workspaceRef: { ...CHECKOUT_A, expectedMaterializationEpoch: 5 } },
+    ];
+    explorer.viewResources["project-a"] = views.map((view) => ({ projectId: "project-a", ...view }));
+    workbench.windows.main!.groups.main!.tabs.push(createWorkbenchEditorInput(
+      { kind: "view", projectId: "project-a", viewId: "combat" }, "战斗面板", { checkoutBinding: CHECKOUT_A },
+    ));
+    explorer.snapshots["project-a"]!.nodes.push(...views.map(({ view }, index) => ({
+      nodeId: view.id, resourceId: view.id, projectId: "project-a", nodeKind: "resource" as const,
+      resourceKind: "view", hidden: false, position: index + 2,
+    })));
+    await setComposerText(mounted.host, "@");
+    expect(mentionNames(mounted)).toContain("战斗面板");
+    await setComposerText(mounted.host, "@view");
+    expect(mentionNames(mounted)).toEqual(["战斗面板", "场景面板"]);
+    expect(mocks.viewList).not.toHaveBeenCalled();
+    mocks.viewList.mockResolvedValue(views.slice(0, 2).map(({ view }) => view));
+    await vi.advanceTimersByTimeAsync(60);
+    expect(mentionNames(mounted)).toEqual(["战斗面板", "场景面板"]);
+  });
+
+  it("ignores View responses from the previous checkout and keeps search usable on View failure", async () => {
+    const pending = deferred<ViewPackageSummary[]>();
+    mocks.viewList.mockReturnValueOnce(pending.promise).mockRejectedValue(new Error("offline"));
+    const mounted = await mountInput();
+    await setComposerText(mounted.host, "@view");
+    await vi.advanceTimersByTimeAsync(60);
+    mounted.state.workspaceRef = CHECKOUT_B;
+    mounted.state.workspaceRoot = "D:/projects/b";
+    await flushAsync();
+    mocks.searchWorkspaceEntries.mockResolvedValue([{
+      relPath: "docs/view.md", name: "view.md", parentPath: "docs", isDir: false, matchScore: 1,
+    }]);
+    await setComposerText(mounted.host, "@vie");
+    await setComposerText(mounted.host, "@view");
+    await vi.advanceTimersByTimeAsync(60);
+    pending.resolve([mentionView()]);
+    await flushAsync();
+    expect(mentionNames(mounted)).toEqual(["view.md"]);
+    expect(mocks.viewList).toHaveBeenLastCalledWith(CHECKOUT_B);
+    expect(mounted.host.querySelector(".mention-loading-status")).toBeNull();
+  });
+
   it("keeps matching slow-provider candidates visible while the next query fills in", async () => {
     mocks.searchWorkspaceEntries.mockResolvedValue([
       { relPath: "docs/Hero.md", name: "Hero.md", parentPath: "docs", isDir: false, matchScore: 1 },
@@ -750,8 +975,8 @@ describe("RichChatInput scoped controller", () => {
   });
 
   it("binds @ search and scene validation to the editor checkout and discards stale results", async () => {
-    const firstStatus = deferred<Record<string, unknown>>();
-    mocks.checkUnityConnectionStatus.mockReturnValueOnce(firstStatus.promise);
+    const firstSearch = deferred<Array<Record<string, unknown>>>();
+    mocks.searchLoadedSceneObjects.mockReturnValueOnce(firstSearch.promise);
     const mounted = await mountInput();
 
     await setComposerText(mounted.host, "@Hero");
@@ -769,25 +994,20 @@ describe("RichChatInput scoped controller", () => {
       expect.objectContaining({ query: "Hero" }),
       CHECKOUT_A,
     );
-    expect(mocks.checkUnityConnectionStatus).toHaveBeenCalledWith(CHECKOUT_A);
+    expect(mocks.searchLoadedSceneObjects).toHaveBeenCalledWith("Hero", 160, CHECKOUT_A);
+    expect(mocks.checkUnityConnectionStatus).not.toHaveBeenCalled();
 
     mounted.state.workspaceRef = CHECKOUT_B;
     mounted.state.workspaceRoot = "D:/projects/b";
     await nextTick();
-    firstStatus.resolve({
-      connected: true,
+    firstSearch.resolve([{
       scenePath: "Assets/Scenes/A.unity",
-      scenePaths: ["Assets/Scenes/A.unity"],
-    });
+      objectPath: "Root/Hero", name: "Hero", matchScore: 100,
+    }]);
     await flushAsync();
-    expect(mocks.searchWorkspaceSceneObjects).not.toHaveBeenCalled();
+    expect(mounted.host.textContent).not.toContain("Root/Hero");
 
-    mocks.checkUnityConnectionStatus.mockResolvedValue({
-      connected: true,
-      scenePath: "Assets/Scenes/B.unity",
-      scenePaths: ["Assets/Scenes/B.unity"],
-    });
-    mocks.searchWorkspaceSceneObjects.mockResolvedValue([{
+    mocks.searchLoadedSceneObjects.mockResolvedValue([{
       scenePath: "Assets/Scenes/B.unity",
       objectPath: "Root/Enemy",
       name: "Enemy",
@@ -801,8 +1021,7 @@ describe("RichChatInput scoped controller", () => {
       mocks.searchWorkspaceAssets.mock.calls.length - 1
     ];
     expect(latestAssetSearch?.[3]).toEqual(CHECKOUT_B);
-    expect(mocks.searchWorkspaceSceneObjects).toHaveBeenCalledWith(
-      "Assets/Scenes/B.unity",
+    expect(mocks.searchLoadedSceneObjects).toHaveBeenCalledWith(
       "Enemy",
       160,
       CHECKOUT_B,
@@ -817,6 +1036,31 @@ describe("RichChatInput scoped controller", () => {
       CHECKOUT_B,
       "Assets/Scenes/B.unity",
       "Root/Enemy",
+    );
+  });
+
+  it("publishes loaded SubScene matches within the short debounce without waiting for other providers", async () => {
+    mocks.searchWorkspaceAssets.mockReturnValue(new Promise(() => {}));
+    mocks.searchLoadedSceneObjects.mockResolvedValue([{
+      scenePath: "Assets/Scenes/World_SubScene.unity",
+      objectPath: "E008/GameObject/Cube[2]", name: "Cube", matchScore: 1200,
+    }]);
+    // Real readiness responses contain no scenePath/scenePaths.
+    mocks.checkUnityConnectionStatus.mockResolvedValue({ connected: true, ready: true });
+    const mounted = await mountInput();
+    await setComposerText(mounted.host, "@Cube");
+    await vi.advanceTimersByTimeAsync(25);
+    await flushAsync();
+    const cube = Array.from(mounted.host.querySelectorAll<HTMLButtonElement>(".mention-select"))
+      .find((item) => item.textContent?.includes("Cube"));
+    expect(cube).toBeDefined();
+    expect(cube!.textContent).toContain("World_SubScene.unity");
+    expect(mocks.searchLoadedSceneObjects).toHaveBeenCalledOnce();
+    expect(mocks.checkUnityConnectionStatus).not.toHaveBeenCalled();
+    cube!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    await flushAsync();
+    expect(mocks.validateUnitySceneObject).toHaveBeenCalledWith(
+      CHECKOUT_A, "Assets/Scenes/World_SubScene.unity", "E008/GameObject/Cube[2]",
     );
   });
 

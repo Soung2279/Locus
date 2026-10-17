@@ -60,7 +60,7 @@ describe("chat responsive layout", () => {
     const sidebar = read("src/components/ChatSidebarPanel.vue");
 
     expect(app).toContain('import DevelopmentWorkbench from "./components/workbench/DevelopmentWorkbench.vue"');
-    expect(app).toContain('<DevelopmentWorkbench v-show="uiStore.activePage === \'development\'" />');
+    expect(app).toContain(':window-id="applicationWindowId"');
     expect(app).toContain("await registerListeners();");
     expect(unityView).toContain("<DevelopmentWorkbench");
     expect(development).toContain("<WorkbenchSplitHost");

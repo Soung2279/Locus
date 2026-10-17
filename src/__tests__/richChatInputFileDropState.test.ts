@@ -37,8 +37,8 @@ describe("RichChatInput file drop state", () => {
     expect(richInput).toContain('@dragover="handleLocalFileDragOver"');
     expect(richInput).toContain('@dragleave="handleLocalFileDragLeave"');
     expect(richInput).toContain('@drop="handleLocalFileDrop"');
-    expect(richInput).toContain('document.addEventListener("drop", handleDocumentLocalFileDrop)');
-    expect(richInput).toContain('window.addEventListener("blur", handleWindowLocalFileDragBlur)');
+    expect(richInput).toContain('ownerDocument.addEventListener("drop", handleDocumentLocalFileDrop)');
+    expect(richInput).toContain('ownerWindow.addEventListener("blur", handleWindowLocalFileDragBlur)');
 
     expect(composer).toContain("dropAvailable?: boolean;");
     expect(composer).toContain("dropActive?: boolean;");
@@ -54,7 +54,7 @@ describe("RichChatInput file drop state", () => {
 
     expect(service).toContain("export interface LocusFileDragStatePayload");
     expect(service).toContain("export function subscribeLocusFileDragState");
-    expect(service).toContain('runtime.subscribe<LocusFileDragStatePayload>("locus-file-drag-state", handler)');
+    expect(service).toContain('(owner ?? getCurrentWindow()).listen<LocusFileDragStatePayload>("locus-file-drag-state"');
 
     expect(command).toContain('const FILE_DRAG_STATE_EVENT: &str = "locus-file-drag-state";');
     expect(command).toContain("struct LocusFileDragStatePayload");

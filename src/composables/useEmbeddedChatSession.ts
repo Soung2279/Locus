@@ -18,6 +18,7 @@ import { useThrottledStreamingText } from "./streamingRenderThrottle";
 import { hydrateChatMessagesIntent, withClientMessageId } from "./chatInputIntents";
 import { useChatInputSettings } from "./useChatInputSettings";
 import { useDisplaySettings } from "./useDisplaySettings";
+import { prefetchMessagePathStatuses } from "./markdownPathStatusPrefetch";
 import {
   buildPendingSessionInputDraft,
   buildUserMessageDraft,
@@ -28,14 +29,18 @@ import {
   asyncTaskDisplayStatus,
 } from "./asyncTaskUpdates";
 import { useModelStore } from "../stores/model";
+import { useNotificationStore } from "../stores/notification";
 import type { WorkspaceRef } from "../services/project";
 import {
   bindSessionAsyncTaskUpdateConsumer,
   bindSessionStreamEventConsumer,
   sessionStreamSourceMatchesWorkspace,
   subscribeSessionAsyncTaskUpdateConsumer,
+  subscribeSessionAsyncTaskUpdates,
   subscribeSessionExecutionStateConsumer,
+  subscribeSessionContentChangeConsumer,
   subscribeSessionStreamEventConsumer,
+  subscribeSessionStreamEvents,
 } from "../services/sessionStreamEventHub";
 import {
   buildInterruptedTrailingToolResultMessages,
@@ -66,6 +71,7 @@ import type {
   PendingSessionInput,
   SessionDetail,
   SessionTurnPreview,
+  SessionViewSnapshot,
 } from "../types";
 
 export interface EmbeddedChatRequest {
@@ -88,6 +94,7 @@ interface EmbeddedChatState extends StreamState {
   hydrated: boolean;
   currentRunId: string | null;
   error: string | null;
+  errorNotificationHandled: boolean;
   loading: boolean;
   sessionAgentId: string | null;
   sessionModelId: string | null;
@@ -97,6 +104,7 @@ interface EmbeddedChatState extends StreamState {
   parentSessionId: string | null;
   latestCompletedRunId: string | null;
   latestTodoRunId: string | null;
+  todosSessionScoped: boolean;
   todoWriteVersion: number;
   resumeAvailable: boolean;
   planModeActive: boolean;
@@ -168,6 +176,11 @@ function emptyTokenUsage(): TokenUsage {
   };
 }
 
+function setEmbeddedError(state: EmbeddedChatState, message: string | null, notified = false) {
+  state.error = message;
+  state.errorNotificationHandled = notified;
+}
+
 function createState(key: string): EmbeddedChatState {
   return reactive({
     key,
@@ -175,6 +188,7 @@ function createState(key: string): EmbeddedChatState {
     hydrated: false,
     currentRunId: null,
     error: null,
+    errorNotificationHandled: false,
     loading: false,
     sessionAgentId: null,
     sessionModelId: null,
@@ -184,6 +198,7 @@ function createState(key: string): EmbeddedChatState {
     parentSessionId: null,
     latestCompletedRunId: null,
     latestTodoRunId: null,
+    todosSessionScoped: false,
     todoWriteVersion: 0,
     resumeAvailable: false,
     planModeActive: false,
@@ -239,6 +254,119 @@ const sharedEmbeddedChatDrafts = new Map<string, { value: string }>();
 const sharedEmbeddedRestoredDrafts = new Map<string, { value: UserMessageDraft | null }>();
 const sharedEmbeddedChatRetainCounts = new WeakMap<EmbeddedChatState, number>();
 const MAX_SHARED_EMBEDDED_CHAT_STATES = 64;
+
+function loadSessionMetadataBundle(sessionId: string, workspaceRef: WorkspaceRef | null) {
+  return Promise.all([
+    sessionService.getSessionUsage(sessionId).catch(() => null),
+    sessionService.getTodos(sessionId).catch(() => ({ items: [], latestRunId: null, sessionScoped: false })),
+    undoService.undoList(sessionId).catch(() => []),
+    sessionService.getSessionResumeAvailable(sessionId).catch(() => false),
+    sessionService.getSessionPlanState(sessionId, workspaceRef).catch(() => ({
+      active: false,
+      planFilePath: "",
+      planFileExists: false,
+    })),
+  ] as const);
+}
+
+type SessionMetadataBundle = Awaited<ReturnType<typeof loadSessionMetadataBundle>>;
+
+interface SessionViewPreload {
+  snapshot: Promise<SessionViewSnapshot | null>;
+  metadata: Promise<SessionMetadataBundle>;
+  workspaceRef: WorkspaceRef | null;
+  messageLimit: number;
+  createdAt: number;
+}
+
+// Pointing at a session in the sidebar preloads its first page, inline path
+// statuses and metadata, so opening a session that has not been loaded in this
+// window is as fast as reopening one that has. A preload is used at most once,
+// expires quickly, and is discarded as soon as its session receives any event,
+// so it is never older than a load started at click time would be.
+const SESSION_VIEW_PRELOAD_TTL_MS = 2_000;
+const MAX_SESSION_VIEW_PRELOADS = 4;
+const sessionViewPreloads = new Map<string, SessionViewPreload>();
+let sessionViewPreloadInvalidation: (() => void) | null = null;
+
+function ensureSessionViewPreloadInvalidation(): void {
+  if (sessionViewPreloadInvalidation) return;
+  const owner = {};
+  const stopStream = subscribeSessionStreamEvents(({ event }) => {
+    sessionViewPreloads.delete(event.sessionId.trim());
+  });
+  const stopTasks = subscribeSessionAsyncTaskUpdates((update) => {
+    sessionViewPreloads.delete(update.sessionId);
+  });
+  const stopContent = subscribeSessionContentChangeConsumer(
+    ({ sessionId }) => (sessionViewPreloads.has(sessionId) ? owner : null),
+    ({ sessionId }) => { sessionViewPreloads.delete(sessionId); },
+  );
+  sessionViewPreloadInvalidation = () => { stopStream(); stopTasks(); stopContent(); };
+}
+
+function sameWorkspaceRef(left: WorkspaceRef | null, right: WorkspaceRef | null): boolean {
+  if (!left || !right) return left === right;
+  return left.checkoutId === right.checkoutId
+    && (left.expectedGeneration ?? null) === (right.expectedGeneration ?? null)
+    && (left.expectedMaterializationEpoch ?? null) === (right.expectedMaterializationEpoch ?? null);
+}
+
+/** Starts loading an idle session that is about to be opened. */
+export function preloadEmbeddedChatSession(sessionId: string, workspaceRef: WorkspaceRef | null): void {
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedSessionId) return;
+  const shared = sharedEmbeddedChatSessionStates.get(normalizedSessionId);
+  if (shared?.hydrated || shared?.loading) return;
+  const messageLimit = useDisplaySettings().state.sessionMessagePageSize;
+  const existing = sessionViewPreloads.get(normalizedSessionId);
+  if (
+    existing
+    && existing.messageLimit === messageLimit
+    && sameWorkspaceRef(existing.workspaceRef, workspaceRef)
+    && Date.now() - existing.createdAt < SESSION_VIEW_PRELOAD_TTL_MS
+  ) return;
+  ensureSessionViewPreloadInvalidation();
+  const snapshot = sessionService.loadSessionView(normalizedSessionId, messageLimit, false)
+    .then(async (view) => {
+      const pathStatuses = prefetchMessagePathStatuses(view.session.messages);
+      if (pathStatuses) await pathStatuses;
+      return view;
+    })
+    .catch(() => null);
+  sessionViewPreloads.delete(normalizedSessionId);
+  sessionViewPreloads.set(normalizedSessionId, {
+    snapshot,
+    metadata: loadSessionMetadataBundle(normalizedSessionId, workspaceRef),
+    workspaceRef,
+    messageLimit,
+    createdAt: Date.now(),
+  });
+  while (sessionViewPreloads.size > MAX_SESSION_VIEW_PRELOADS) {
+    const oldest = sessionViewPreloads.keys().next().value as string | undefined;
+    if (!oldest) break;
+    sessionViewPreloads.delete(oldest);
+  }
+}
+
+function takeSessionViewPreload(
+  sessionId: string,
+  messageLimit: number,
+): SessionViewPreload | null {
+  const preload = sessionViewPreloads.get(sessionId) ?? null;
+  sessionViewPreloads.delete(sessionId);
+  if (
+    !preload
+    || preload.messageLimit !== messageLimit
+    || Date.now() - preload.createdAt >= SESSION_VIEW_PRELOAD_TTL_MS
+  ) return null;
+  return preload;
+}
+
+/** Resolves to the value when the promise has already settled, otherwise to undefined. */
+function settledValue<T>(promise: Promise<T>): Promise<T | undefined> {
+  return Promise.race([promise, Promise.resolve(undefined)]);
+}
 
 function sharedEmbeddedChatDraft(key: string): { value: string } {
   const existing = sharedEmbeddedChatDrafts.get(key);
@@ -874,6 +1002,7 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       resetEmbeddedStreams(state);
       break;
     case "setTodos":
+      state.todosSessionScoped = mutation.sessionScoped === true;
       state.todos = mutation.todos;
       state.latestTodoRunId = mutation.runId;
       state.todoWriteVersion += 1;
@@ -985,6 +1114,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   ): void {
     state.todos = sessionTodos.items;
     state.latestTodoRunId = sessionTodos.latestRunId;
+    state.todosSessionScoped = sessionTodos.sessionScoped === true;
     if (state.todos.length === 0) state.showTodoPanel = false;
     state.undoableMessageIds = new Set(undoEntries.map((entry) => entry.assistantMessageId));
     if (usage) state.tokenUsage = usage;
@@ -997,17 +1127,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     sessionId: string,
     workspaceRef: WorkspaceRef | null,
   ) {
-    return Promise.all([
-      sessionService.getSessionUsage(sessionId).catch(() => null),
-      sessionService.getTodos(sessionId).catch(() => ({ items: [], latestRunId: null })),
-      undoService.undoList(sessionId).catch(() => []),
-      sessionService.getSessionResumeAvailable(sessionId).catch(() => false),
-      sessionService.getSessionPlanState(sessionId, workspaceRef).catch(() => ({
-        active: false,
-        planFilePath: "",
-        planFileExists: false,
-      })),
-    ] as const);
+    return loadSessionMetadataBundle(sessionId, workspaceRef);
   }
 
   const sessionHydrationEpochs = new Map<string, number>();
@@ -1042,7 +1162,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     }
     state = bindSharedEmbeddedChatSession(state, normalizedSessionId);
     state.loading = true;
-    state.error = null;
+    setEmbeddedError(state, null);
     sessionStates.set(normalizedSessionId, state);
     let hydrated = false;
     try {
@@ -1054,20 +1174,44 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         resume: state.resumeAvailable,
       };
       // Auxiliary IPC requests run concurrently, but only the transcript is on
-      // the critical path to displaying a session.
-      const snapshotRequest = sessionService.loadSessionView(
-        normalizedSessionId, useDisplaySettings().state.sessionMessagePageSize,
-      );
-      const metadata = loadEmbeddedSessionMetadata(normalizedSessionId, workspaceRef);
+      // the critical path to displaying a session. The saved transcript is shown
+      // first; remote (SSH) history is reconciled in the background below.
+      const messageLimit = useDisplaySettings().state.sessionMessagePageSize;
+      const preload = takeSessionViewPreload(normalizedSessionId, messageLimit);
+      const snapshotRequest = preload
+        ? preload.snapshot.then((view) => view ?? sessionService.loadSessionView(normalizedSessionId, messageLimit, false))
+        : sessionService.loadSessionView(normalizedSessionId, messageLimit, false);
+      const metadata = preload && sameWorkspaceRef(preload.workspaceRef, workspaceRef)
+        ? preload.metadata
+        : loadEmbeddedSessionMetadata(normalizedSessionId, workspaceRef);
       const snapshot = await snapshotRequest;
+      if (
+        sessionHydrationEpochs.get(state.key) !== epoch
+        || state.sessionId !== normalizedSessionId
+      ) return;
+      // One batched stat before the first render: the hidden surface renders
+      // its final file references once and is presented as soon as it is done.
+      const pathStatuses = prefetchMessagePathStatuses(snapshot.session.messages);
+      if (pathStatuses) {
+        await pathStatuses;
+        if (
+          sessionHydrationEpochs.get(state.key) !== epoch
+          || state.sessionId !== normalizedSessionId
+        ) return;
+      }
+      // Metadata requested with the transcript is usually back by now; applying
+      // it in the same pass keeps todos, resume and plan state in the first
+      // frame. Metadata that is still pending never delays the transcript.
+      const settledMetadata = await settledValue(metadata);
       if (
         sessionHydrationEpochs.get(state.key) !== epoch
         || state.sessionId !== normalizedSessionId
       ) return;
       applyLoadedSessionSnapshot(state, snapshot);
       hydrated = true;
+      void synchronizeRemoteHistoryInBackground(state, normalizedSessionId, epoch);
       const completedRun = state.latestCompletedRunId;
-      void metadata.then(([usage, sessionTodos, undoEntries, resumeAvailable, planState]) => {
+      const applyHydrationMetadata = ([usage, sessionTodos, undoEntries, resumeAvailable, planState]: SessionMetadataBundle) => {
         if (sessionHydrationEpochs.get(state.key) !== epoch || state.sessionId !== normalizedSessionId
           || state.metadataVersion !== metadataVersion) return;
         // The user can already interact and receive stream updates. Late
@@ -1076,6 +1220,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         if (state.todos === baseline.todos && state.todoWriteVersion === baseline.todoVersion) {
           state.todos = sessionTodos.items;
           state.latestTodoRunId = sessionTodos.latestRunId;
+          state.todosSessionScoped = sessionTodos.sessionScoped === true;
           if (state.todos.length === 0) state.showTodoPanel = false;
         }
         if (state.undoableMessageIds === baseline.undo) {
@@ -1091,13 +1236,15 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
           state.planModeActive = planState.active;
           state.planFilePath = planState.planFilePath || null;
         }
-      });
+      };
+      if (settledMetadata) applyHydrationMetadata(settledMetadata);
+      else void metadata.then(applyHydrationMetadata);
     } catch (error) {
       if (
         sessionHydrationEpochs.get(state.key) !== epoch
         || state.sessionId !== normalizedSessionId
       ) return;
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
     } finally {
       if (sessionHydrationEpochs.get(state.key) === epoch) state.loading = false;
       if (hydrated) {
@@ -1111,19 +1258,41 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     }
   }
 
+  async function synchronizeRemoteHistoryInBackground(
+    state: EmbeddedChatState,
+    sessionId: string,
+    epoch: number,
+  ): Promise<void> {
+    try {
+      const result = await sessionService.synchronizeSessionRemoteHistory(sessionId);
+      // Only a changed remote transcript is reloaded, so an up-to-date session
+      // is never re-rendered. A run started meanwhile reloads when it ends.
+      if (!result.changed || sessionHydrationEpochs.get(state.key) !== epoch
+        || state.sessionId !== sessionId || state.isStreaming || state.pendingRun) return;
+      await reloadSessionState(state, sessionId, true);
+    } catch (error) {
+      console.warn("[embedded-chat] remote history synchronization failed:", error);
+    }
+  }
+
   function resolveStateForEvent(event: StreamEvent) {
     return sessionStates.get(event.sessionId) ?? null;
   }
 
-  async function reloadSessionState(state: EmbeddedChatState, sessionId: string): Promise<boolean> {
-    state.metadataVersion += 1;
+  async function reloadSessionState(state: EmbeddedChatState, sessionId: string, savedOnly = false): Promise<boolean> {
+    const version = ++state.metadataVersion;
+    const runId = state.currentRunId;
     try {
       const workspaceRef = captureWorkspaceRef();
       const [snapshot, metadata] = await Promise.all([
-        sessionService.loadSessionView(sessionId, useDisplaySettings().state.sessionMessagePageSize),
+        savedOnly ? sessionService.loadSessionView(sessionId, useDisplaySettings().state.sessionMessagePageSize, false)
+          : sessionService.loadSessionView(sessionId, useDisplaySettings().state.sessionMessagePageSize),
         loadEmbeddedSessionMetadata(sessionId, workspaceRef),
       ]);
+      const pathStatuses = prefetchMessagePathStatuses(snapshot.session.messages);
+      if (pathStatuses) await pathStatuses;
       if (state.sessionId !== sessionId) return false;
+      if (savedOnly && (version !== state.metadataVersion || runId !== state.currentRunId || state.isStreaming)) return false;
       applyLoadedSessionSnapshot(state, snapshot);
       applyLoadedSessionMetadata(state, metadata);
       return true;
@@ -1175,7 +1344,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.pendingRun = false;
       state.isCancelling = false;
       state.resumeAvailable = false;
-      state.error = null;
+      setEmbeddedError(state, null);
       return;
     }
 
@@ -1237,7 +1406,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
     if (event.type === "error") {
       flushDeferredUserMessages(state, event.runId);
-      state.error = normalizeAppError(event.error).message;
+      useNotificationStore().addNotice("error", event.error.message, { code: event.error.code, operation: "chat" });
+      setEmbeddedError(state, normalizeAppError(event.error).message, true);
       state.currentRunId = null;
       state.pendingRun = false;
       state.isCancelling = false;
@@ -1340,7 +1510,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
     const execution = resolveExecutionSelection(state, request.mode);
     if (!execution) {
-      state.error = t("model.select");
+      setEmbeddedError(state, t("model.select"));
       return;
     }
 
@@ -1390,7 +1560,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
           );
         }
         activeDraft.value.value = "";
-        state.error = null;
+        setEmbeddedError(state, null);
       } catch (error) {
         const err = normalizeAppError(error);
         if (isPendingInputFallbackError(err.code)) {
@@ -1434,7 +1604,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
           );
           state.localFallbackMergeGroupId = mergeGroupId;
           activeDraft.value.value = "";
-          state.error = null;
+          setEmbeddedError(state, null);
           if (!state.isStreaming || state.currentRunId !== pending.runId) {
             state.pendingInputs = state.pendingInputs.filter((input) => input.id !== pending.id);
             state.localMergeGroupId = null;
@@ -1451,7 +1621,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
           }
           return;
         }
-        state.error = err.message;
+        setEmbeddedError(state, err.message);
       }
       return;
     }
@@ -1496,7 +1666,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     }
 
     activeDraft.value.value = "";
-    state.error = null;
+    setEmbeddedError(state, null);
     state.pendingQuestion = null;
     state.pendingToolConfirms = [];
     state.streamSequence = 0;
@@ -1589,7 +1759,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.compactQueued = false;
       restoreEmbeddedSubmittedDraft(submittedUserMessage);
       resetRoundState(state);
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
     }
   }
 
@@ -1628,7 +1798,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
     const execution = resolveExecutionSelection(state, request.mode);
     if (!execution) {
-      state.error = t("model.select");
+      setEmbeddedError(state, t("model.select"));
       return false;
     }
 
@@ -1644,7 +1814,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.cancelPendingLaunch = false;
     state.compactPendingLaunch = false;
     state.compactQueued = false;
-    state.error = null;
+    setEmbeddedError(state, null);
     state.pendingQuestion = null;
     state.pendingToolConfirms = [];
     state.streamSequence = 0;
@@ -1733,7 +1903,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.compactQueued = false;
       state.resumeAvailable = request.resume === true ? resumeAvailableBeforeLaunch : false;
       resetRoundState(state);
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
       return false;
     }
   }
@@ -1764,7 +1934,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         await sessionService.queueSessionCompact(targetSessionId, targetRunId);
         if (state.sessionId === targetSessionId && state.currentRunId === targetRunId) {
           state.compactQueued = true;
-          state.error = null;
+          setEmbeddedError(state, null);
         }
         return true;
       } catch (error) {
@@ -1778,7 +1948,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
             return compact(false);
           }
         }
-        state.error = err.message;
+        setEmbeddedError(state, err.message);
         return false;
       }
     }
@@ -1807,7 +1977,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       }
       return true;
     } catch (error) {
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
       return false;
     }
   }
@@ -1842,7 +2012,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       }
       return allWithdrawn;
     } catch (error) {
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
       return false;
     }
   }
@@ -1873,7 +2043,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       await sessionService.cancelChat(targetSessionId);
       await reloadSessionState(state, targetSessionId);
     } catch (error) {
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
     } finally {
       state.isCancelling = false;
     }
@@ -1894,11 +2064,11 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       if (state.sessionId !== targetSessionId) return false;
       state.planModeActive = planState.active;
       state.planFilePath = planState.planFilePath?.trim() || null;
-      state.error = null;
+      setEmbeddedError(state, null);
       return true;
     } catch (error) {
       if (state.sessionId === targetSessionId) {
-        state.error = normalizeAppError(error).message;
+        setEmbeddedError(state, normalizeAppError(error).message);
       }
       return false;
     }
@@ -1929,6 +2099,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         beforeRowId,
         messageLimit,
       );
+      const pathStatuses = prefetchMessagePathStatuses(page.messages);
+      if (pathStatuses) await pathStatuses;
       if (
         activeState.value !== state
         || state.sessionId !== targetSessionId
@@ -2032,7 +2204,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     try {
       return await sessionService.forkSessionFromMessage(targetSessionId, messageId, title);
     } catch (error) {
-      if (state.sessionId === targetSessionId) state.error = normalizeAppError(error).message;
+      if (state.sessionId === targetSessionId) setEmbeddedError(state, normalizeAppError(error).message);
       return null;
     }
   }
@@ -2044,7 +2216,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     try {
       return await sessionService.forkSession(targetSessionId, title);
     } catch (error) {
-      if (state.sessionId === targetSessionId) state.error = normalizeAppError(error).message;
+      if (state.sessionId === targetSessionId) setEmbeddedError(state, normalizeAppError(error).message);
       return null;
     }
   }
@@ -2068,7 +2240,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const state = activeState.value;
     const targetSessionId = state.sessionId;
     if (!targetSessionId || !assistantMessageId || state.isStreaming) return false;
-    state.error = null;
+    setEmbeddedError(state, null);
     try {
       await undoService.undoPerform(
         targetSessionId,
@@ -2078,7 +2250,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       );
       return reloadSessionState(state, targetSessionId);
     } catch (error) {
-      if (state.sessionId === targetSessionId) state.error = normalizeAppError(error).message;
+      if (state.sessionId === targetSessionId) setEmbeddedError(state, normalizeAppError(error).message);
       return false;
     }
   }
@@ -2087,7 +2259,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const state = activeState.value;
     const targetSessionId = state.sessionId;
     if (!targetSessionId || state.isStreaming) return false;
-    state.error = null;
+    setEmbeddedError(state, null);
     try {
       if (targetMessageId) {
         await sessionService.rollbackSessionToMessage(targetSessionId, targetMessageId);
@@ -2096,7 +2268,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       }
       return reloadSessionState(state, targetSessionId);
     } catch (error) {
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
       return false;
     }
   }
@@ -2109,7 +2281,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const state = activeState.value;
     const targetSessionId = state.sessionId;
     if (!targetSessionId || !assistantMessageId || state.isStreaming) return false;
-    state.error = null;
+    setEmbeddedError(state, null);
     try {
       if (targetMessageId) {
         await undoService.undoPerformToMessage(
@@ -2129,7 +2301,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       }
       return reloadSessionState(state, targetSessionId);
     } catch (error) {
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
       return false;
     }
   }
@@ -2142,7 +2314,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     try {
       await sessionService.answerQuestion(question.questionId, answer);
     } catch (error) {
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
     }
   }
 
@@ -2154,7 +2326,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     try {
       await sessionService.answerQuestion(toolConfirm.questionId, answer);
     } catch (error) {
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
     }
   }
 
@@ -2166,7 +2338,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     await Promise.all(
       toolConfirms.map((item) =>
         sessionService.answerQuestion(item.questionId, answer).catch((error) => {
-          state.error = normalizeAppError(error).message;
+          setEmbeddedError(state, normalizeAppError(error).message);
         })),
     );
   }
@@ -2179,7 +2351,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       await sessionService.applyKnowledgeProposal(state.sessionId, proposalId);
       updateProposalStatus(state, "applied", proposalId);
     } catch (error) {
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
       updateProposalStatus(state, "stale", proposalId);
     }
   }
@@ -2191,7 +2363,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     try {
       await sessionService.ignoreKnowledgeProposal(state.sessionId, proposalId);
     } catch (error) {
-      state.error = normalizeAppError(error).message;
+      setEmbeddedError(state, normalizeAppError(error).message);
       updateProposalStatus(state, "stale", proposalId);
     }
   }
@@ -2270,8 +2442,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       : activeState.value.latestCompletedRunId
   ));
   const currentTodos = computed(() => (
-    todoRunBoundaryId.value
-    && activeState.value.latestTodoRunId === todoRunBoundaryId.value
+    activeState.value.todosSessionScoped || (todoRunBoundaryId.value
+    && activeState.value.latestTodoRunId === todoRunBoundaryId.value)
       ? activeState.value.todos
       : []
   ));
@@ -2356,6 +2528,14 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       update.multiAgentEnabled,
     ),
   );
+  const unsubscribeContentChanges = subscribeSessionContentChangeConsumer(
+    ({ sessionId, source }) => sessionStreamSourceMatchesWorkspace(source, toValue(options.workspaceRef))
+      ? sessionStates.get(sessionId) ?? null : null,
+    ({ sessionId }) => {
+      const state = sessionStates.get(sessionId);
+      if (state && !state.isStreaming && !state.pendingRun) void reloadSessionState(state, sessionId, true);
+    },
+  );
 
   watch([activeKey, requestedSessionId], ([key, requestedId]) => {
     syncActiveState(key, requestedId || null);
@@ -2366,6 +2546,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     unsubscribeStreamEvents();
     unsubscribeAsyncTaskUpdates();
     unsubscribeExecutionState();
+    unsubscribeContentChanges();
     releaseSharedEmbeddedChatState(activeState.value);
   });
 
@@ -2401,6 +2582,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     pendingToolConfirms,
     queuedFollowUp,
     errorMessage,
+    errorNotificationHandled: computed(() => activeState.value.errorNotificationHandled),
     isLoading,
     sessionId,
     currentRunId,

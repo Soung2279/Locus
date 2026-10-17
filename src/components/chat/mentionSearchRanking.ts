@@ -1,6 +1,6 @@
 import { prepareSearchText, scorePreparedSearchText } from "../../composables/searchMatcher";
 
-export type MentionSearchEntryKind = "asset" | "knowledge" | "sceneObject";
+export type MentionSearchEntryKind = "asset" | "knowledge" | "sceneObject" | "view" | "session";
 
 export interface MentionSearchRankable {
   name: string;
@@ -37,6 +37,8 @@ export function mentionResultKey(result: Pick<MentionSearchRankable, "relPath"> 
 }
 
 function searchFields(result: MentionSearchRankable) {
+  // Session discovery is by title; IDs and archive labels are only metadata.
+  if (result.entryKind === "session") return [{ text: prepareSearchText(result.name), weight: 180 }];
   return [
     {
       text: result.name,
@@ -70,6 +72,15 @@ export function rankMentionSearchResults<T extends MentionSearchRankable>(
   for (const result of results) {
     const key = mentionResultKey(result);
     const previous = unique.get(key);
+    if (previous && ((result.entryKind === "view" && previous.entryKind === "asset")
+      || (result.entryKind === "asset" && previous.entryKind === "view"))) {
+      // A loaded source file keeps its tab/tree priority, but the View supplies
+      // its searchable display name, icon and attachment target.
+      const view = result.entryKind === "view" ? result : previous;
+      const source = sourcePriority(result) < sourcePriority(previous) ? result.source : previous.source;
+      unique.set(key, view.source === source ? view : { ...view, source });
+      continue;
+    }
     if (!previous || sourcePriority(result) < sourcePriority(previous)
       || (sourcePriority(result) === sourcePriority(previous)
         && result.entryKind === "knowledge" && previous.entryKind !== "knowledge")) {

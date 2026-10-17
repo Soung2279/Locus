@@ -159,6 +159,17 @@ export function listSessions(): Promise<SessionSummary[]> {
   return ipcInvoke<SessionSummary[]>("list_sessions");
 }
 
+export interface SessionTitleMatch {
+  id: string;
+  title: string;
+  archived: boolean;
+  updatedAt: number;
+}
+
+export function searchSessionTitles(query: string, workspaceRef: WorkspaceRef): Promise<SessionTitleMatch[]> {
+  return ipcInvoke("search_session_titles", { query, workspaceRef, limit: 120 });
+}
+
 export function listCheckoutSessions(workspaceRef: WorkspaceRef): Promise<SessionSummary[]> {
   return ipcInvoke<SessionSummary[]>("list_checkout_sessions", { workspaceRef });
 }
@@ -200,11 +211,36 @@ export function saveSessionExecutionState(
 export function loadSessionView(
   sessionId: string,
   messageLimit?: number | null,
+  synchronizeRemote?: boolean,
 ): Promise<SessionViewSnapshot> {
   return ipcInvoke<SessionViewSnapshot>("load_session_view", {
     sessionId,
     messageLimit: messageLimit ?? null,
+    ...(synchronizeRemote === undefined ? {} : { synchronizeRemote }),
   });
+}
+
+export interface SessionRemoteHistorySync {
+  changed: boolean;
+  warning?: string | null;
+}
+
+const remoteHistorySyncs = new Map<string, Promise<SessionRemoteHistorySync>>();
+
+/**
+ * Reconciles remote Claude history after a view has been shown from local
+ * storage. Concurrent callers (e.g. two panes opening one session) share one
+ * request; `changed` is false when the saved transcript is already current.
+ */
+export function synchronizeSessionRemoteHistory(sessionId: string): Promise<SessionRemoteHistorySync> {
+  const inFlight = remoteHistorySyncs.get(sessionId);
+  if (inFlight) return inFlight;
+  const request = ipcInvoke<SessionRemoteHistorySync>("synchronize_session_remote_history", { sessionId })
+    .finally(() => {
+      if (remoteHistorySyncs.get(sessionId) === request) remoteHistorySyncs.delete(sessionId);
+    });
+  remoteHistorySyncs.set(sessionId, request);
+  return request;
 }
 
 export function loadSessionMessagePage(

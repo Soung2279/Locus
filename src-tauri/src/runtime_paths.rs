@@ -10,6 +10,16 @@ pub(crate) const RUNTIME_LOG_DIR_ENV: &str = "LOCUS_RUNTIME_LOG_DIR";
 pub(crate) const RUNTIME_WORKSPACE_DIR_ENV: &str = "LOCUS_RUNTIME_WORKSPACE_DIR";
 pub(crate) const WEBVIEW_DATA_DIR_ENV: &str = "WEBVIEW2_USER_DATA_FOLDER";
 pub(crate) const SKIP_ONBOARDING_ENV: &str = "LOCUS_SKIP_ONBOARDING";
+pub(crate) const TEST_ROOT_ENV: &str = "LOCUS_TEST_ROOT";
+
+/// Parent directory for disposable acceptance/test projects. Override with
+/// `LOCUS_TEST_ROOT`; defaults to `<system temp>/LocusTemp`.
+pub(crate) fn isolated_test_root() -> PathBuf {
+    std::env::var_os(TEST_ROOT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("LocusTemp"))
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeLaunchOptions {

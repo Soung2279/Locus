@@ -117,7 +117,7 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite worktrees --install-plugin
   bun run locus:test:unity -- --project F:\\OwnedCheckout --suite asset-merge --install-plugin
   bun run locus:test:unity -- --project F:\\OwnedCheckout --suite asset-api --install-plugin
-  bun run locus:test:unity -- --driver-binary E:\\LocusTemp\\driver\\locus.exe --project F:\\OwnedCheckout --suite asset-api --install-plugin
+  bun run locus:test:unity -- --driver-binary F:\\Builds\\driver\\locus.exe --project F:\\OwnedCheckout --suite asset-api --install-plugin
   bun run locus:test:unity -- --project F:\\OwnedCheckout --suite project-pool --install-plugin
   bun run locus:test:unity -- --project F:\\Game --workspace-project F:\\GameCopy --workspace-project F:\\GameWorktree --suite workspace --install-plugin
   bun run locus:test:unity -- --project F:\\GameA --workspace-project F:\\GameB --suite workspace-switch --install-plugin
@@ -140,7 +140,7 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite yaml-parity --yaml-parity-samples 8
 
 Driver options:
-  --suite <name>              headless-development | worktrees | worktree-sdk | asset-merge | asset-api | project-pool | workspace | workspace-switch | session-undo | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | recompile-import | execute | frame-debugger | python-sdk | modal-dialog | safe-mode | yaml-parity | unity-test | all
+  --suite <name>              headless-development | worktrees | worktree-sdk | asset-merge | asset-api | project-pool | workspace | workspace-switch | session-undo | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | recompile-import | execute | frame-debugger | python-sdk | property-sdk-read | modal-dialog | safe-mode | yaml-parity | unity-test | all
                                headless-development creates an isolated worktree and verifies C# edits, tests, Editor reuse, idle TTL and process memory
                                frame-debugger diagnoses capture, paused unity_execute and event-data readiness
                                hot-reload-release runs Release first, then switches to Debug at runtime and runs again
@@ -302,6 +302,15 @@ function runUnityDriver(command, commandArgs, requestedLogDir) {
         replayDriverEventsFromLog(state, child);
       } catch {
         // Keep the child process result authoritative; log replay is diagnostic.
+      }
+      // A launched Unity Editor can inherit these pipes after the driver has
+      // exited. Once its terminal event is recorded, release our pipe readers
+      // so a successful CLI run can exit without waiting for that Editor.
+      if (state.terminalEventSeen) {
+        child.stdout.removeAllListeners("data");
+        child.stderr.removeAllListeners("data");
+        child.stdout.destroy();
+        child.stderr.destroy();
       }
       resolve({
         code,

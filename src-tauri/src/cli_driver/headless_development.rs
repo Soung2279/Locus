@@ -79,7 +79,7 @@ pub(super) async fn run(
         .ok_or("Missing Unity version")?;
     let root = std::env::var_os("LOCUS_HEADLESS_TEST_ROOT")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("E:/LocusTemp"))
+        .unwrap_or_else(crate::runtime_paths::isolated_test_root)
         .join(format!("headless-loop-{}", uuid::Uuid::new_v4().simple()));
     let source = root.join("source");
     let target = root.join("worktree");

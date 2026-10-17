@@ -13,13 +13,7 @@ pub(super) async fn run(
     let runtime = registry.register(&project)?;
     let root = std::env::var_os("LOCUS_WORKTREE_SDK_TEST_ROOT")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(if cfg!(windows) {
-                "E:/LocusTemp"
-            } else {
-                "/tmp"
-            })
-        })
+        .unwrap_or_else(crate::runtime_paths::isolated_test_root)
         .join(format!("worktree-sdk-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let timeout = config.suite_timeout.as_secs().clamp(60, 1800);

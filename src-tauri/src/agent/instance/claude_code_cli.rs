@@ -224,6 +224,40 @@ struct ClaudeCodeRoundHost<'a> {
     render_order: StreamRenderOrderTracker,
 }
 
+// Validate the same output the native adapter will receive, before persisting
+// or emitting a successful tool completion. A later Mod refusal cannot replace
+// an already completed tool result (and must never cause the operation to rerun).
+fn validate_native_tool_result(
+    tool_call_id: &str,
+    result: &mut ExecutedToolResult,
+    stored_output: &mut String,
+) {
+    if result.outcome != super::ToolRunOutcome::Done {
+        return;
+    }
+    let Some(scope) = claude_code_cli::native_scope::current()
+        .filter(|scope| scope.call.id == tool_call_id)
+    else {
+        return;
+    };
+    let reply = claude_code_cli::native_tools::finish_result(
+        &scope.call,
+        &ClaudeCodeToolResult {
+            output: stored_output.clone(),
+            is_error: result.is_error,
+            images: result.images.clone(),
+        },
+        scope.result(),
+    );
+    if let Some(error) = reply["deny"].as_str() {
+        *stored_output = error.to_string();
+        result.output = error.to_string();
+        result.is_error = true;
+        result.outcome = super::ToolRunOutcome::Error;
+        result.images = None;
+    }
+}
+
 fn save_claude_code_tool_result(
     store: &SessionStore,
     session_id: &str,
@@ -1614,7 +1648,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 .map(|round| round.message_id.clone())
                 .or_else(|| self.last_persisted_assistant_message_id.clone())
                 .unwrap_or_default();
-            let result = if let Some(result) = result_override {
+            let mut result = if let Some(result) = result_override {
                 result
             } else {
                 self.ensure_cli_round_undo_checkpoint(&tool_call.name, &args_for_exec)
@@ -1649,7 +1683,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 });
             }
 
-            let stored_output = match self.store.rewrite_tool_result_for_storage(
+            let mut stored_output = match self.store.rewrite_tool_result_for_storage(
                 &self.agent.session_id,
                 &tool_call.id,
                 &tool_call.name,
@@ -1665,6 +1699,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 }
             };
 
+            validate_native_tool_result(&tool_call.id, &mut result, &mut stored_output);
             match save_claude_code_tool_result(
                 self.store,
                 &self.agent.session_id,
@@ -1770,7 +1805,12 @@ impl AgentInstance {
     ) -> Vec<serde_json::Value> {
         if self.cached_lazy_tool_renderer() == super::LazyToolRenderer::ClaudeCliNative {
             let plan = self.build_native_request_tool_plan(super::LazyToolRenderer::ClaudeCliNative, active_skill_tool_names).await;
-            return self.build_api_tools_for_plan(super::LazyToolRenderer::ClaudeCliNative, &plan).await;
+            let mut tools = self.build_api_tools_for_plan(super::LazyToolRenderer::ClaudeCliNative, &plan).await;
+            // Only the model-facing catalog is deduplicated. The local names
+            // must remain authorized: native Edit/Bash/etc. dispatch to them.
+            tools.retain(|tool| tool["function"]["name"].as_str().is_none_or(|name|
+                claude_code_cli::native_tools::native_equivalent_for_locus_tool(name).is_none()));
+            return tools;
         }
         let names = self.build_cli_request_tool_names(dynamic_mode, active_skill_tool_names).await;
         self.build_api_tools(&names).await
@@ -2285,6 +2325,24 @@ fn sanitize_request_id(request_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_cli_catalog_omits_aliases_without_revoking_local_execution() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let instance = super::super::tests::native_plan_test_instance(&root);
+        instance.refresh_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::Native, true);
+        let api = instance.build_cli_api_tools(crate::config::DynamicToolLoadingMode::Native, &HashSet::new()).await;
+        assert!(api.iter().all(|tool| claude_code_cli::native_tools::native_equivalent_for_locus_tool(tool["function"]["name"].as_str().unwrap()).is_none()));
+        assert!(api.iter().any(|tool| tool["function"]["name"] == "web_fetch"));
+        let allowed = instance.allowed_tool_set_for_active_skills(&HashSet::new()).await;
+        assert!(allowed.contains("edit"), "the native Edit adapter still needs local edit authorization");
+        assert!(allowed.contains("read"));
+        // Existing compatibility renderers are not silently migrated.
+        instance.refresh_lazy_tool_renderer(crate::config::DynamicToolLoadingMode::MetaTool, true);
+        let legacy = instance.build_cli_api_tools(crate::config::DynamicToolLoadingMode::MetaTool, &HashSet::new()).await;
+        assert!(legacy.iter().any(|tool| tool["function"]["name"] == "edit"));
+    }
+
     #[test]
     fn claude_notifications_keep_the_real_user_identity_and_retry_payload() {
         use super::*;
@@ -2453,6 +2511,85 @@ mod tests {
     }
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn native_read_adapter_failure_is_persisted_as_error_before_completion() {
+        use claude_code_cli::{native_scope::NativeInvocation, native_tools};
+        use serde_json::json;
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path()).unwrap();
+        let session_id = store.create_session("native error", None, None, "chat", None).unwrap();
+        store.try_start_run(&session_id, "native-error-run").unwrap();
+        let call = native_tools::adapt("native-error", "Read", &json!({"file_path":"large.txt"})).unwrap();
+        let scope = NativeInvocation::new(call.clone(), session_id.clone());
+        let mut result = ExecutedToolResult::from_tool_result(crate::tool::ToolResult {
+            output: "<persisted-output>Full output saved; use a smaller read range.</persisted-output>".into(),
+            is_error: false,
+        });
+        let mut stored_output = result.output.clone();
+        scope.run(async {
+            validate_native_tool_result(&call.id, &mut result, &mut stored_output);
+        }).await;
+        assert!(result.is_error);
+        assert_eq!(result.outcome.as_stream_outcome(), ToolCallOutcome::Error);
+        assert_eq!(result.output, stored_output);
+        let wire = native_tools::finish_result(&call, &ClaudeCodeToolResult {
+            output: stored_output.clone(), is_error: result.is_error, images: result.images.clone(),
+        }, scope.result());
+        assert_eq!(wire["deny"], stored_output);
+        let tool_call: ToolCallInfo = serde_json::from_value(json!({
+            "id":call.id,"name":"read","arguments":call.locus_input.to_string(),
+        })).unwrap();
+        assert_eq!(finalize_tool_call_record(&tool_call, Some(&result)).outcome, Some(ToolCallOutcome::Error));
+        save_claude_code_tool_result(&store, &session_id, "native-error-run", &call.id, &stored_output, None)
+            .unwrap().unwrap();
+        let messages = store.get_messages_for_prompt(&session_id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, wire["deny"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn native_validation_preserves_skill_success_structured_results_and_interruption() {
+        use claude_code_cli::{native_scope::NativeInvocation, native_tools};
+        use serde_json::json;
+        let call = native_tools::adapt("native-read", "Read", &json!({"file_path":"SKILL.md"})).unwrap();
+        let scope = NativeInvocation::new(call.clone(), "test-session".into());
+        let output = "<content>\n1\t# Workflow\n\n(End of file — 1 lines total)\n</content>\n\nLoaded Skill document tools for the next step: read";
+        let mut result = ExecutedToolResult::from_tool_result(crate::tool::ToolResult { output: output.into(), is_error: false });
+        let mut stored = output.to_string();
+        scope.run(async { validate_native_tool_result(&call.id, &mut result, &mut stored); }).await;
+        assert!(!result.is_error);
+        assert_eq!(result.outcome.as_stream_outcome(), ToolCallOutcome::Done);
+        assert_eq!(stored, output);
+
+        for (output, is_error) in [
+            (crate::session::history::INTERRUPTED_TOOL_RESULT, false),
+            ("Permission denied", true),
+        ] {
+            let mut result = ExecutedToolResult::from_tool_result(crate::tool::ToolResult { output: output.into(), is_error });
+            let outcome = result.outcome;
+            let mut stored = output.to_string();
+            scope.run(async { validate_native_tool_result(&call.id, &mut result, &mut stored); }).await;
+            assert_eq!(result.outcome, outcome);
+            assert_eq!(stored, output);
+        }
+
+        let call = native_tools::adapt("native-glob", "Glob", &json!({"pattern":"*.md"})).unwrap();
+        let scope = NativeInvocation::new(call.clone(), "test-session".into());
+        scope.set_result(json!({"filenames":["SKILL.md"],"numFiles":1}));
+        let mut result = ExecutedToolResult::from_tool_result(crate::tool::ToolResult { output: "structured search output".into(), is_error: false });
+        let mut stored = result.output.clone();
+        scope.run(async { validate_native_tool_result(&call.id, &mut result, &mut stored); }).await;
+        assert!(!result.is_error);
+        assert_eq!(stored, "structured search output");
+
+        // Ordinary/MCP tools are not subject to Claude's native result schema.
+        let mut result = ExecutedToolResult::from_tool_result(crate::tool::ToolResult { output: "ordinary output".into(), is_error: false });
+        let mut stored = result.output.clone();
+        validate_native_tool_result("mcp-read", &mut result, &mut stored);
+        assert!(!result.is_error);
+        assert_eq!(stored, "ordinary output");
+    }
 
     #[test]
     fn claude_code_tool_result_uses_stored_output() {

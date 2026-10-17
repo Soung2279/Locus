@@ -208,6 +208,40 @@ describe('Claude native tools Mod', () => {
     ]);
   });
 
+  it.each([
+    { label: 'all eager', deferred: [] as string[] },
+    { label: 'mixed', deferred: ['TaskList', 'mcp__locus__skill_action', 'mcp__external__unknown', 'mcp__external__hyphen-name'] },
+  ])('corrects only new deferred notices using final placement ($label)', async ({ deferred }) => {
+    const header = 'The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — use ToolSearch first:';
+    const original = '<system-reminder>\n' + header + '\n' + ['mcp__locus__edit', ...deferred].join('\n') + '\n</system-reminder>';
+    const h = harness({ active: false, tools: [
+      { name: 'edit', description: 'Pinned legacy edit', input_schema: {}, defer_loading: false },
+      { name: 'skill_action', description: 'Deferred skill', input_schema: {}, defer_loading: true },
+    ] });
+    const api = { ...h.api, env: { get: async (key: string) => key === 'LOCUS_CLAUDE_TUI' ? '1' : key.endsWith('_URL') ? 'http://127.0.0.1:19200' : 'test-token' },
+      session: { id: async () => 'session', model: async () => 'test' }, tool: { register: vi.fn(async () => ({})) } };
+    await h.hooks.get('session.start')!.run(api, {}, h.next);
+    const append = vi.fn(async event => event);
+    const row = { uuid: 'new-notice', door: 'attachment', message: { type: 'attachment', role: 'user', name: 'deferred_tools_delta', content: [{ type: 'text', text: original }] } };
+    await h.hooks.get('session.append')!.run(api, row, append);
+    const text = append.mock.calls[0]![0].message.content[0].text;
+    expect(text).not.toContain('\nmcp__locus__edit\n');
+    expect(text).toContain('Already available directly (no ToolSearch needed): mcp__locus__edit.');
+    if (deferred.length) expect(text).toContain(header + '\n' + deferred.join('\n'));
+    else expect(text).not.toContain('Their schemas are NOT loaded');
+    // Historical rendering and user text must not be rewritten on resume.
+    const render = async (event: { text: string }) => ({ text: event.text });
+    expect(await h.hooks.get('prompt.attachment')!.run(api, { type: 'deferred_tools_delta', text: original }, render)).toEqual({ text: original });
+    append.mockClear();
+    const user = { ...row, door: 'prompt', message: { ...row.message, type: 'user' } };
+    await h.hooks.get('session.append')!.run(api, user, append);
+    expect(append.mock.calls[0]![0].message.content[0].text).toBe(original);
+    append.mockClear();
+    const futureLayout = original.replace('\nmcp__locus__edit\n', '\nmcp__locus__edit\nunknown future listing format\n');
+    await h.hooks.get('session.append')!.run(api, { ...row, message: { ...row.message, content: [{ type: 'text', text: futureLayout }] } }, append);
+    expect(append.mock.calls[0]![0].message.content[0].text).toBe(futureLayout);
+  });
+
   it('registers unchanged definitions once and refuses changes to the cached schema', async () => {
     const options = { active: true, inputId: 'input', prompt: 'hello', tools: [
       { name: 'python', description: 'Run locally', input_schema: { type: 'object', properties: {} } },

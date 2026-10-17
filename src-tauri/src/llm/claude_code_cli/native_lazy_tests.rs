@@ -15,7 +15,7 @@ fn tool(name: &str) -> ClaudeCodeToolDefinition {
     }
 }
 #[derive(Default)]
-struct Host { activated: bool, executed: Vec<String> }
+struct Host { activated: bool, executed: Vec<String>, root: String }
 impl ClaudeCodeHost for Host {
     fn on_text_delta(&mut self, _: String) {}
     fn on_thinking_delta(&mut self, _: String) {}
@@ -24,12 +24,20 @@ impl ClaudeCodeHost for Host {
     fn refresh_tools(&self) -> Pin<Box<dyn Future<Output=Result<Option<Vec<ClaudeCodeToolDefinition>>,String>> + Send + '_>> {
         Box::pin(async {
             let mut tools = vec![tool("read_skill")];
-            if self.activated { tools.push(tool("skill_action")); }
+            if self.activated { tools.extend([tool("skill_action"), tool("edit")]); }
             Ok(Some(tools))
         })
     }
-    fn execute_tool<'a>(&'a mut self, _: &'a str, name: &'a str, _: serde_json::Value) -> ClaudeCodeHostFuture<'a> {
+    fn execute_tool<'a>(&'a mut self, _: &'a str, name: &'a str, args: serde_json::Value) -> ClaudeCodeHostFuture<'a> {
         Box::pin(async move {
+            if name == "edit" {
+                let native = native_scope::current().expect("Edit must arrive through the native adapter");
+                assert_eq!(native.call.tool, "Edit");
+                self.executed.push(name.into());
+                return crate::tool::ToolRegistry::with_builtins().execute_with_context(name, &args, crate::tool::ToolExecutionContext {
+                    working_dir: Some(self.root.clone()), ..Default::default()
+                }).await.into();
+            }
             match name {
                 "read_skill" => self.activated = true,
                 "skill_action" => assert!(self.activated, "unactivated Skill executed"),
@@ -45,6 +53,7 @@ fn sse(step: usize) -> String {
         0 => Some(("mcp__locus__read_skill", json!({}))),
         1 => Some(("ToolSearch", json!({"query":"select:mcp__locus__skill_action","max_results":1}))),
         2 | 4 => Some(("mcp__locus__skill_action", json!({}))),
+        5 => Some(("Edit", json!({"file_path":"native-edit.txt","old_string":"before","new_string":"after"}))),
         _ => None,
     };
     let block = call.as_ref().map(|(name,_)| json!({"type":"tool_use","id":format!("toolu_lazy_{step}"),"name":name,"input":{}}))
@@ -70,6 +79,27 @@ fn without_cache_marks(value: &serde_json::Value) -> serde_json::Value {
 }
 fn eager(request: &serde_json::Value) -> Vec<serde_json::Value> {
     request["tools"].as_array().unwrap().iter().filter(|tool|tool["defer_loading"]!=true).cloned().collect()
+}
+
+fn assert_deferred_notices_match_catalog(value: &serde_json::Value, eager: &[serde_json::Value]) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("type").and_then(|value|value.as_str()) == Some("text") {
+                let text = map.get("text").and_then(|value|value.as_str()).unwrap_or_default();
+                let mut lines = text.lines();
+                while let Some(line) = lines.next() {
+                    if !line.starts_with("The following deferred tools are now available via ToolSearch.") { continue; }
+                    for name in lines.by_ref() {
+                        if name.is_empty() || !name.chars().all(|ch|ch.is_ascii_alphanumeric() || ch=='_') { break; }
+                        assert!(!eager.iter().any(|tool|tool["name"]==name), "eager {name} was falsely announced as deferred");
+                    }
+                }
+            }
+            for item in map.values() { assert_deferred_notices_match_catalog(item, eager); }
+        }
+        serde_json::Value::Array(items) => for item in items { assert_deferred_notices_match_catalog(item, eager); },
+        _ => {},
+    }
 }
 
 #[tokio::test(flavor="multi_thread", worker_threads=2)]
@@ -125,9 +155,12 @@ async fn real_tui_first_tool_search_and_late_skill_preserve_cache_prefix_on_resu
     let options=ClaudeCodeCliOptions {
         remote:None,locus_session_id:id.clone(),cwd:root.path().to_string_lossy().into_owned(),
         system_prompt:"LOCUS_NATIVE_LAZY_PREFIX".into(),model:"claude-sonnet-4-6".into(),effort:None,
-        resume_session_id:None,tools:vec![tool("read_skill")],native_tool_search:true,
+        resume_session_id:None,
+        tools:["read_skill","read","edit","write","bash","grep","list","ask_user_question","todowrite","python"].into_iter().map(tool).collect(),
+        native_tool_search:true,
     };
-    let mut host=Host::default();
+    std::fs::write(root.path().join("native-edit.txt"), "before").unwrap();
+    let mut host=Host { root: root.path().to_string_lossy().into_owned(), ..Default::default() };
     let first=tokio::time::timeout(Duration::from_secs(60),run_turn(options.clone(),json!({"role":"user","content":"Load the Skill and use its tool"}),&mut host)).await.unwrap().unwrap();
     assert_eq!(first.final_text,"NATIVE_LAZY_OK");
     eprintln!("LAZY_BEFORE_RESUME requests={} calls={:?}", requests.lock().unwrap().len(), host.executed);
@@ -153,14 +186,23 @@ async fn real_tui_first_tool_search_and_late_skill_preserve_cache_prefix_on_resu
         std::fs::write(Path::new(&path).join("events.jsonl"), format!("{}\n{}", first.raw_response, second.raw_response)).unwrap();
     }
     eprintln!("LAZY_AFTER_RESUME requests={} calls={:?}", requests.len(), host.executed);
-    assert_eq!(host.executed,vec!["read_skill","skill_action","skill_action"]);
-    assert_eq!(requests.len(),6);
+    assert_eq!(host.executed,vec!["read_skill","skill_action","skill_action","edit"]);
+    assert_eq!(std::fs::read_to_string(root.path().join("native-edit.txt")).unwrap(), "after");
+    assert_eq!(requests.len(),7);
     let prefix=eager(&requests[0]);
     assert!(prefix.iter().any(|tool|tool["name"]=="ToolSearch"),"ToolSearch must be eager before its FIRST use");
+    for name in ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "AskUserQuestion", "mcp__locus__python"] {
+        assert!(requests[0]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == name), "missing {name}");
+    }
     assert!(!requests[0]["tools"].to_string().contains("mcp__locus__skill_action"));
     for (index,request) in requests.iter().enumerate() {
         assert_eq!(eager(request),prefix,"eager prefix changed at step {index}");
         assert_eq!(request["system"],requests[0]["system"],"system prefix changed at step {index}");
+        assert!(request["tools"].as_array().unwrap().iter().all(|tool| {
+            tool["name"].as_str().and_then(|name|name.strip_prefix("mcp__locus__"))
+                .is_none_or(|name|native_tools::native_equivalent_for_locus_tool(name).is_none())
+        }), "covered MCP alias leaked at step {index}");
+        assert_deferred_notices_match_catalog(&request["messages"], &prefix);
         if index>0 {
             let before=requests[index-1]["messages"].as_array().unwrap();
             let current=request["messages"].as_array().unwrap();

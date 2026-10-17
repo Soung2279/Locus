@@ -45,6 +45,36 @@ async function registerTools($, tools, registeredTools, toolPlacements) {
   }
 }
 
+// Correct only NEW attachment rows (see session.append below). Re-rendering
+// old prompt.attachment rows on resume would change an already-cached prefix.
+function correctDeferredToolNotice(text, toolPlacements) {
+  const lines = text.split('\n');
+  const output = [];
+  for (let index = 0; index < lines.length; index++) {
+    const header = lines[index];
+    if (!header.startsWith('The following deferred tools are now available via ToolSearch.')) {
+      output.push(header);
+      continue;
+    }
+    const entries = [];
+    let end = index + 1;
+    while (end < lines.length && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(lines[end])) entries.push(lines[end++]);
+    // Unknown future layouts pass through verbatim rather than losing their
+    // header or accidentally changing removal/server-status sections.
+    if (end < lines.length && lines[end] !== '' && lines[end] !== '</system-reminder>') {
+      output.push(header);
+      continue;
+    }
+    const eager = entries.filter(name => toolPlacements.get(name) === false);
+    if (!eager.length) { output.push(header); continue; }
+    const deferred = entries.filter(name => toolPlacements.get(name) !== false);
+    if (deferred.length) output.push(header, ...deferred);
+    output.push('Already available directly (no ToolSearch needed): ' + eager.join(', ') + '. Prefer an equivalent native CLI tool when available.');
+    index = end - 1;
+  }
+  return output.join('\n');
+}
+
 export function register(on) {
   let tui = false;
   let runId = null;
@@ -222,6 +252,9 @@ export function register(on) {
     const content = e.message.content.map(block => {
       if (block.type !== 'text') return block;
       let text = block.text;
+      if (e.door === 'attachment' && e.message.type === 'attachment' && e.message.name === 'deferred_tools_delta') {
+        text = correctDeferredToolNotice(text, toolPlacements);
+      }
       for (const file of options.attachmentMappings || []) {
         text = text.split(file.path).join(file.label);
         const windowsPath = file.path.replaceAll('/', '\\');

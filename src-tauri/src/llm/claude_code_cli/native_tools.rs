@@ -11,6 +11,24 @@ pub struct NativeCall {
     pub locus_input: Value,
 }
 
+/// Model-facing duplicates of capabilities already provided by the pinned CLI
+/// builtins. Keep this explicit: TaskOutput/TaskStop also dispatch through
+/// `python`, but they do not replace the Python SDK tool itself. Native task
+/// tools own their state and the Mod synchronizes it back to Locus.
+pub(crate) fn native_equivalent_for_locus_tool(name: &str) -> Option<&'static str> {
+    match name {
+        "read" => Some("Read"),
+        "write" => Some("Write"),
+        "edit" => Some("Edit"),
+        "bash" => Some("Bash"),
+        "grep" => Some("Grep"),
+        "list" => Some("Glob"),
+        "ask_user_question" => Some("AskUserQuestion"),
+        "todowrite" => Some("TaskCreate"),
+        _ => None,
+    }
+}
+
 pub fn adapt(id: &str, tool: &str, input: &Value) -> Result<NativeCall, String> {
     if id.is_empty() || !input.is_object() {
         return Err("Native tool call requires an ID and object input".into());
@@ -195,6 +213,7 @@ pub fn finish(call: &NativeCall, output: &str, is_error: bool) -> Value {
     if is_error {
         return deny(output);
     }
+    let mut context = Vec::new();
     let result = match call.tool.as_str() {
         "Bash" => json!({"stdout":output,"stderr":"","interrupted":false,"isImage":false}),
         "Write" => json!({"type":"create","filePath":call.input["file_path"],
@@ -205,27 +224,35 @@ pub fn finish(call: &NativeCall, output: &str, is_error: bool) -> Value {
         "Read" => {
             // Locus text reads frame each physical line as <number>\t<content>.
             // Only strip a sequential prefix, preserving tabs/numbers in content.
-            let Some(body) = output
+            // Skill activation/runtime notes and async notifications follow the
+            // frame. They are model context, not file lines; retain them separately.
+            let Some((body, trailing)) = output
                 .strip_prefix("<content>\n")
-                .and_then(|s| s.strip_suffix("\n</content>"))
+                .and_then(|s| s.split_once("\n</content>"))
             else {
-                return deny("This Read result is not an adapted text file (image/PDF/directory reads are not supported yet)");
+                return deny("Read output is not a supported text frame; use a supported file type or a smaller read range");
+            };
+            if !trailing.trim().is_empty() {
+                context.push(trailing.trim().to_string());
+            }
+            let Some((numbered_lines, summary)) = body.rsplit_once("\n\n") else {
+                return deny("Read output was capped or unrecognized; retry with a smaller limit");
             };
             let start = call
                 .input
                 .get("offset")
                 .and_then(Value::as_u64)
-                .unwrap_or(1);
+                .unwrap_or(1)
+                .max(1);
             let mut lines = Vec::new();
-            for line in body.lines() {
+            for line in numbered_lines.lines() {
                 let prefix = format!("{}\t", start + lines.len() as u64);
                 if let Some(content) = line.strip_prefix(&prefix) {
                     lines.push(content);
                 } else {
-                    break;
+                    return deny("Read output has inconsistent line numbers; retry with a smaller limit");
                 }
             }
-            let summary = body.rsplit_once("\n\n").map(|(_, s)| s).unwrap_or(body);
             let total = summary
                 .strip_prefix("(End of file — ")
                 .and_then(|s| s.strip_suffix(" lines total)"))
@@ -246,9 +273,13 @@ pub fn finish(call: &NativeCall, output: &str, is_error: bool) -> Value {
     };
     let mut answer = json!({"callId":call.id,"result":result});
     // Writes may include Unity/import or knowledge metadata which the native
-    // result schema cannot carry. Read/Bash already carry their whole output.
+    // result schema cannot carry. Read carries only file lines in its result;
+    // its supplemental context must survive outside that schema.
     if matches!(call.tool.as_str(), "Write" | "Edit") {
-        answer["context"] = json!([output]);
+        context.push(output.to_string());
+    }
+    if !context.is_empty() {
+        answer["context"] = json!(context);
     }
     answer
 }
@@ -256,6 +287,16 @@ pub fn finish(call: &NativeCall, output: &str, is_error: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_equivalents_are_declared_builtins_and_do_not_hide_sdk_or_specialized_tools() {
+        for name in ["read", "write", "edit", "bash", "grep", "list", "ask_user_question", "todowrite"] {
+            let native = native_equivalent_for_locus_tool(name).unwrap();
+            assert!(super::super::NATIVE_BUILTIN_TOOLS.split(',').any(|declared| declared == native), "missing builtin for {name}");
+        }
+        for name in ["python", "web_fetch", "unity_execute", "skill_list", "create_skill_package", "subagent", "my_package_edit"] {
+            assert_eq!(native_equivalent_for_locus_tool(name), None, "{name} is not fully covered by a native tool");
+        }
+    }
     #[test]
     fn interrupted_locus_output_never_becomes_a_successful_native_write() {
         let call = adapt("write-cancelled","Write",&json!({"file_path":"a","content":"new content"})).unwrap();
@@ -307,6 +348,85 @@ mod tests {
         assert_eq!(answer["result"]["file"]["content"], "1\tvalue\n");
         assert_eq!(answer["result"]["file"]["totalLines"], 3);
     }
+    #[tokio::test]
+    async fn text_read_preserves_skill_runtime_and_notification_context() {
+        let root = tempfile::tempdir().unwrap();
+        let text = "---\ntools: [bash, read]\n---\n\n# Workflow\n\nLiteral </content>\n1\tkeep this tab\n";
+        std::fs::write(root.path().join("SKILL.md"), text).unwrap();
+        let call = adapt("skill-read", "Read", &json!({"file_path":"SKILL.md"})).unwrap();
+        let registry = crate::tool::ToolRegistry::with_builtins();
+        let mut result: super::super::ClaudeCodeToolResult = registry.execute_with_context(
+            call.locus_name,
+            &call.locus_input,
+            crate::tool::ToolExecutionContext {
+                working_dir: Some(root.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        ).await.into();
+        assert!(!result.is_error, "{}", result.output);
+        let context = "Locus Skill runtime: Unity C# scripts are not ready.\nfixture error\n\nLoaded Skill document tools for the next step: bash, read\n\n<system-reminder>Background task finished.</system-reminder>";
+        result.output.push_str(&format!("\n\n{context}"));
+        let answer = finish_result(&call, &result, None);
+        assert!(answer.get("deny").is_none(), "{answer}");
+        assert_eq!(answer["result"]["file"]["content"], text.trim_end_matches('\n'));
+        assert_eq!(answer["result"]["file"]["numLines"], 8);
+        assert_eq!(answer["result"]["file"]["totalLines"], 8);
+        assert_eq!(answer["context"], json!([context]));
+    }
+
+    #[test]
+    fn text_read_accepts_empty_files_partial_ranges_and_trailing_whitespace() {
+        let empty = adapt("empty", "Read", &json!({"file_path":"empty.txt"})).unwrap();
+        let answer = finish(&empty, "<content>\n\n\n(End of file — 0 lines total)\n</content>\n", false);
+        assert_eq!(answer["result"]["file"]["content"], "");
+        assert_eq!(answer["result"]["file"]["numLines"], 0);
+        assert_eq!(answer["result"]["file"]["totalLines"], 0);
+        assert!(answer.get("context").is_none());
+
+        let partial = adapt("partial", "Read", &json!({"file_path":"SKILL.md","offset":3,"limit":2})).unwrap();
+        let answer = finish(&partial, "<content>\n3\t</content>\n4\t\n\n(Showing lines 3-4 of 9. Use offset=5 to continue.)\n</content>\n\nLoaded Skill document tools for the next step: read", false);
+        assert_eq!(answer["result"]["file"]["content"], "</content>\n");
+        assert_eq!(answer["result"]["file"]["startLine"], 3);
+        assert_eq!(answer["result"]["file"]["numLines"], 2);
+        assert_eq!(answer["result"]["file"]["totalLines"], 9);
+        assert_eq!(answer["context"], json!(["Loaded Skill document tools for the next step: read"]));
+    }
+
+    #[test]
+    fn text_read_rejects_capped_or_malformed_frames_without_silent_data_loss() {
+        let call = adapt("bad-read", "Read", &json!({"file_path":"file.txt"})).unwrap();
+        for output in [
+            "<content>\n1\tline\n\n(Output capped at 50KB. Showing lines 1-1. Use offset=2 to continue.)\n</content>",
+            "<content>\n1\tline\n\n(End of file — 1 lines total)",
+            "<content>\n1\tfirst\n3\tmissing second line\n\n(End of file — 3 lines total)\n</content>\n\nextra context",
+            "<persisted-output>Read the saved full output</persisted-output>",
+        ] {
+            let answer = finish(&call, output, false);
+            assert!(answer["deny"].is_string(), "{answer}");
+            assert!(answer.get("result").is_none(), "{answer}");
+        }
+    }
+
+    #[test]
+    fn native_read_keeps_images_and_execution_errors_out_of_text_parsing() {
+        let call = adapt("image", "Read", &json!({"file_path":"image.png"})).unwrap();
+        let mut result = super::super::ClaudeCodeToolResult {
+            output: "Image file read. Image attached.".into(),
+            is_error: false,
+            images: Some(vec![crate::session::models::ImageData {
+                data: "aQ==".into(), mime_type: "image/png".into(), capture: None,
+            }]),
+        };
+        let answer = finish_result(&call, &result, None);
+        assert_eq!(answer["result"]["type"], "image");
+        assert_eq!(answer["result"]["file"]["originalSize"], 1);
+        result.is_error = true;
+        result.output = "permission denied".into();
+        let answer = finish_result(&call, &result, None);
+        assert_eq!(answer["deny"], "permission denied");
+        assert!(answer.get("result").is_none());
+    }
+
     #[test]
     fn unsupported_semantics_never_reach_the_host() {
         assert!(adapt(

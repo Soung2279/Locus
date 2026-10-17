@@ -43,6 +43,13 @@ impl ToolCatalog {
                 }
                 continue;
             }
+            // Saved duplicates are intentionally retained above: removing an
+            // already-published eager schema would invalidate the prefix.
+            // Never publish a new duplicate, including from a later Skill or
+            // a low-level caller that bypasses Agent request assembly.
+            if self.native_tool_search && super::native_tools::native_equivalent_for_locus_tool(&tool.name).is_some() {
+                continue;
+            }
             let mut tool = tool.clone();
             // This also covers a Skill that introduces a normally-direct tool.
             // Only the very first catalog may choose the eager prefix.
@@ -127,6 +134,34 @@ mod tests {
         assert!(resumed.merge(&[tool("after_resume", false)]).unwrap()[0].defer_loading);
         assert_eq!(resumed.tools[0], eager);
         assert!(ToolCatalog::load(&path, false).is_err());
+    }
+    #[test]
+    fn new_native_catalog_omits_covered_tools_but_keeps_sdk_and_skill_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let mut catalog = ToolCatalog::load(&root.path().join("catalog.json"), true).unwrap();
+        let covered = ["read", "write", "edit", "bash", "grep", "list", "ask_user_question", "todowrite"];
+        let mut incoming: Vec<_> = covered.iter().map(|name| tool(name, false)).collect();
+        incoming.extend([tool("python", false), tool("unity_execute", false), tool("skill_list", true)]);
+        let delta = catalog.merge(&incoming).unwrap();
+        assert_eq!(delta.iter().map(|tool|tool.name.as_str()).collect::<Vec<_>>(), vec!["python", "unity_execute", "skill_list"]);
+        assert!(catalog.merge(&covered.iter().map(|name|tool(name, true)).collect::<Vec<_>>()).unwrap().is_empty());
+    }
+    #[test]
+    fn restored_eager_duplicates_remain_byte_stable_while_new_duplicates_are_omitted() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        // A catalog published before native alias deduplication.
+        let mut prior = ToolCatalog::load(&path, true).unwrap();
+        prior.tools = vec![tool("edit", false), tool("python", false)];
+        prior.initialized = true;
+        prior.save(&path).unwrap();
+        let prefix = serde_json::to_vec(&prior.tools).unwrap();
+        let mut restored = ToolCatalog::load(&path, true).unwrap();
+        let delta = restored.merge(&[tool("python", false), tool("write", false), tool("skill_new", false)]).unwrap();
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].name, "skill_new");
+        assert!(delta[0].defer_loading);
+        assert_eq!(serde_json::to_vec(&restored.tools[..2]).unwrap(), prefix);
     }
     #[test]
     fn existing_conversations_are_not_migrated_on_first_search() {

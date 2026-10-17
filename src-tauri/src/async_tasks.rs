@@ -19,7 +19,9 @@ const MAX_RESULT_CHARS: usize = 12_000;
 const MAX_LIVE_OUTPUT_CHARS: usize = 50_000;
 
 mod communication;
+mod panel;
 mod resume;
+pub(crate) use panel::BackgroundTaskInfo;
 pub(crate) use resume::{SubagentResumeHandler, SubagentResumeInfo};
 
 fn first_attempt() -> u32 {

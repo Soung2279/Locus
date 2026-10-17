@@ -8,6 +8,11 @@ import {
   setAsyncTasksEnabled,
   setUnityMultiAgentEditorEnabled,
 } from "../../services/system";
+import {
+  claudeCodeCliEnabled,
+  loadClaudeCodeCliEnabled,
+  setClaudeCodeCliEnabled,
+} from "../../services/claudeCodeCli";
 import { useNotificationStore } from "../../stores/notification";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import { useDisplaySettings } from "../../composables/useDisplaySettings";
@@ -26,6 +31,11 @@ const unityMultiAgentEditorReady = ref(false);
 const unityMultiAgentEditorBusy = ref(false);
 const unityMultiAgentEditorStatusLabel = computed(() =>
   t(unityMultiAgentEditorEnabled.value ? "common.enabled" : "common.disabled"),
+);
+const claudeCodeCliReady = ref(false);
+const claudeCodeCliBusy = ref(false);
+const claudeCodeCliStatusLabel = computed(() =>
+  t(claudeCodeCliEnabled.value ? "common.enabled" : "common.disabled"),
 );
 
 async function loadAsyncTasksEnabled() {
@@ -96,9 +106,41 @@ async function updateUnityMultiAgentEditorEnabled(value: boolean) {
   }
 }
 
+async function loadClaudeCodeCli() {
+  try {
+    await loadClaudeCodeCliEnabled();
+  } catch (error) {
+    const normalized = normalizeAppError(error);
+    notificationStore.addNotice("error", normalized.message, {
+      code: normalized.code,
+      operation: "loadClaudeCodeCliEnabled",
+    });
+  } finally {
+    claudeCodeCliReady.value = true;
+  }
+}
+
+async function updateClaudeCodeCliEnabled(value: boolean) {
+  if (!claudeCodeCliReady.value || claudeCodeCliBusy.value) return;
+  claudeCodeCliBusy.value = true;
+  try {
+    await setClaudeCodeCliEnabled(value);
+  } catch (error) {
+    const normalized = normalizeAppError(error);
+    notificationStore.addNotice("error", normalized.message, {
+      code: normalized.code,
+      operation: "setClaudeCodeCliEnabled",
+      replaceOperation: true,
+    });
+  } finally {
+    claudeCodeCliBusy.value = false;
+  }
+}
+
 onMounted(() => {
   void loadAsyncTasksEnabled();
   void loadUnityMultiAgentEditorEnabled();
+  void loadClaudeCodeCli();
 });
 </script>
 
@@ -159,6 +201,28 @@ onMounted(() => {
       </div>
     </div>
     <WorktreePoolSettings />
+  </div>
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.experimental.models") }}</div>
+    <div class="experimental-list" :aria-busy="!claudeCodeCliReady">
+      <div class="experimental-row">
+        <div class="experimental-info">
+          <span class="experimental-name">Claude Code CLI</span>
+          <span class="experimental-desc">{{ t("settings.experimental.claudeCodeCliDesc") }}</span>
+        </div>
+        <div class="experimental-control">
+          <span class="experimental-status">{{ claudeCodeCliStatusLabel }}</span>
+          <BaseSwitch
+            v-if="claudeCodeCliReady"
+            :model-value="claudeCodeCliEnabled"
+            :disabled="claudeCodeCliBusy"
+            aria-label="Claude Code CLI"
+            @update:model-value="updateClaudeCodeCliEnabled"
+          />
+          <span v-else class="switch-placeholder" aria-hidden="true" />
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 

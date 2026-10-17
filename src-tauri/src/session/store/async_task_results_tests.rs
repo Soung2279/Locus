@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn interrupted_background_tasks_fail_once_without_replay() {
+    use crate::async_tasks::{AsyncTaskManager,AsyncTaskStatus};
+    let root=tempfile::tempdir().unwrap();let store=Arc::new(SessionStore::new(root.path()).unwrap());
+    let id=store.create_session("restart",None,None,"chat",None).unwrap();
+    let manager=AsyncTaskManager::new(store.clone()).unwrap();
+    for status in [AsyncTaskStatus::Queued,AsyncTaskStatus::Running,AsyncTaskStatus::Cancelling] {
+        let started=manager.create_task(&id,"unity_test_run",true);
+        let mut task=manager.snapshot(&started.task_id).unwrap();
+        task.status=status;store.save_async_task(&task,None).unwrap();
+    }
+    drop(manager);
+    store.recover_async_tasks().unwrap();
+    let tasks=store.list_async_tasks(&id).unwrap();
+    assert_eq!(tasks.len(),3);
+    for task in &tasks {
+        assert_eq!(task.status,AsyncTaskStatus::Failed);
+        assert_eq!(task.is_error,Some(true));
+        assert!(task.output.as_deref().unwrap().contains("Do not retry"));
+    }
+    store.recover_async_tasks().unwrap();
+    assert_eq!(serde_json::to_value(store.list_async_tasks(&id).unwrap()).unwrap(),serde_json::to_value(tasks).unwrap());
+    assert_eq!(store.pending_async_notifications(&id).unwrap().len(),3);
+}
+
+#[test]
 fn async_delivery_failure_retries_without_losing_or_duplicating_results() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(SessionStore::new(dir.path()).unwrap());

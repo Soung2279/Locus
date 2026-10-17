@@ -317,8 +317,8 @@ impl SessionStore {
         Ok(delivered)
     }
 
-    /// Processes cannot survive a Locus restart. Keep their output reference and
-    /// expose the interrupted result on the next user-driven run, without waking it.
+    /// A restart loses the executor receipt, not necessarily the external
+    /// effect. Fail unfinished tasks without replay or an automatic wake-up.
     pub(crate) fn recover_async_tasks(&self) -> Result<(), String> {
         let snapshots = {
             let conn = self.conn.lock().map_err(|e| e.to_string())?;
@@ -338,13 +338,14 @@ impl SessionStore {
             if snapshot.status.is_terminal() {
                 continue;
             }
-            snapshot.status = crate::async_tasks::AsyncTaskStatus::Cancelled;
+            snapshot.status = crate::async_tasks::AsyncTaskStatus::Failed;
+            snapshot.progress = Some("Failed".into());
             snapshot.is_error = Some(true);
             snapshot.finished_at = Some(Self::now_ts() * 1_000);
             snapshot.updated_at = snapshot.finished_at.unwrap();
             snapshot.output = Some(crate::async_tasks::prepare_final_output(
                 &snapshot,
-                "Task interrupted by Locus shutdown. The process was not resumed.",
+                "Task failed because Locus stopped before recording its result. Do not retry or repeat it. External effects may remain or still be running; continue with the user's current request.",
             ));
             let reminder = snapshot
                 .notify

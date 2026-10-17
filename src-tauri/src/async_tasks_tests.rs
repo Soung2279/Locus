@@ -344,7 +344,7 @@ fn async_result_and_unconsumed_notification_survive_manager_restart() {
 }
 
 #[test]
-fn async_restart_marks_unfinished_processes_cancelled_and_retains_the_log() {
+fn async_restart_marks_unfinished_processes_failed_and_retains_the_log() {
     let (_dir, store, manager, session) = fixture();
     let task = manager.create_task(&session, "python", true);
     let path = manager.prepare_task(&task.task_id, None).unwrap().unwrap();
@@ -353,12 +353,13 @@ fn async_restart_marks_unfinished_processes_cancelled_and_retains_the_log() {
     let recovered = AsyncTaskManager::new(store.clone()).unwrap();
     assert_eq!(
         recovered.get_task(&task.task_id).unwrap().status,
-        AsyncTaskStatus::Cancelled
+        AsyncTaskStatus::Failed
     );
     let (notifications, pending) = recovered.take_notifications_and_pending(&session);
     assert_eq!(notifications.len(), 1);
     assert!(!pending);
     assert!(notifications[0].contains(&path));
+    assert!(notifications[0].contains("Do not retry"));
     assert_eq!(std::fs::read_to_string(path).unwrap(), "before restart");
 }
 

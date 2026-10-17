@@ -32,6 +32,11 @@ if ($major -ge 6000) {
 
 $references = @{}
 $referenceFolders = @('NetStandard/ref/2.1.0','NetStandard/compat/2.1.0/shims/netfx','NetStandard/compat/2.1.0/shims/netstandard','NetStandard/EditorExtensions','BCLExtensions/TargetingPacks/netstandard2.1/ref','Managed/UnityEngine')
+if ($major -lt 6000) {
+    # Unity 2022's netstandard facade forwards Registry back to mscorlib; use its
+    # Editor Mono profile consistently instead of mixing that facade with .NET 6 tools.
+    $referenceFolders = @('MonoBleedingEdge/lib/mono/unityjit-win32','MonoBleedingEdge/lib/mono/unityjit-win32/Facades','NetStandard/EditorExtensions','Managed/UnityEngine')
+}
 foreach ($folder in $referenceFolders) {
     $path = Join-Path $data $folder
     if (Test-Path -LiteralPath $path) {

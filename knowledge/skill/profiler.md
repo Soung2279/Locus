@@ -2,7 +2,7 @@
 id: kd_skill_builtin_profiler
 injectMode: excerpt
 summary: >-
-  Profile live Unity Editor / Play Mode CPU, GPU, memory, GC, rendering, physics, audio, animation, UI, loading, 2D and custom metrics. Discover counters, capture samples, compare baselines, inspect hierarchies and save memory snapshots through ctx.Profiler in unity_execute or unity_run_states. Not for static code review.
+  Profile Unity Editor / Play Mode CPU, GPU, memory, GC, rendering and subsystem metrics. Capture bounded samples, compare baselines, analyze worker call paths by Marker ID with reusable buffers, inspect timelines and save memory snapshots through ctx.Profiler. Not for static code review.
 aiMaintained: false
 skillEnabled: true
 skillSurface: both
@@ -23,6 +23,8 @@ Use for slow frames, stutters, allocations, memory growth, rendering load, simul
 3. Allow warmup. Collect 120–600 observations or a bounded time window. Keep baseline/candidate conditions and sampling policies comparable.
 4. Check availability and missing counts before interpreting statistics. Use frame exports for call attribution and snapshots for memory ownership.
 5. Print a short finding with evidence, limitations and saved paths. Save raw samples in CSV and hierarchies in JSON.
+
+Keep sampling and presentation separate. Never read `GetSampleName` for every sample during recording: the strings generate `GC.Alloc` samples in the next frame and can amplify history indefinitely. Match Marker IDs instead. Stop recording before resolving names, building hierarchies, calculating summaries, printing or exporting. Discard measurements already contaminated by a sampler; rerun after warmup for a final baseline.
 
 All helpers are available through **`ctx.Profiler` in both `unity_execute` and `unity_run_states`**. Captures belong to the current call and are cleaned up on success, failure or cancellation. Save before returning. Use `readonly: false` when starting captures or writing artifacts; discovery and reading buffered frames can be read-only. Standalone/remote Player capture is outside this helper's scope.
 
@@ -107,11 +109,14 @@ Defaults sum samples across threads in a frame. `GpuRecorder` requests GPU timin
 | `WarmupFrames` | `0` | Skip initial observed frames/ticks |
 | `SampleEveryFrames` | `1` | Sample latest values every N observed frames/ticks; not an N-frame sum |
 | `MaxSamples` | `3600` | Stop at this row count; range 1–60000 |
+| `MaxSpikes` | `512` | Preallocated spike slots per capture; range 0–60000; overflow returns false and increments `GetProfilerDroppedSpikeCount(name)` |
 | `Clock` | `"auto"` | Distinct `Time.frameCount` in Play Mode, editor ticks in Edit Mode; explicit `"unity_frame"` / `"editor_update"` also supported |
 | `CaptureHierarchy` | `false` | Temporarily enable Profiler recording/CPU data for frame export |
 | `CaptureGpu` | `false` | Also request GPU Profiler data, subject to hardware/API support |
 
 The API observes latest recorder values; it cannot reconstruct frames missed between editor callbacks. Edit Mode ticks can read the same completed value again. Recorder buffers are not reset every tick: Unity `Reset()` stops collection. No completed data is missing, not zero. The row cap still applies if metrics are missing. Non-positive GPU frame timing is treated as unavailable.
+
+Metric rows and spike slots are allocated at startup. The warmed numeric sampling loop and bounded spike updates do not grow storage or allocate managed objects (use already-normalized names/labels). Custom readers must also avoid allocations; after an exception the reader is disabled for that capture and subsequent rows are missing. Initialization, async waits, user code, Unity recording, discovery, summaries and serialization have separate overhead; zero managed allocation in the sampling loop does not imply zero CPU or native overhead.
 
 Methods on `ctx.Profiler`:
 
@@ -125,13 +130,15 @@ Percentiles use nearest rank and exclude missing/non-finite observations. No-dat
 
 ## Spikes and frame hierarchy
 
-Start with `CaptureHierarchy = true`. Between awaits or in state updates:
+Start with `CaptureHierarchy = true`. Record candidates between awaits or in state updates; export only after capture stops:
 
 ```csharp
 var p = ctx.Profiler;
-if (p.RecordProfilerSpikeTop("baseline", "main_thread_ms", 30, "slow", 5)) {
-    int frame = p.GetProfilerLastSpikeFrame("baseline", "main_thread_ms");
-    if (frame >= 0) p.SaveProfilerFrame("slow_" + frame, frame,
+p.RecordProfilerSpikeTop("baseline", "main_thread_ms", 30, "slow", 5);
+// After the bounded sampling window:
+p.StopProfiler("baseline");
+foreach (var spike in p.GetProfilerSpikes("baseline")) {
+    if (spike.ProfilerFrameIndex >= 0) p.SaveProfilerFrame("slow_" + spike.ProfilerFrameIndex, spike.ProfilerFrameIndex,
         new Locus.LocusBridge.ProfilerFrameOptions {
             ThreadName = "Main Thread", SortBy = "self_ms", TopCount = 80
         }, inlineRows: 0);
@@ -142,9 +149,48 @@ Spikes retain observation metadata; repeated checks do not duplicate the observa
 
 `GetProfilerThreads(frame)` lists names/groups/indices/IDs. `GetProfilerFrame(frame, options)` returns CPU rows in memory. Options select `ThreadName` or concrete `ThreadIndex`, `SortBy` (`total_ms`, `self_ms`, `gc_bytes`, `calls`), `NameContains` (path substring), and `TopCount` (0–512). Missing threads produce errors, not another thread's rows. Frame metadata includes GPU duration when available; row durations remain **CPU** durations.
 
+These allocating frame APIs require `ProfilerDriver.enabled == false`. `GetProfilerFrame` reports an error during recording; `GetProfilerThreads` throws. `StopProfiler` releases this call's recording lease and preserves an already-running user recording or another overlapping capture. If recording remains active, finish those captures or stop the Profiler explicitly before analysis. Without a path filter, hierarchy exports read names/paths only for Top-N winners.
+
 Legacy exports remain supported: `ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount)` and `ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount, inlineRows)`. Overloads without the index use the latest buffered frame.
 
 Unity frames, tool ticks and Profiler indices are different clocks. A sampled row records the latest available Profiler frame as a **candidate**, not guaranteed exact attribution; GPU data can arrive later. Inspect adjacent frames and verify the marker before attributing a spike. Buffers roll over: save promptly. Use the local Editor target; switching targets invalidates frame association. Do not sum hierarchy total-time rows because parent values include children.
+
+## Workers, call paths and reusable numeric buffers
+
+Use a short capture that fits Unity's history. After stopping, analyze all recorded threads in one pass:
+
+```csharp
+var p = ctx.Profiler;
+var buffer = new Locus.LocusBridge.ProfilerFrameBuffer(
+    maxThreads: 256, maxRows: 32768, maxDepth: 256,
+    maxSamples: 1000000, timelineCapacity: 0);
+p.StartProfiler("workers", p.ProfilerMetrics("cpu", "memory"),
+    new Locus.LocusBridge.ProfilerCaptureOptions {
+        CaptureHierarchy = true, WarmupFrames = 10, MaxSamples = 30
+    });
+await ctx.WaitUntil(() => p.IsProfilerStopped("workers"));
+int frame = p.LatestProfilerFrameIndex();
+var status = p.ReadProfilerFrameInto(frame, buffer); // all threads; exact selection: threadIndex: N
+if (status != Locus.LocusBridge.ProfilerScanStatus.Complete)
+    throw new System.InvalidOperationException(status.ToString());
+status = p.ResolveProfilerFrameNames(buffer); // optional; once per distinct Marker ID
+if (status != Locus.LocusBridge.ProfilerScanStatus.Complete)
+    throw new System.InvalidOperationException(status.ToString());
+p.SaveProfilerFrameAnalysis("workers", buffer);
+p.SaveProfiler("workers");
+```
+
+`ReadProfilerFrameInto` reuses the buffer and resets it for each frame. It refuses live recording (`Recording`) because Unity allocates a `RawFrameDataView` wrapper per thread. For an already-open view, `AnalyzeProfilerThreadInto(rawView, buffer)` scans one thread with no managed allocation after initialization; the caller owns/disposes the view. It also resets the buffer. Do not print, resolve strings or open a new view per sample in that loop. Prefer stopped-frame analysis for minimal measurement interference.
+
+Only entries below `ThreadCount`, `RowCount` and `SampleCount` are valid. Use indexed loops over these counts; do not serialize the entire backing arrays. `SaveProfilerFrameAnalysis` streams only populated entries to `locus.profiler.raw_frame.v1` JSON and prints `profiler_analysis_file`.
+
+- `Threads`: native thread `Id`, per-frame `Index`, `FrameStartTimeNs`, `FrameMs`, root-sample `SampledMs`, sample counts, `GcBytes`, `MissingGcMetadata`, and the contiguous `FirstRow`/`RowCount` range. Names/groups are filled only by `ResolveProfilerFrameNames`.
+- `Rows`: `(ThreadIndex, ParentRow, MarkerId)` identifies a call path. Includes category, native flags, depth, calls, inclusive `TotalMs`, exclusive `SelfMs`, inclusive `GcBytes` and direct `SelfGcBytes`. Repeated child calls under the same parent path aggregate; the same marker under a different parent or worker stays separate. GC bytes come from `GC.Alloc` metadata, not its duration. Inclusive bytes propagate to ancestors; add direct bytes only when summing rows.
+- Optional `Samples`: set `timelineCapacity > 0` to retain chronological raw sample order, raw `SampleIndex`, parent **buffer** index `ParentSample` (-1 for roots), `MarkerRow`, frame-relative `StartMs`, total/self duration and direct GC bytes. Pair `StartMs` with the thread's `FrameStartTimeNs` to align workers. `TimelineTruncated` means aggregates are complete but the requested detail buffer filled.
+
+`Status` explicitly reports unavailable frame/thread, row/thread/depth capacity or scan-work limits. Non-`Complete` aggregates are partial; increase capacity **before the next recording**, or select a narrower thread. The numeric scan has no dynamic growth, per-sample strings, path construction, sorting, reflection or logging. Marker IDs and row indices must not be reused blindly across captures; reset each frame and resolve names from its same buffered frame/target before eviction.
+
+Thread totals include waits and idle scopes; they are not CPU utilization percentages. Inspect named self-time rows and timeline overlap to distinguish worker work, waiting and imbalance. Do not add overlapping worker totals to frame wall time. The API does not infer job dependency graphs or GPU work from CPU markers.
 
 ## GPU timing and memory snapshots
 

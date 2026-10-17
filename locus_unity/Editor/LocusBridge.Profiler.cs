@@ -272,8 +272,8 @@ namespace Locus
                 if (_lifetime.IsCancellationRequested) { Dispose(); return; }
                 int profilerFrameIndex = CurrentProfilerFrameIndex();
                 long elapsedMs = _stopwatch.ElapsedMilliseconds;
-                foreach (RuntimeProfilerSession profiler in _profilers.Values)
-                    profiler.Sample(TotalFrames, Time.frameCount, profilerFrameIndex, elapsedMs);
+                foreach (var profiler in _profilers)
+                    profiler.Value.Sample(TotalFrames, Time.frameCount, profilerFrameIndex, elapsedMs);
             }
 
             private RuntimeProfilerSession RequireProfiler(string name)

@@ -118,6 +118,7 @@ namespace Locus
 
             public ProfilerThreadInfo[] GetProfilerThreads(int profilerFrameIndex)
             {
+                RequireProfilerAnalysisStopped();
                 var result = new List<ProfilerThreadInfo>();
                 for (int i = 0; ; i++)
                 {

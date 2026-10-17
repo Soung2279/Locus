@@ -13,7 +13,8 @@ describe('shared Unity profiler API', () => {
     expect(skill).toContain('ctx.Profiler');
     expect(JSON.parse(read('tools/unity_execute.json')).description).toContain('ctx.Profiler');
     expect(JSON.parse(read('tools/unity_run_states.json')).description).toContain('ctx.Profiler');
-    for (const method of ['DiscoverMetrics', 'ProfilerMetrics', 'GetProfilerSamples', 'CompareProfilers', 'GetProfilerBudget', 'SaveMemorySnapshotAsync']) {
+    for (const method of ['DiscoverMetrics', 'ProfilerMetrics', 'GetProfilerSamples', 'CompareProfilers', 'GetProfilerBudget', 'SaveMemorySnapshotAsync',
+      'ReadProfilerFrameInto', 'AnalyzeProfilerThreadInto', 'ResolveProfilerFrameNames', 'SaveProfilerFrameAnalysis', 'GetProfilerDroppedSpikeCount']) {
       expect(skill).toContain(method);
     }
   });

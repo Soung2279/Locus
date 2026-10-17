@@ -15,6 +15,7 @@ namespace Locus
             public int WarmupFrames = 0;
             public int SampleEveryFrames = 1;
             public int MaxSamples = 3600;
+            public int MaxSpikes = 512;
             // Auto uses distinct Time.frameCount in Play Mode, editor ticks in Edit Mode.
             public string Clock = "auto";
             public bool CaptureHierarchy = false;
@@ -25,6 +26,7 @@ namespace Locus
                 if (WarmupFrames < 0 || WarmupFrames > 60000) throw new ArgumentOutOfRangeException(nameof(WarmupFrames));
                 if (SampleEveryFrames < 1 || SampleEveryFrames > 60000) throw new ArgumentOutOfRangeException(nameof(SampleEveryFrames));
                 if (MaxSamples < 1 || MaxSamples > 60000) throw new ArgumentOutOfRangeException(nameof(MaxSamples));
+                if (MaxSpikes < 0 || MaxSpikes > 60000) throw new ArgumentOutOfRangeException(nameof(MaxSpikes));
                 if (Clock != "auto" && Clock != "unity_frame" && Clock != "editor_update")
                     throw new ArgumentException("Clock must be auto, unity_frame, or editor_update.");
                 return (ProfilerCaptureOptions)MemberwiseClone();

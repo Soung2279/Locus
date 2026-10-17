@@ -8,20 +8,21 @@ namespace Locus
         public sealed partial class ProfilerApi
         {
             public bool IsProfilerStopped(string name) { return RequireProfiler(name).IsStopped; }
+            public int GetProfilerDroppedSpikeCount(string name) { return RequireProfiler(name).DroppedSpikes; }
 
             public ProfilerObservation[] GetProfilerSamples(string name, string metricName, int offset = 0, int count = 600)
             {
                 if (offset < 0 || count < 0 || count > 60000) throw new ArgumentOutOfRangeException("offset/count");
-                var points = RequireProfiler(name).FindSample(metricName).Points();
-                var result = new List<ProfilerObservation>();
-                for (int i = offset; i < points.Length && result.Count < count; i++)
+                var sample = RequireProfiler(name).FindSample(metricName);
+                var result = new ProfilerObservation[Math.Min(count, Math.Max(0, sample.PointCount - offset))];
+                for (int i = 0; i < result.Length; i++)
                 {
-                    var p = points[i];
-                    result.Add(new ProfilerObservation { SessionFrame = p.SessionFrame, UnityTimeFrameCount = p.UnityTimeFrameCount,
+                    var p = sample.PointAt(offset + i);
+                    result[i] = new ProfilerObservation { SessionFrame = p.SessionFrame, UnityTimeFrameCount = p.UnityTimeFrameCount,
                         ProfilerFrameIndex = p.ProfilerFrameIndex, ElapsedMs = p.ElapsedMs,
-                        Value = double.IsNaN(p.Value) || double.IsInfinity(p.Value) ? (double?)null : p.Value });
+                        Value = double.IsNaN(p.Value) || double.IsInfinity(p.Value) ? (double?)null : p.Value };
                 }
-                return result.ToArray();
+                return result;
             }
 
             public ProfilerBudget GetProfilerBudget(string name, string metricName, double threshold)
@@ -29,8 +30,9 @@ namespace Locus
                 if (double.IsNaN(threshold) || double.IsInfinity(threshold)) throw new ArgumentOutOfRangeException(nameof(threshold));
                 var sample = RequireProfiler(name).FindSample(metricName);
                 var result = new ProfilerBudget { Metric = metricName, Unit = sample.Metric.Unit, Threshold = threshold };
-                foreach (var point in sample.Points())
+                for (int i = 0; i < sample.PointCount; i++)
                 {
+                    var point = sample.PointAt(i);
                     if (double.IsNaN(point.Value) || double.IsInfinity(point.Value)) continue;
                     result.SampleCount++;
                     if (point.Value > threshold) result.ExceededCount++;

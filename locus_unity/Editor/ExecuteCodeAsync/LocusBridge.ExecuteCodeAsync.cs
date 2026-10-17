@@ -1505,6 +1505,7 @@ namespace Locus
             ExecuteCodeRequestState requestState)
         {
             BeginAsyncExecuteRuntime();
+            NativeReportExecution(true);
 
             ExecuteCodeContext ctx = null;
             ScriptGlobals globals = null;
@@ -1546,17 +1547,25 @@ namespace Locus
             }
             finally
             {
-                if (ctx != null)
+                try
                 {
-                    ctx.DisposeProfiler();
-                    ctx.ClearProgress();
+                    if (ctx != null)
+                    {
+                        ctx.DisposeProfiler();
+                        ctx.ClearProgress();
+                    }
+                    if (requestState != null)
+                        requestState.ClearExecution(execution);
                 }
-
-                if (requestState != null)
-                    requestState.ClearExecution(execution);
-
-                execution.Dispose();
-                EndAsyncExecuteRuntime();
+                finally
+                {
+                    try { execution.Dispose(); }
+                    finally
+                    {
+                        NativeReportExecution(false);
+                        EndAsyncExecuteRuntime();
+                    }
+                }
             }
         }
 

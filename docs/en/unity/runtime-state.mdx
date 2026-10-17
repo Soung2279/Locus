@@ -15,6 +15,18 @@ The probe degrades in tiers: when deeper information is out of reach, it falls b
 
 The switch is `Out-of-process state probe`. In the same area, `Live connection test` connects to the running editor, walks through domain reload, play, pause, resume, and exit-play in turn, and verifies the probe observes each state change.
 
+### Hang diagnosis
+
+When the editor's main thread has not returned to the editor loop for 30 seconds, the state turns `Unresponsive` and Locus automatically works out where the main thread is stuck. The native bridge takes a few very short samples of the main thread from inside the Unity process, walks its call stack all the way into managed (C#) code, and reports method names with source lines; Unity's own native frames are resolved with the symbol files that ship with the editor. The result appears in the Unity details on the status panel:
+
+- `Hang diagnosis`: whether the main thread is busy running code (high CPU, usually an endless loop or a very long operation) or blocked waiting (a blocking call, another thread, or a deadlock), and whether the code belongs to the project, to code the Agent executed, or to the Unity editor.
+- `Stuck at`: the most likely culprit, preferring a frame in project code or Agent-executed code.
+- The full main-thread stack, the capture source, and notes sit under `Diagnostics`.
+
+The Agent gets the same diagnosis: Unity tool errors returned during the hang include it, and if Agent calls are still waiting on Unity when you click `Restart Unity`, they end immediately and tell the Agent that you restarted Unity and where it was stuck, instead of hanging or attaching to the restarted editor.
+
+With an older plugin, the diagnosis falls back to scanning the stack from outside the process and shows native frames only; update the Locus Unity plugin to see C# frames.
+
 ## Native bridge
 
 The native bridge is a native-layer implementation of the command channel between Locus and Unity. Its most important value is keeping the connection alive through domain reloads: commands continue after the reload finishes, with no fresh handshake.

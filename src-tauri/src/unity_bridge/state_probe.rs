@@ -6,8 +6,12 @@
 //! state from OUTSIDE the process, with no cooperation from the C# layer, so
 //! it keeps reporting through reloads and hangs.
 //!
-//! Signal, in order of richness (each independently fallible → graceful
-//! fallback; the fused semantic state records which tier answered):
+//! Normal monitoring reads the broker's heartbeat from shared memory once per
+//! second. A live pipe or advancing CPU is not proof of main-thread progress.
+//! After a sustained missing heartbeat, at most three passive CPU samples help
+//! describe the failure. The automatic observer never suspends the Editor.
+//!
+//! Explicit diagnostics/self-tests can additionally use these tiers:
 //!
 //!   T1  main-thread stack classification — suspend the editor main thread for
 //!       ~one bulk stack read, scan the live frames for a return address inside
@@ -18,7 +22,7 @@
 //!       over a cached address table) plus Win32 thread/RPM calls — no dbghelp.
 //!   T2  CPU/liveness — main-thread CPU delta (`GetThreadTimes`) + whether the
 //!       instruction pointer sits inside the Unity module. Separates "busy /
-//!       progressing" from "wedged" when T1 says "not reloading".
+//!       executing" from "waiting"; neither proves forward progress.
 //!   T3  process liveness only — alive / gone (handled by the caller via the
 //!       existing `process` probe).
 //!
@@ -144,6 +148,10 @@ pub struct ObservedMainThreadState {
     pub stack_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspend_window_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_executions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,9 +283,21 @@ pub struct SemanticState {
     pub safety: ObservedSafetyState,
     pub state_plane: ObservedStatePlane,
     pub editor_log: super::ObservedEditorLogState,
+    /// Where the main thread is stuck — present while `phase` is
+    /// `unresponsive` (status `running` until the capture completes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hang_diagnosis: Option<super::hang_diagnosis::UnityHangDiagnosis>,
 }
 
 impl SemanticState {
+    pub(crate) fn can_restart_process(&self, pid: u32, created_at_ms: u64) -> bool {
+        self.phase == "unresponsive"
+            && self.safety.recommended_action == "diagnose_hang"
+            && self.process.state == "running"
+            && self.process.pid == Some(pid)
+            && self.process.pid_created_at_ms == Some(created_at_ms)
+    }
+
     fn new(
         phase: SemanticPhase,
         source: &str,
@@ -326,6 +346,8 @@ impl SemanticState {
                 quiescent_for_ms: 0,
                 stack_class: None,
                 suspend_window_us: None,
+                heartbeat_age_ms: None,
+                active_executions: None,
             },
             safety: ObservedSafetyState {
                 can_call_unity_api: false,
@@ -341,6 +363,7 @@ impl SemanticState {
                 last_observed_at_ms: None,
             },
             editor_log: super::ObservedEditorLogState::default(),
+            hang_diagnosis: None,
         }
     }
 }
@@ -434,11 +457,13 @@ const LAST_KNOWN_EDITOR_MODE_MEDIUM_CONFIDENCE_MS: u64 = 60_000;
 const PENDING_EDITOR_INTENT_MAX_STALE_MS: u64 = 60_000;
 const NATIVE_BROKER_STATE_PROBE_CONSUMER: &str = "unity_state_probe";
 const OBSERVER_HISTORY_LIMIT: usize = 120;
-const OBSERVER_NORMAL_INTERVAL_MS: u64 = 500;
-const OBSERVER_FAST_INTERVAL_MS: u64 = 150;
+const OBSERVER_NORMAL_INTERVAL_MS: u64 = 1_000;
+const OBSERVER_FAST_INTERVAL_MS: u64 = 1_000;
+const MAIN_THREAD_DELAYED_MS: u64 = 10_000;
+const MAIN_THREAD_UNRESPONSIVE_MS: u64 = 30_000;
+const BROKER_SNAPSHOT_MAX_AGE_MS: u64 = 5_000;
 const PROCESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_000);
 const PASSIVE_SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
-const STACK_SAMPLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_000);
 
 // ── Status surface (settings card) ───────────────────────────────────
 
@@ -1107,7 +1132,42 @@ async fn native_hook_observation_for_process(
     }
 }
 
+fn broker_heartbeat_age(status: &super::NativeBrokerStatus, now_ms: u64) -> Option<u64> {
+    let observed = u64::try_from(status.observed_at_ms).ok().filter(|value| *value > 0)?;
+    if observed > now_ms.saturating_add(1_000)
+        || now_ms.saturating_sub(observed) > BROKER_SNAPSHOT_MAX_AGE_MS {
+        return None;
+    }
+    if status.broker_capabilities.iter().any(|cap| cap == "broker_main_thread_liveness_v1") {
+        // Age was measured by the broker's monotonic clock. Do not turn a
+        // cached snapshot's delivery time into a new main-thread heartbeat.
+        return status.main_thread_heartbeat_age_ms;
+    }
+    let heartbeat = u64::try_from(status.last_managed_heartbeat_ms).ok().filter(|value| *value > 0)?;
+    (heartbeat <= now_ms).then(|| now_ms.saturating_sub(heartbeat))
+}
+
+fn input_heartbeat_age(inputs: &FusionInputs) -> Option<u64> {
+    inputs.native_broker_status.as_ref().and_then(|status| broker_heartbeat_age(status, unix_now_ms()))
+}
+
+fn main_thread_unresponsive(inputs: &FusionInputs) -> bool {
+    inputs.native_broker_status.as_ref().is_some_and(|status| status.managed_state == "ready")
+        && input_heartbeat_age(inputs).is_some_and(|age| age >= MAIN_THREAD_UNRESPONSIVE_MS)
+}
+
 fn select_editor_mode(inputs: &FusionInputs, now_ms: u64) -> ObservedEditorMode {
+    if let Some(status) = inputs.native_broker_status.as_ref().filter(|status| status.managed_state == "ready") {
+        let age = broker_heartbeat_age(status, now_ms);
+        let fresh = age.is_some_and(|age| age < MAIN_THREAD_DELAYED_MS);
+        return ObservedEditorMode {
+            value: editor_mode_from_status(&status.editor_status).to_string(),
+            source: if fresh { "native_broker" } else { "last_known" }.to_string(),
+            confidence: if fresh { "high" } else { "low" }.to_string(),
+            stale_ms: age,
+            detail: (!fresh).then(|| "Last reported editor mode; the main thread has not confirmed availability".to_string()),
+        };
+    }
     if inputs.pipe_connected {
         return ObservedEditorMode {
             value: editor_mode_from_status(&inputs.pipe_status).to_string(),
@@ -1318,6 +1378,23 @@ fn main_thread_state_for_inputs(
     inputs: &FusionInputs,
     editor_mode: &ObservedEditorMode,
 ) -> ObservedMainThreadState {
+    if let Some(broker) = &inputs.native_broker_status {
+        let age = input_heartbeat_age(inputs);
+        let cpu = inputs.native.as_ref().map(|sample| sample.cpu_active);
+        let state = if main_thread_unresponsive(inputs) {
+            match cpu { Some(true) => "unresponsive_busy", Some(false) => "unresponsive_waiting", None => "unresponsive" }
+        } else if age.is_some_and(|age| age >= MAIN_THREAD_DELAYED_MS) {
+            "stalled"
+        } else if age.is_some() && broker.managed_state == "ready" {
+            "responsive"
+        } else { "unknown" };
+        return ObservedMainThreadState {
+            state: state.to_string(), cpu_active: cpu.unwrap_or(false),
+            quiescent_for_ms: inputs.native.as_ref().map(|sample| sample.quiescent_for_ms).unwrap_or(0),
+            stack_class: None, suspend_window_us: None,
+            heartbeat_age_ms: age, active_executions: Some(broker.active_executions),
+        };
+    }
     let Some(native) = &inputs.native else {
         return ObservedMainThreadState {
             state: "unknown".to_string(),
@@ -1325,6 +1402,8 @@ fn main_thread_state_for_inputs(
             quiescent_for_ms: 0,
             stack_class: None,
             suspend_window_us: None,
+            heartbeat_age_ms: None,
+            active_executions: None,
         };
     };
 
@@ -1354,6 +1433,8 @@ fn main_thread_state_for_inputs(
         } else {
             None
         },
+        heartbeat_age_ms: None,
+        active_executions: None,
     }
 }
 
@@ -1365,14 +1446,20 @@ fn safety_for_state(
 ) -> ObservedSafetyState {
     let process_running = inputs.process_state == super::UnityEditorProcessState::Running;
     let domain_ready = domain.phase == "none";
-    let main_thread_usable = !matches!(main_thread.state.as_str(), "hung" | "stalled");
+    let main_thread_usable = if inputs.native_broker_status.is_some() {
+        main_thread.state == "responsive"
+    } else {
+        !matches!(main_thread.state.as_str(), "hung" | "stalled")
+    };
     let can_call_unity_api =
         process_running && inputs.pipe_connected && domain_ready && main_thread_usable;
     let can_modify_assets_safely = can_call_unity_api && editor_mode.value == "editing";
     let recommended_action = if domain.phase == "reloading" {
         "wait_reload"
-    } else if main_thread.state == "hung" {
+    } else if main_thread.state == "hung" || main_thread.state.starts_with("unresponsive") {
         "diagnose_hang"
+    } else if !main_thread_usable {
+        "avoid_unity_api"
     } else if !inputs.pipe_connected && process_running {
         "avoid_unity_api"
     } else if !inputs.pipe_connected {
@@ -1477,6 +1564,14 @@ fn fuse(inputs: &FusionInputs) -> SemanticState {
             SemanticState::new(phase, "process", "high", None, None),
             inputs,
             now_ms,
+        );
+    }
+
+    if main_thread_unresponsive(inputs) {
+        return decorate_state(
+            SemanticState::new(SemanticPhase::Unresponsive, "native_broker", "high", None,
+                Some(format!("Unity main thread has not returned to the editor loop for {}s", input_heartbeat_age(inputs).unwrap_or(0) / 1_000))),
+            inputs, now_ms,
         );
     }
 
@@ -1780,6 +1875,84 @@ async fn native_sample_with_timeout(
     }
 }
 
+/// Main-thread stack candidates read from outside the Editor process.
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalStackScan {
+    /// Per sample: the instruction pointer, then call-site-validated return
+    /// addresses in stack order. Heuristic: may contain stale frames.
+    pub samples: Vec<Vec<u64>>,
+    pub cpu_start_100ns: Option<u64>,
+    pub cpu_end_100ns: Option<u64>,
+    pub wall_ms: u64,
+}
+
+/// Hang-diagnosis fallback: scan the main thread's stack from outside the
+/// process. Blocking; call from a blocking task.
+pub(crate) fn scan_main_thread_stack(
+    pid: u32,
+    thread_hint: Option<u32>,
+) -> Result<ExternalStackScan, String> {
+    imp::scan_main_thread(pid, thread_hint, 3, std::time::Duration::from_millis(250), 48)
+}
+
+/// `bytes` are the 8 bytes preceding a candidate return address. True when
+/// they end with a `call rel32` or an `FF /2` indirect call whose encoded
+/// length lands exactly on the candidate.
+fn looks_like_call_site(bytes: &[u8; 8]) -> bool {
+    if bytes[3] == 0xE8 {
+        return true;
+    }
+    for length in 2..=7usize {
+        let start = 8 - length;
+        if bytes[start] != 0xFF {
+            continue;
+        }
+        let modrm = bytes[start + 1];
+        if (modrm >> 3) & 7 != 2 {
+            continue;
+        }
+        let rm = modrm & 7;
+        let sib = bytes.get(start + 2).copied();
+        let operand = match modrm >> 6 {
+            3 => Some(1),
+            0 if rm == 5 => Some(5),
+            0 if rm == 4 => sib.map(|sib| if sib & 7 == 5 { 6 } else { 2 }),
+            0 => Some(1),
+            1 => Some(if rm == 4 { 3 } else { 2 }),
+            _ => Some(if rm == 4 { 6 } else { 5 }),
+        };
+        if operand.is_some_and(|operand| 1 + operand == length) {
+            return true;
+        }
+    }
+    false
+}
+
+struct PassiveIncident {
+    pid: u32,
+    created: Option<u64>,
+    samples: u8,
+}
+
+/// At most three passive CPU samples per stalled interval. Healthy Editors
+/// need no thread inspection; automatic observers never suspend a thread.
+fn should_sample_stalled_thread(project: &str, pid: u32, created: Option<u64>, age: Option<u64>) -> bool {
+    static INCIDENTS: OnceLock<Mutex<HashMap<String, PassiveIncident>>> = OnceLock::new();
+    let Ok(mut incidents) = INCIDENTS.get_or_init(|| Mutex::new(HashMap::new())).lock() else { return false; };
+    let key = project_key(project);
+    if !age.is_some_and(|age| age >= MAIN_THREAD_UNRESPONSIVE_MS) {
+        incidents.remove(&key);
+        return false;
+    }
+    let incident = incidents.entry(key).or_insert(PassiveIncident { pid, created, samples: 0 });
+    if incident.pid != pid || incident.created != created {
+        *incident = PassiveIncident { pid, created, samples: 0 };
+    }
+    if incident.samples >= 3 { return false; }
+    incident.samples += 1;
+    true
+}
+
 /// Gather the cheap signals for a project and fuse them into one semantic
 /// state. This is the observer actor's single-sample path; public callers go
 /// through `semantic_state_for_project` so they can use the observer cache.
@@ -1806,16 +1979,19 @@ async fn observe_project_once_with_native_broker_status(
         );
     }
 
-    // Pipe status (SHORT timeout, so a wedged editor or half-open pipe cannot
-    // stall us for the default 35s) and the process probe run CONCURRENTLY.
-    // Native sampling below is gated only on the (fast) process probe — never
-    // on the pipe — so the native signal is available even while the pipe is
-    // silent.
+    // Native shared memory is the normal observation path. It never queues
+    // work on the Editor; only legacy/unavailable brokers need a pipe probe.
+    let mut native_broker_status = match native_broker_status_override {
+        Some(status) => Some(status),
+        None => super::query_native_broker_observation(project_path, NATIVE_BROKER_STATE_PROBE_CONSUMER)
+            .await.map(native_broker_status_for_semantic),
+    };
     let (pipe_probe, process) = tokio::join!(
-        super::try_query_unity_status_response_with_timeout(
-            project_path,
-            std::time::Duration::from_millis(800)
-        ),
+        async {
+            if native_broker_status.is_some() { Ok(None) } else {
+                super::try_query_unity_status_response_with_timeout(project_path, std::time::Duration::from_millis(800)).await
+            }
+        },
         query_process_bounded(project_path),
     );
 
@@ -1874,18 +2050,21 @@ async fn observe_project_once_with_native_broker_status(
         }
     }
 
-    let native_broker_status = match native_broker_status_override {
-        Some(status) => Some(status),
-        None => {
-            super::query_native_broker_observation(project_path, NATIVE_BROKER_STATE_PROBE_CONSUMER)
-                .await
-                .map(native_broker_status_for_semantic)
-        }
-    };
+    if native_broker_status.as_ref().is_some_and(|status|
+        status.process_id.is_some() && status.process_id != process_id) {
+        native_broker_status = None;
+        pipe_connected = false;
+        control_channel_state = "disconnected".to_string();
+    }
     if let Some(status) = &native_broker_status {
         match status.managed_state.as_str() {
             "ready" => {
-                if !status.editor_status.trim().is_empty() {
+                pipe_connected = status.native_alive;
+                control_channel_state = "ready".to_string();
+                pipe_status = super::normalize_editor_status(&status.editor_status).to_string();
+                pipe_error = None;
+                if broker_heartbeat_age(status, unix_now_ms()).is_some_and(|age| age < MAIN_THREAD_DELAYED_MS)
+                    && !status.editor_status.trim().is_empty() {
                     note_pipe_editor_status(
                         project_path,
                         super::normalize_editor_status(&status.editor_status),
@@ -1933,37 +2112,12 @@ async fn observe_project_once_with_native_broker_status(
         .map(|created| unix_now_ms().saturating_sub(created) < 30_000)
         .unwrap_or(false);
 
-    let native = if enabled() {
-        if let Some(pid) = process_id {
-            // Passive first — never suspends the main thread.
-            let hint = module_hint.clone();
-            let passive =
-                native_sample_with_timeout(project_path, pid, hint, false, PASSIVE_SAMPLE_TIMEOUT)
-                    .await;
-
-            // On-demand escalation: only suspend for a stack read when a domain
-            // reload is actually likely — the pipe is down while the editor is
-            // alive and its main thread is busy, or we initiated a recompile.
-            // Idle / edit / play (the pipe answers) NEVER escalates → no
-            // suspension in the common case.
-            let reload_likely = !pipe_connected
-                && (recompile_inflight
-                    || (process_alive && passive.as_ref().map(|s| s.cpu_active).unwrap_or(false)));
-
-            if reload_likely {
-                let hint = module_hint.clone();
-                native_sample_with_timeout(project_path, pid, hint, true, STACK_SAMPLE_TIMEOUT)
-                    .await
-                    .or(passive)
-            } else {
-                passive
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let heartbeat_age = native_broker_status.as_ref().and_then(|status| broker_heartbeat_age(status, unix_now_ms()));
+    let native = if let Some(pid) = process_id.filter(|_| enabled()) {
+        if should_sample_stalled_thread(project_path, pid, process_created_at_ms, heartbeat_age) {
+            native_sample_with_timeout(project_path, pid, module_hint.clone(), false, PASSIVE_SAMPLE_TIMEOUT).await
+        } else { None }
+    } else { None };
     let native_hook = native_hook_observation_for_process(
         project_path,
         process_id,
@@ -2040,6 +2194,11 @@ async fn observe_project_once_with_native_broker_status(
         state.safety.can_modify_assets_safely = false;
         state.safety.recommended_action = "fix_compile_errors".to_string();
     }
+    super::hang_diagnosis::note_semantic_state(
+        project_path,
+        &mut state,
+        inputs.native_broker_status.as_ref(),
+    );
     note_fused(project_path, &state, process_id);
     state
 }
@@ -2377,7 +2536,27 @@ mod imp {
             size: usize,
             read: *mut usize,
         ) -> Bool;
+        fn VirtualQueryEx(
+            h: Handle,
+            address: *const c_void,
+            buffer: *mut MemoryBasicInformation,
+            length: usize,
+        ) -> usize;
     }
+
+    #[repr(C)]
+    struct MemoryBasicInformation {
+        base_address: *mut c_void,
+        allocation_base: *mut c_void,
+        allocation_protect: u32,
+        partition_id: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
+
+    const _: () = assert!(size_of::<MemoryBasicInformation>() == 48);
 
     #[link(name = "dbghelp")]
     unsafe extern "system" {
@@ -2469,10 +2648,10 @@ mod imp {
         C.get_or_init(|| Mutex::new(Cache::default()))
     }
 
-    /// dbghelp is not thread-safe; serialize the (rare, init-only) symbol work.
+    /// dbghelp is not thread-safe; serialize the (rare, init-only) symbol work
+    /// with every other dbghelp user in the process.
     fn dbghelp_lock() -> &'static Mutex<()> {
-        static L: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
+        crate::unity_bridge::hang_diagnosis::dbghelp_lock()
     }
 
     pub(super) fn clear_cache() {
@@ -2752,6 +2931,121 @@ mod imp {
         }
     }
 
+    /// Out-of-process fallback for hang diagnosis when the in-process broker
+    /// cannot walk the stack (older plugin, broker unreachable). Each sample
+    /// freezes the main thread for one context read plus one stack read; the
+    /// candidate return addresses are then filtered after resuming: they must
+    /// point into a loaded module and directly follow a `call` instruction.
+    pub(super) fn scan_main_thread(
+        pid: u32,
+        thread_hint: Option<u32>,
+        samples: u32,
+        interval: std::time::Duration,
+        max_frames: usize,
+    ) -> Result<super::ExternalStackScan, String> {
+        let tid = match thread_hint {
+            Some(tid) if tid != 0 => tid,
+            _ => find_main_thread(pid)?,
+        };
+        let thread = OwnedHandle::new(unsafe {
+            OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                FALSE,
+                tid,
+            )
+        })
+        .ok_or_else(|| format!("OpenThread {tid} failed: {}", last_error()))?;
+        let process = OwnedHandle::new(unsafe {
+            OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid)
+        })
+        .ok_or_else(|| format!("OpenProcess {pid} failed: {}", last_error()))?;
+        let mut modules: Vec<(u64, u64)> =
+            crate::unity_bridge::background_hook::process_modules(pid)?
+                .into_iter()
+                .map(|module| (module.base, module.base.saturating_add(module.size)))
+                .collect();
+        modules.sort_unstable();
+        let in_module = |address: u64| match modules.binary_search_by(|(base, _)| base.cmp(&address)) {
+            Ok(_) => true,
+            Err(0) => false,
+            Err(index) => address < modules[index - 1].1,
+        };
+        let read_remote = |address: u64, buffer: &mut [u8]| -> usize {
+            let mut read = 0usize;
+            let ok = unsafe {
+                ReadProcessMemory(
+                    process.0,
+                    address as *const c_void,
+                    buffer.as_mut_ptr() as *mut c_void,
+                    buffer.len(),
+                    &mut read,
+                ) != 0
+            };
+            if ok { buffer.len() } else { read }
+        };
+
+        let started = Instant::now();
+        let cpu_start_100ns = thread_cpu_100ns(thread.0);
+        let mut buffer = vec![0u8; STACK_SCAN_BYTES];
+        let mut out = Vec::with_capacity(samples as usize);
+        for index in 0..samples.max(1) {
+            if index > 0 {
+                std::thread::sleep(interval);
+            }
+            if unsafe { SuspendThread(thread.0) } == u32::MAX {
+                return Err(format!("SuspendThread failed: {}", last_error()));
+            }
+            let (rip, read) = {
+                let _resume = SuspendGuard(thread.0);
+                let mut ctx: Context = unsafe { zeroed() };
+                ctx.context_flags = CONTEXT_CONTROL;
+                if unsafe { GetThreadContext(thread.0, &mut ctx) } == 0 {
+                    return Err(format!("GetThreadContext failed: {}", last_error()));
+                }
+                // Read only the committed stack above RSP: the stack top can
+                // be much closer than the scan window on a shallow stack.
+                let mut info: MemoryBasicInformation = unsafe { zeroed() };
+                let queried = unsafe {
+                    VirtualQueryEx(
+                        process.0,
+                        ctx.rsp as *const c_void,
+                        &mut info,
+                        size_of::<MemoryBasicInformation>(),
+                    ) != 0
+                };
+                let region_end = (info.base_address as u64).saturating_add(info.region_size as u64);
+                let len = if queried && region_end > ctx.rsp {
+                    ((region_end - ctx.rsp) as usize).min(buffer.len())
+                } else {
+                    buffer.len()
+                };
+                (ctx.rip, read_remote(ctx.rsp, &mut buffer[..len]))
+            };
+
+            let mut frames = vec![rip];
+            for word in buffer[..read - read % 8].chunks_exact(8) {
+                if frames.len() >= max_frames {
+                    break;
+                }
+                let value = u64::from_le_bytes(word.try_into().unwrap());
+                if value < 0x10000 || !in_module(value) || frames.last() == Some(&value) {
+                    continue;
+                }
+                let mut site = [0u8; 8];
+                if read_remote(value - 8, &mut site) == 8 && super::looks_like_call_site(&site) {
+                    frames.push(value);
+                }
+            }
+            out.push(frames);
+        }
+        Ok(super::ExternalStackScan {
+            samples: out,
+            cpu_start_100ns,
+            cpu_end_100ns: thread_cpu_100ns(thread.0),
+            wall_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        })
+    }
+
     pub(super) fn sample(
         project_path: &str,
         pid: u32,
@@ -2927,6 +3221,23 @@ mod workspace_scope_tests {
     use crate::workspace_service::event::WorkspaceEventScope;
     use crate::workspace_service::{CheckoutId, ProjectId, ServiceInstanceId};
 
+    #[test]
+    fn call_site_heuristic_accepts_only_call_encodings_ending_at_the_candidate() {
+        // call rel32
+        assert!(looks_like_call_site(&[0x90, 0x90, 0x90, 0xE8, 1, 2, 3, 4]));
+        // call qword ptr [rip+disp32]
+        assert!(looks_like_call_site(&[0x90, 0x90, 0xFF, 0x15, 1, 2, 3, 4]));
+        // call rax
+        assert!(looks_like_call_site(&[0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xFF, 0xD0]));
+        // call qword ptr [rax+8]
+        assert!(looks_like_call_site(&[0x90, 0x90, 0x90, 0x90, 0x90, 0xFF, 0x50, 0x08]));
+        // call qword ptr [rsp+0x20] (SIB + disp8)
+        assert!(looks_like_call_site(&[0x90, 0x90, 0x90, 0x90, 0xFF, 0x54, 0x24, 0x20]));
+        // jmp rax (FF /4) and plain data are rejected
+        assert!(!looks_like_call_site(&[0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xFF, 0xE0]));
+        assert!(!looks_like_call_site(&[0, 0, 0, 0, 0, 0, 0, 0]));
+    }
+
     fn connected_recompile_inputs(pipe_connected: bool) -> FusionInputs {
         FusionInputs {
             pipe_connected,
@@ -2953,6 +3264,89 @@ mod workspace_scope_tests {
             native_hook: NativeHookObservation::default(),
             observer: None,
         }
+    }
+
+    fn heartbeat_inputs(age: Option<u64>) -> FusionInputs {
+        let mut inputs = connected_recompile_inputs(true);
+        inputs.native_broker_status = Some(super::super::NativeBrokerStatus {
+            native_alive: true, observed_at_ms: unix_now_ms() as i64,
+            managed_state: "ready".to_string(), editor_status: "editing".to_string(),
+            main_thread_heartbeat_age_ms: age,
+            broker_capabilities: vec!["broker_main_thread_liveness_v1".to_string()],
+            active_executions: 1, ..Default::default()
+        });
+        inputs
+    }
+
+    #[test]
+    fn stopped_heartbeat_overrides_a_healthy_pipe_high_cpu_and_pending_recompile() {
+        let mut inputs = heartbeat_inputs(Some(45_000));
+        inputs.native = Some(NativeSample { reloading: None, rip_in_unity: true, cpu_active: true,
+            quiescent_for_ms: 0, suspended: false, suspend_window_us: 0 });
+        let state = fuse(&inputs);
+        assert_eq!(state.phase, "unresponsive");
+        assert_eq!(state.main_thread.state, "unresponsive_busy");
+        assert_eq!(state.main_thread.active_executions, Some(1));
+        assert!(!state.safety.can_call_unity_api);
+        assert!(!state.safety.can_modify_assets_safely);
+        assert_eq!(state.safety.recommended_action, "diagnose_hang");
+        assert_eq!(state.editor_mode.source, "last_known");
+    }
+
+    #[test]
+    fn fresh_heartbeat_recovers_without_cpu_or_stack_sampling() {
+        let state = fuse(&heartbeat_inputs(Some(0)));
+        assert_eq!(state.phase, "editing");
+        assert_eq!(state.main_thread.state, "responsive");
+        assert!(state.safety.can_call_unity_api);
+        assert_eq!(state.main_thread.suspend_window_us, None);
+    }
+
+    #[test]
+    fn restart_requires_the_same_unresponsive_process_and_no_modal_dialog() {
+        let mut state = fuse(&heartbeat_inputs(Some(45_000)));
+        assert!(state.can_restart_process(42, 1));
+        assert!(!state.can_restart_process(43, 1));
+        assert!(!state.can_restart_process(42, 2));
+        state.safety.recommended_action = "resolve_dialog".to_string();
+        assert!(!state.can_restart_process(42, 1));
+        assert!(!fuse(&heartbeat_inputs(Some(0))).can_restart_process(42, 1));
+    }
+
+    #[test]
+    fn unavailable_or_stale_broker_evidence_does_not_authorize_unity_api() {
+        let mut inputs = heartbeat_inputs(None);
+        assert!(!fuse(&inputs).safety.can_call_unity_api);
+        inputs.native_broker_status.as_mut().unwrap().main_thread_heartbeat_age_ms = Some(0);
+        inputs.native_broker_status.as_mut().unwrap().observed_at_ms -= 60_000;
+        let state = fuse(&inputs);
+        assert!(!state.safety.can_call_unity_api);
+        assert_eq!(state.main_thread.state, "unknown");
+        assert_ne!(state.phase, "unresponsive");
+    }
+
+    #[test]
+    fn explicit_reload_is_not_misreported_as_a_hang() {
+        let mut inputs = heartbeat_inputs(Some(45_000));
+        inputs.native_broker_status.as_mut().unwrap().managed_state = "reloading".to_string();
+        let state = fuse(&inputs);
+        assert_eq!(state.phase, "reloading");
+        assert!(!state.safety.can_call_unity_api);
+    }
+
+    #[test]
+    fn legacy_heartbeat_and_passive_sampling_budget_are_bounded() {
+        let mut inputs = heartbeat_inputs(None);
+        let broker = inputs.native_broker_status.as_mut().unwrap();
+        broker.broker_capabilities.clear();
+        broker.last_managed_heartbeat_ms = unix_now_ms() as i64 - 45_000;
+        assert_eq!(fuse(&inputs).phase, "unresponsive");
+        let project = "F:/liveness-budget-unit-test";
+        assert!(!should_sample_stalled_thread(project, 1, Some(2), Some(0)));
+        for _ in 0..3 { assert!(should_sample_stalled_thread(project, 1, Some(2), Some(45_000))); }
+        assert!(!should_sample_stalled_thread(project, 1, Some(2), Some(45_000)));
+        assert!(!should_sample_stalled_thread(project, 1, Some(2), Some(0)));
+        assert!(should_sample_stalled_thread(project, 2, Some(3), Some(45_000)));
     }
 
     #[test]
@@ -3021,6 +3415,16 @@ mod imp {
     use super::NativeSample;
 
     pub(super) fn clear_cache() {}
+
+    pub(super) fn scan_main_thread(
+        _pid: u32,
+        _thread_hint: Option<u32>,
+        _samples: u32,
+        _interval: std::time::Duration,
+        _max_frames: usize,
+    ) -> Result<super::ExternalStackScan, String> {
+        Err("main-thread stack scan is only supported on Windows".to_string())
+    }
 
     pub(super) fn sample(
         _project_path: &str,

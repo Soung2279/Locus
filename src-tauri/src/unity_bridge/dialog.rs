@@ -47,6 +47,7 @@ pub fn message_requires_unity_main_thread(message_type: &str) -> bool {
             | "get_reload_state"
             | "get_compile_result"
             | "unity_test_cancel"
+            | "main_thread_stack"
     )
 }
 

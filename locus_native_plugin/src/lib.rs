@@ -32,6 +32,14 @@
 
 use std::os::raw::c_int;
 
+mod heartbeat;
+
+#[cfg(windows)]
+mod gpu_output;
+
+#[cfg(windows)]
+mod hang_stack;
+
 // ── Managed lifecycle states (must match the C# `ManagedState` enum) ─────────
 
 /// Native is up; the managed executor has not registered yet (first load).
@@ -92,9 +100,9 @@ mod imp {
     use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use serde::Serialize;
     use serde_json::Value;
@@ -109,7 +117,7 @@ mod imp {
     };
 
     const NATIVE_CAPABILITIES: &str =
-        "broker_v1,broker_state_mmf_v1,broker_queue_limits_v1,broker_request_accepted_v1";
+        "broker_v1,broker_state_mmf_v1,broker_queue_limits_v1,broker_request_accepted_v1,broker_main_thread_liveness_v1,broker_main_thread_stack_v1";
     const REQUEST_ACCEPTED_EVENT: &str = "locus-request-accepted";
     const STATUS_EVENT_BUFFER_LIMIT: usize = 256;
     const MAX_PENDING_REQUESTS: usize = 128;
@@ -341,6 +349,13 @@ mod imp {
         generation: AtomicI64,
         /// Unix-ms of the last managed heartbeat / state push.
         last_heartbeat_ms: AtomicI64,
+        // Hot path: a pulse is only an atomic increment, never a clock read,
+        // lock, allocation, JSON serialization or shared-memory publication.
+        heartbeat_sequence: AtomicU64,
+        heartbeat_age_ms: AtomicI64,
+        main_thread_id: u32,
+        active_executions: AtomicU32,
+        snapshot_dirty: AtomicBool,
 
         /// Last editor status string the managed side published
         /// (`editing|playing|playing_paused` + optional `|scenePath`). Answers
@@ -427,6 +442,11 @@ mod imp {
                 managed_state: AtomicI32::new(MANAGED_STATE_INITIALIZING),
                 generation: AtomicI64::new(0),
                 last_heartbeat_ms: AtomicI64::new(0),
+                heartbeat_sequence: AtomicU64::new(0),
+                heartbeat_age_ms: AtomicI64::new(-1),
+                main_thread_id: unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
+                active_executions: AtomicU32::new(0),
+                snapshot_dirty: AtomicBool::new(true),
                 editor_status: Mutex::new(String::new()),
                 managed_capabilities: Mutex::new(String::new()),
                 queue: Mutex::new(VecDeque::new()),
@@ -585,6 +605,10 @@ mod imp {
                 "domainGeneration": self.generation.load(Ordering::SeqCst),
                 "editorStatus": self.editor_status.lock().map(|s| s.clone()).unwrap_or_default(),
                 "lastManagedHeartbeatMs": self.last_heartbeat_ms.load(Ordering::SeqCst),
+                "mainThreadId": self.main_thread_id,
+                "mainThreadHeartbeatSeq": self.heartbeat_sequence.load(Ordering::Relaxed),
+                "mainThreadHeartbeatAgeMs": match self.heartbeat_age_ms.load(Ordering::Relaxed) { age if age >= 0 => Some(age), _ => None },
+                "activeExecutions": self.active_executions.load(Ordering::Relaxed),
                 "pendingRequests": self.queue.lock().map(|q| q.len()).unwrap_or(0),
                 "pendingBytes": self.queued_bytes.lock().map(|bytes| *bytes).unwrap_or(0),
                 "inflightRequests": self.inflight.lock().map(|m| m.len()).unwrap_or(0),
@@ -638,6 +662,12 @@ mod imp {
         }
 
         fn publish_status_snapshot(&self) {
+            // Called from both managed FFI and the broker. Publication must
+            // never serialize or acquire the state-plane lock on the Editor.
+            self.snapshot_dirty.store(true, Ordering::Relaxed);
+        }
+
+        fn flush_status_snapshot(&self) {
             let (observed_at_ms, json) = self.shared_memory_status_json();
             if let Ok(mut guard) = self.state_plane.lock() {
                 if let Some(plane) = guard.as_mut() {
@@ -711,6 +741,10 @@ mod imp {
         ) -> Result<(), &'static str> {
             self.expire_requests();
 
+            if self.main_thread_unresponsive() {
+                return Err("native_main_thread_unresponsive");
+            }
+
             if raw.len() > MAX_REQUEST_BYTES {
                 return Err("native_payload_too_large");
             }
@@ -745,7 +779,6 @@ mod imp {
         }
 
         fn next_request_len(&self) -> Option<usize> {
-            self.expire_requests();
             if self
                 .inflight
                 .lock()
@@ -759,7 +792,6 @@ mod imp {
         }
 
         fn take_next_request(&self) -> Option<QueuedRequest> {
-            self.expire_requests();
             if self
                 .inflight
                 .lock()
@@ -856,7 +888,10 @@ mod imp {
             let previous = self.managed_state.swap(state, Ordering::SeqCst);
             let observed_at_ms = now_ms();
             if generation > 0 {
-                self.generation.store(generation, Ordering::SeqCst);
+                if self.generation.swap(generation, Ordering::SeqCst) != generation {
+                    self.active_executions.store(0, Ordering::Relaxed);
+                    self.heartbeat_age_ms.store(-1, Ordering::Relaxed);
+                }
             }
             self.last_heartbeat_ms
                 .store(observed_at_ms, Ordering::SeqCst);
@@ -896,11 +931,87 @@ mod imp {
             self.publish_status_snapshot();
         }
 
-        fn heartbeat(&self, generation: i64) {
-            if generation > 0 {
-                self.generation.store(generation, Ordering::SeqCst);
+        fn heartbeat(&self, _generation: i64) {
+            self.heartbeat_sequence.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn main_thread_unresponsive(&self) -> bool {
+            self.managed_state() == MANAGED_STATE_READY
+                && self.heartbeat_age_ms.load(Ordering::Relaxed)
+                    >= crate::heartbeat::UNRESPONSIVE_AFTER.as_millis() as i64
+        }
+
+        fn execution_activity(&self, active: bool) {
+            if active {
+                self.active_executions.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let _ = self.active_executions.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
             }
-            self.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
+        }
+
+        fn reject_stalled_queue(&self) {
+            let rejected = if let (Ok(mut queue), Ok(mut bytes)) = (self.queue.lock(), self.queued_bytes.lock()) {
+                *bytes = 0;
+                queue.drain(..).map(|request| request.id).collect::<Vec<_>>()
+            } else { Vec::new() };
+            for id in rejected {
+                self.respond_error(&id, "native_main_thread_unresponsive");
+            }
+        }
+
+        async fn observe_main_thread(self: Arc<Self>) {
+            let mut observer = crate::heartbeat::HeartbeatObserver::new(Instant::now());
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = self.shutdown_notify.notified() => break,
+                    _ = interval.tick() => {}
+                }
+                if self.shutdown.load(Ordering::Relaxed) { break; }
+                let age = observer.sample(self.heartbeat_sequence.load(Ordering::Relaxed), self.generation.load(Ordering::Relaxed), Instant::now());
+                self.heartbeat_age_ms.store(age.map(|age| age.as_millis().min(i64::MAX as u128) as i64).unwrap_or(-1), Ordering::Relaxed);
+                if age.is_some_and(|age| age.is_zero()) {
+                    self.last_heartbeat_ms.store(now_ms(), Ordering::Relaxed);
+                }
+                if self.main_thread_unresponsive() { self.reject_stalled_queue(); }
+                // Publish once per second even when stalled so readers can
+                // distinguish a live broker from a stale mapped snapshot.
+                if self.snapshot_dirty.swap(false, Ordering::Relaxed) || age.is_some() {
+                    self.flush_status_snapshot();
+                }
+            }
+        }
+
+        /// Answer `main_thread_stack` from a dedicated thread: the capture
+        /// sleeps between samples and may wait on Mono, and the broker runtime
+        /// must keep serving the pipe and the heartbeat observer meanwhile.
+        fn capture_main_thread_stack(self: &Arc<Self>, id: &str, value: &Value) {
+            let request = value
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .and_then(|message| serde_json::from_str::<crate::hang_stack::CaptureRequest>(message).ok())
+                .unwrap_or_default();
+            let broker = Arc::clone(self);
+            let request_id = id.to_string();
+            let thread_id = self.main_thread_id;
+            let spawned = std::thread::Builder::new()
+                .name("locus-hang-capture".to_string())
+                .spawn(move || match crate::hang_stack::capture(thread_id, &request) {
+                    Ok(result) => match serde_json::to_string(&result) {
+                        Ok(json) => broker.respond_ok(&request_id, Some(json)),
+                        Err(error) => broker.respond_error(
+                            &request_id,
+                            &format!("main_thread_stack_failed: serialize: {error}"),
+                        ),
+                    },
+                    Err(error) => broker
+                        .respond_error(&request_id, &format!("main_thread_stack_failed: {error}")),
+                });
+            if spawned.is_err() {
+                self.respond_error(id, "main_thread_stack_failed: capture thread could not start");
+            }
         }
 
         fn set_capabilities(&self, caps: String) {
@@ -955,6 +1066,35 @@ mod imp {
         use serde_json::Value;
         use std::sync::Arc;
         use tokio::sync::mpsc;
+
+        #[test]
+        fn heartbeat_does_not_publish_or_read_a_clock_on_the_editor_thread() {
+            use std::sync::atomic::Ordering;
+            let broker = Broker::new("F:/HeartbeatTest".into(), "heartbeat-test".into(), 1);
+            broker.snapshot_dirty.store(false, Ordering::Relaxed);
+            for _ in 0..10_000 { broker.heartbeat(1); }
+            assert_eq!(broker.heartbeat_sequence.load(Ordering::Relaxed), 10_000);
+            assert_eq!(broker.last_heartbeat_ms.load(Ordering::Relaxed), 0);
+            assert!(!broker.snapshot_dirty.load(Ordering::Relaxed));
+        }
+
+        #[test]
+        fn stalled_main_thread_rejects_pending_work_but_preserves_actual_execution() {
+            use std::sync::atomic::Ordering;
+            let broker = Broker::new("F:/StalledTest".into(), "stalled-test".into(), 1);
+            broker.set_managed_state(MANAGED_STATE_READY, 1, Some("editing".into()));
+            broker.execution_activity(true);
+            broker.enqueue("waiting".into(), b"{}".to_vec(), true).unwrap();
+            broker.heartbeat_age_ms.store(31_000, Ordering::Relaxed);
+            broker.reject_stalled_queue();
+            assert!(broker.queue.lock().unwrap().is_empty());
+            assert_eq!(broker.active_executions.load(Ordering::Relaxed), 1);
+            assert_eq!(broker.enqueue("later".into(), b"{}".to_vec(), true), Err("native_main_thread_unresponsive"));
+            broker.heartbeat_age_ms.store(0, Ordering::Relaxed);
+            assert!(broker.enqueue("recovered".into(), b"{}".to_vec(), true).is_ok());
+            broker.execution_activity(false);
+            assert_eq!(broker.active_executions.load(Ordering::Relaxed), 0);
+        }
 
         #[test]
         fn complete_drops_stale_or_already_interrupted_requests() {
@@ -1179,6 +1319,8 @@ mod imp {
             "ping" => broker.respond_ok(id, Some("pong".to_string())),
             "status" => broker.respond_status(id),
             "bridge_capabilities" => broker.respond_ok(id, Some(broker.capabilities_string())),
+            // Diagnosis of a wedged main thread must not depend on it.
+            "main_thread_stack" => broker.capture_main_thread_stack(id, &value),
             _ => match broker.managed_state() {
                 MANAGED_STATE_READY => match broker.enqueue(
                     id.to_string(),
@@ -1318,6 +1460,9 @@ mod imp {
         if BROKER.set(broker.clone()).is_err() {
             return 0; // lost an init race; the winner is running
         }
+        // Resolve Mono exports now, on the editor thread, instead of during a
+        // hang when the loader lock may be owned by the stuck main thread.
+        crate::hang_stack::prepare();
         broker.publish_status_snapshot();
 
         let thread_broker = broker;
@@ -1334,7 +1479,11 @@ mod imp {
                         return;
                     }
                 };
-                runtime.block_on(broker_main(thread_broker, pipe_name));
+                runtime.block_on(async move {
+                    let observer = tokio::spawn(thread_broker.clone().observe_main_thread());
+                    broker_main(thread_broker, pipe_name).await;
+                    observer.abort();
+                });
             });
 
         match spawn {
@@ -1365,6 +1514,10 @@ mod imp {
         if let Some(broker) = BROKER.get() {
             broker.heartbeat(generation);
         }
+    }
+
+    pub fn managed_execution(active: bool) {
+        if let Some(broker) = BROKER.get() { broker.execution_activity(active); }
     }
 
     pub fn set_capabilities(caps: String) {
@@ -2210,6 +2363,15 @@ pub extern "C" fn locus_managed_heartbeat(generation: i64) {
     }
 }
 
+/// Execution lifetime is independent of the request's response/timeout.
+#[no_mangle]
+pub extern "C" fn locus_managed_execution(active: c_int) {
+    #[cfg(windows)]
+    imp::managed_execution(active != 0);
+    #[cfg(not(windows))]
+    let _ = active;
+}
+
 /// Register the managed executor's capability string (merged with native caps
 /// when answering `bridge_capabilities`).
 ///
@@ -2385,3 +2547,5 @@ pub unsafe extern "C" fn locus_overlay_push(line: *const u8, line_len: i32) {
         let _ = (line, line_len);
     }
 }
+#[cfg(windows)]
+mod webview;

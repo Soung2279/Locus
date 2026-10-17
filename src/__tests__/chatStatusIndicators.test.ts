@@ -16,7 +16,7 @@ describe("chat status indicators", () => {
     const workspace = read("src/components/ChatWorkspaceView.vue");
 
     expect(chatView).toContain('import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue"');
-    expect(chatView).toMatch(/<div v-if="!inputControlsCollapsed" class="input-backdrop-status">[\s\S]*<ChatStatusIndicators/);
+    expect(chatView).toMatch(/<div class="input-backdrop-status">\s*<ChatStatusIndicators\s+v-if="!inputControlsCollapsed"/);
     expect(chatView).toMatch(/<template v-if="!inputControlsCollapsed" #footer-start>[\s\S]*<ModelEffortSelector[\s\S]*\/>\s*<TokenUsageBar/);
     expect(chatView).toContain('@start-scan="emit(\'startScan\')"');
     expect(chatView).toContain(':unity-plugin-status="unityPluginStatus"');
@@ -66,7 +66,7 @@ describe("chat status indicators", () => {
     expect(indicators).toContain('label: t("chat.status.unity.lastError")');
     expect(indicators).toContain('label: t("chat.status.unity.processLastError")');
     expect(indicators).toContain('label: t("chat.status.unity.reconnectAttempts")');
-    expect(indicators).toContain(':class="{ \'is-mono\': row.mono }"');
+    expect(indicators).toContain(':class="{ \'is-mono\': row.mono, \'is-multiline\': row.multiline }"');
     expect(zh).toContain('"chat.status.unity.pipe": "管道"');
     expect(zh).toContain('"chat.status.unity.workingDir": "工作目录"');
     expect(zh).toContain('"chat.status.unity.process": "进程"');
@@ -133,7 +133,7 @@ describe("chat status indicators", () => {
     expect(indicators).toContain('if (effectiveUnityLaunchState.value === "starting") return t("chat.unity.launching");');
     expect(indicators).toContain('return t("chat.status.unity.waitingConnection");');
     expect(indicators).toContain(':variant="activeItem.actionVariant"');
-    expect(indicators).toContain('actionVariant: unityCanCloseHeadless.value');
+    expect(indicators).toContain('actionVariant: unityCanRestart.value || unityCanCloseHeadless.value');
     expect(projectStore).toContain('const unityLaunchState = ref<UnityLaunchState>("idle");');
     expect(projectStore).toContain('const unityLaunching = computed(() => unityLaunchState.value === "starting");');
     expect(projectStore).toContain("function connectionStatusFromLaunchResult(result: UnityLaunchResult): UnityConnectionStatus");
@@ -165,7 +165,7 @@ describe("chat status indicators", () => {
     expect(indicators).toContain('const unityCanCloseHeadless = computed(() =>');
     expect(indicators).toContain('props.unityConnectionStatus?.launchMode === "headless"');
     expect(indicators).toContain("await closeHeadlessUnityProject(workspaceRef)");
-    expect(indicators).toContain('actionVariant: unityCanCloseHeadless.value');
+    expect(indicators).toContain('actionVariant: unityCanRestart.value || unityCanCloseHeadless.value');
     expect(unityService).toContain('ipcInvoke<void>("close_headless_unity_project", { workspaceRef })');
     expect(rust).toContain("pub async fn close_headless_unity_project(");
     expect(rust).toContain("if !status.headless");

@@ -729,6 +729,33 @@ mod windows_impl {
         }
     }
 
+    pub(super) fn process_modules(process_id: u32) -> Result<Vec<super::ProcessModule>, String> {
+        let snapshot = unsafe {
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id)
+        };
+        let snapshot = OwnedHandle::new(snapshot).map_err(|error| {
+            format!("Failed to create module snapshot for Unity PID {process_id}: {error}")
+        })?;
+        let mut entry: ModuleEntry32W = unsafe { zeroed() };
+        entry.dwSize = size_of::<ModuleEntry32W>() as u32;
+        let mut modules = Vec::new();
+        let mut has_entry = unsafe { Module32FirstW(snapshot.raw(), &mut entry) != 0 };
+        while has_entry {
+            let info = module_info_from_entry(wide_to_string(&entry.szModule), &entry);
+            modules.push(super::ProcessModule {
+                name: info.name,
+                base: info.base,
+                size: u64::from(info.size),
+                path: info.path,
+            });
+            has_entry = unsafe { Module32NextW(snapshot.raw(), &mut entry) != 0 };
+        }
+        if modules.is_empty() {
+            return Err(format!("no modules listed for Unity PID {process_id}"));
+        }
+        Ok(modules)
+    }
+
     pub(super) fn engine_module_bounds(process_id: u32) -> Result<(u64, u64, String), String> {
         let module = find_unity_engine_module(process_id)?;
         Ok((
@@ -744,6 +771,11 @@ mod windows_impl {
         module: &ModuleInfo,
         symbol_name: &str,
     ) -> Result<u64, String> {
+        // dbghelp is process-global and not thread-safe; share one lock with
+        // the state probe and the hang symbolizer.
+        let _dbghelp = crate::unity_bridge::hang_diagnosis::dbghelp_lock()
+            .lock()
+            .map_err(|_| "dbghelp lock poisoned".to_string())?;
         let session = SymSession::new(symbol_path)?;
         let image = wide_null(image_path.as_os_str());
         let module_name = wide_null(OsStr::new("Unity"));
@@ -909,6 +941,25 @@ pub(in crate::unity_bridge) fn engine_module_bounds(
     _process_id: u32,
 ) -> Result<(u64, u64, String), String> {
     Err("engine module lookup is only supported on Windows".to_string())
+}
+
+/// One module loaded in a Unity process (Toolhelp snapshot).
+#[derive(Debug, Clone)]
+pub(in crate::unity_bridge) struct ProcessModule {
+    pub name: String,
+    pub base: u64,
+    pub size: u64,
+    pub path: String,
+}
+
+#[cfg(target_os = "windows")]
+pub(in crate::unity_bridge) fn process_modules(process_id: u32) -> Result<Vec<ProcessModule>, String> {
+    windows_impl::process_modules(process_id)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(in crate::unity_bridge) fn process_modules(_process_id: u32) -> Result<Vec<ProcessModule>, String> {
+    Err("module enumeration is only supported on Windows".to_string())
 }
 
 #[cfg(test)]

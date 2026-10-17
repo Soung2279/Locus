@@ -306,19 +306,33 @@ namespace Locus
             public double Value;
         }
 
+        private struct RuntimeProfilerSpikePoint
+        {
+            internal string Label, MetricName;
+            internal double Threshold, Value;
+            internal int SessionFrame, UnityTimeFrameCount, ProfilerFrameIndex;
+            internal RuntimeProfilerSpike Export()
+            {
+                return new RuntimeProfilerSpike(Label, MetricName, Threshold, Value, SessionFrame, UnityTimeFrameCount, ProfilerFrameIndex);
+            }
+        }
+
         private sealed class RuntimeProfilerSample : IDisposable
         {
             private readonly RuntimeProfilerMetric _metric;
-            private readonly List<RuntimeProfilerPoint> _points = new List<RuntimeProfilerPoint>(512);
+            private readonly List<RuntimeProfilerPoint> _points;
+            internal readonly string DefaultSpikeLabel;
             private ProfilerRecorder _recorder;
             private string _error;
             private string _dataType = "";
             private string _nativeUnit = "";
             private bool _disposed;
 
-            public RuntimeProfilerSample(RuntimeProfilerMetric metric)
+            public RuntimeProfilerSample(RuntimeProfilerMetric metric, int capacity)
             {
                 _metric = metric;
+                DefaultSpikeLabel = metric.Name + "_spike";
+                _points = new List<RuntimeProfilerPoint>(capacity);
                 if (metric.Reader != null) return;
                 try
                 {
@@ -350,7 +364,7 @@ namespace Locus
                 double value = double.NaN;
                 try
                 {
-                    if (_metric.Reader != null)
+                    if (_metric.Reader != null && string.IsNullOrEmpty(_error))
                         value = (_metric.Reader() ?? double.NaN) * _metric.Scale;
                     else if (string.IsNullOrEmpty(_error) && _recorder.Valid && _recorder.Count > 0)
                     {
@@ -422,7 +436,7 @@ namespace Locus
 
             public RuntimeProfilerMetric Metric => _metric;
             public RuntimeProfilerPoint LastPoint => _points[_points.Count - 1];
-            public RuntimeProfilerPoint[] Points() { return _points.ToArray(); }
+            public RuntimeProfilerPoint PointAt(int index) { return _points[index]; }
             private IEnumerable<double> Values()
             {
                 for (int i = 0; i < _points.Count; i++) yield return _points[i].Value;
@@ -523,7 +537,8 @@ namespace Locus
         {
             private readonly string _name;
             private readonly List<RuntimeProfilerSample> _samples = new List<RuntimeProfilerSample>();
-            private readonly List<RuntimeProfilerSpike> _spikes = new List<RuntimeProfilerSpike>();
+            private readonly List<RuntimeProfilerSpikePoint> _spikes;
+            public int DroppedSpikes { get; private set; }
             private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
             private readonly int _startFrame;
             private readonly int _startUnityFrame;
@@ -559,19 +574,24 @@ namespace Locus
                 _endFrame = startFrame;
                 _endUnityFrame = startUnityFrame;
                 _options = options.CopyValidated();
+                _spikes = new List<RuntimeProfilerSpikePoint>(_options.MaxSpikes);
                 _hostClock = hostClock;
                 _clock = _options.Clock == "auto" ? (_playing ? "unity_frame" : "editor_update") : _options.Clock;
                 _lastClockFrame = _clock == "unity_frame" ? startUnityFrame : startFrame;
-                if (_options.CaptureHierarchy || _options.CaptureGpu) _recordingLease = new ProfilerRecordingLease(_options.CaptureGpu);
-
-                if (metrics != null)
+                try
                 {
-                    foreach (RuntimeProfilerMetric metric in metrics)
+                    if (metrics != null)
                     {
-                        if (metric != null)
-                            _samples.Add(new RuntimeProfilerSample(metric));
+                        foreach (RuntimeProfilerMetric metric in metrics)
+                        {
+                            if (metric != null)
+                                _samples.Add(new RuntimeProfilerSample(metric, _options.MaxSamples));
+                        }
                     }
+                    // Allocate storage and initialize recorders before enabling history capture.
+                    if (_options.CaptureHierarchy || _options.CaptureGpu) _recordingLease = new ProfilerRecordingLease(_options.CaptureGpu);
                 }
+                catch { Dispose(); throw; }
             }
 
             public string Name { get { return _name; } }
@@ -603,8 +623,9 @@ namespace Locus
                 // Recorder metrics are local. A remote Profiler window cannot supply their frame indices.
                 if (!(_options.CaptureHierarchy || _options.CaptureGpu) || ProfilerDriver.connectedProfiler != _connectedProfiler)
                     profilerFrameIndex = -1;
+                long sessionElapsedMs = _stopwatch.ElapsedMilliseconds;
                 for (int i = 0; i < _samples.Count; i++)
-                    _samples[i].Sample(sessionFrame, unityTimeFrameCount, profilerFrameIndex, _stopwatch.ElapsedMilliseconds);
+                    _samples[i].Sample(sessionFrame, unityTimeFrameCount, profilerFrameIndex, sessionElapsedMs);
                 _sampleRows++;
                 if (_sampleRows >= _options.MaxSamples)
                 {
@@ -673,33 +694,27 @@ namespace Locus
                 double value;
                 if (!TryGetLastValue(normalizedMetricName, out value) || value <= threshold)
                     return false;
-                var point = FindSample(normalizedMetricName).LastPoint;
+                var sample = FindSample(normalizedMetricName);
+                var point = sample.LastPoint;
                 sessionFrame = point.SessionFrame;
                 unityTimeFrameCount = point.UnityTimeFrameCount;
                 profilerFrameIndex = point.ProfilerFrameIndex;
 
                 string normalizedLabel = (label ?? "").Trim();
                 if (string.IsNullOrEmpty(normalizedLabel))
-                    normalizedLabel = normalizedMetricName + "_spike";
+                    normalizedLabel = sample.DefaultSpikeLabel;
                 foreach (var existing in _spikes)
                     if (existing.MetricName == normalizedMetricName && existing.Label == normalizedLabel
                         && existing.SessionFrame == sessionFrame) return false;
 
-                RuntimeProfilerSpike spike = new RuntimeProfilerSpike(
-                    normalizedLabel,
-                    normalizedMetricName,
-                    threshold,
-                    value,
-                    sessionFrame,
-                    unityTimeFrameCount,
-                    profilerFrameIndex
-                );
+                var spike = new RuntimeProfilerSpikePoint { Label = normalizedLabel, MetricName = normalizedMetricName,
+                    Threshold = threshold, Value = value, SessionFrame = sessionFrame,
+                    UnityTimeFrameCount = unityTimeFrameCount, ProfilerFrameIndex = profilerFrameIndex };
 
                 int normalizedMaxSpikes = Math.Max(0, maxSpikes);
                 if (normalizedMaxSpikes <= 0)
                 {
-                    _spikes.Add(spike);
-                    return true;
+                    return AddSpike(spike);
                 }
 
                 int matchingCount = 0;
@@ -707,7 +722,7 @@ namespace Locus
                 double weakestValue = double.MaxValue;
                 for (int i = 0; i < _spikes.Count; i++)
                 {
-                    RuntimeProfilerSpike existing = _spikes[i];
+                    var existing = _spikes[i];
                     if (!string.Equals(existing.MetricName, normalizedMetricName, StringComparison.Ordinal)
                         || !string.Equals(existing.Label, normalizedLabel, StringComparison.Ordinal))
                         continue;
@@ -722,8 +737,7 @@ namespace Locus
 
                 if (matchingCount < normalizedMaxSpikes)
                 {
-                    _spikes.Add(spike);
-                    return true;
+                    return AddSpike(spike);
                 }
 
                 if (weakestIndex >= 0 && value > weakestValue)
@@ -735,23 +749,32 @@ namespace Locus
                 return false;
             }
 
+            private bool AddSpike(RuntimeProfilerSpikePoint spike)
+            {
+                if (_spikes.Count == _options.MaxSpikes) { DroppedSpikes++; return false; }
+                _spikes.Add(spike);
+                return true;
+            }
+
             public int GetLastSpikeProfilerFrame(string metricName)
             {
                 string normalizedMetricName = NormalizeMetricName(metricName);
-                RuntimeProfilerSpike latest = null;
+                int latest = -1;
                 for (int i = 0; i < _spikes.Count; i++)
                 {
                     if (string.Equals(_spikes[i].MetricName, normalizedMetricName, StringComparison.Ordinal)
-                        && (latest == null || _spikes[i].SessionFrame > latest.SessionFrame)) latest = _spikes[i];
+                        && (latest < 0 || _spikes[i].SessionFrame > _spikes[latest].SessionFrame)) latest = i;
                 }
-                if (latest != null) return latest.ProfilerFrameIndex;
+                if (latest >= 0) return _spikes[latest].ProfilerFrameIndex;
 
                 throw new InvalidOperationException("Profiler spike not found for metric: " + normalizedMetricName);
             }
 
             public RuntimeProfilerSpike[] GetSpikes()
             {
-                return _spikes.ToArray();
+                var result = new RuntimeProfilerSpike[_spikes.Count];
+                for (int i = 0; i < result.Length; i++) result[i] = _spikes[i].Export();
+                return result;
             }
 
             public string BuildSummary()
@@ -771,6 +794,7 @@ namespace Locus
 
                 if (_spikes.Count > 0)
                     sb.Append("spikes=").AppendLine(_spikes.Count.ToString(CultureInfo.InvariantCulture));
+                if (DroppedSpikes > 0) sb.Append("dropped_spikes=").AppendLine(DroppedSpikes.ToString(CultureInfo.InvariantCulture));
 
                 return sb.ToString().TrimEnd();
             }
@@ -809,6 +833,8 @@ namespace Locus
                     .Append(", \"warmup_frames\": ").Append(_options.WarmupFrames)
                     .Append(", \"sample_every_frames\": ").Append(_options.SampleEveryFrames)
                     .Append(", \"max_samples\": ").Append(_options.MaxSamples)
+                    .Append(", \"max_spikes\": ").Append(_options.MaxSpikes)
+                    .Append(", \"dropped_spikes\": ").Append(DroppedSpikes)
                     .Append(", \"capture_hierarchy\": ").Append(_options.CaptureHierarchy ? "true" : "false")
                     .Append(", \"capture_gpu\": ").Append(_options.CaptureGpu ? "true" : "false")
                     .Append(", \"sample_rows\": ")
@@ -842,7 +868,7 @@ namespace Locus
                     if (i > 0)
                         sb.Append(',');
                     sb.Append("\n    ");
-                    _spikes[i].AppendJson(sb);
+                    _spikes[i].Export().AppendJson(sb);
                 }
                 if (_spikes.Count > 0)
                     sb.Append('\n');
@@ -1221,83 +1247,8 @@ namespace Locus
             sb.Append('"');
         }
 
-        // Cached open delegate for ProfilerDriver.lastFrameIndex. Resolving the
-        // PropertyInfo and calling GetValue every sampled frame boxes the int and
-        // allocates an object[] for the (empty) argument list; binding the getter
-        // once to a Func<int> removes both from the per-frame sampling path.
-        private static Func<int> _lastFrameIndexGetter;
-        private static bool _lastFrameIndexGetterResolved;
-
-        private static int CurrentProfilerFrameIndex()
-        {
-            Func<int> getter = _lastFrameIndexGetter;
-            if (getter == null && !_lastFrameIndexGetterResolved)
-            {
-                _lastFrameIndexGetterResolved = true;
-                getter = _lastFrameIndexGetter = ResolveProfilerDriverIntGetter("lastFrameIndex");
-            }
-
-            if (getter != null)
-            {
-                try
-                {
-                    return getter();
-                }
-                catch
-                {
-                    // A version whose getter throws drops to the reflection path.
-                    _lastFrameIndexGetter = null;
-                }
-            }
-
-            return ReadProfilerDriverIntProperty("lastFrameIndex", -1);
-        }
-
-        private static Func<int> ResolveProfilerDriverIntGetter(string propertyName)
-        {
-            try
-            {
-                PropertyInfo property = typeof(ProfilerDriver).GetProperty(
-                    propertyName,
-                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic
-                );
-                if (property == null || !property.CanRead || property.PropertyType != typeof(int))
-                    return null;
-
-                MethodInfo getter = property.GetGetMethod(true);
-                if (getter == null)
-                    return null;
-
-                return (Func<int>)Delegate.CreateDelegate(typeof(Func<int>), getter);
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static int ReadProfilerDriverIntProperty(string propertyName, int fallback)
-        {
-            try
-            {
-                PropertyInfo property = typeof(ProfilerDriver).GetProperty(
-                    propertyName,
-                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic
-                );
-                if (property == null || !property.CanRead)
-                    return fallback;
-
-                object value = property.GetValue(null, null);
-                if (value == null)
-                    return fallback;
-
-                return Convert.ToInt32(value, CultureInfo.InvariantCulture);
-            }
-            catch
-            {
-                return fallback;
-            }
-        }
+        // Public on supported Unity versions; avoid reflection and boxed fallback reads.
+        private static int CurrentProfilerFrameIndex() { return ProfilerDriver.lastFrameIndex; }
 
         private static RuntimeProfilerFrameExport BuildProfilerFrameExport(
             string name,
@@ -1341,8 +1292,8 @@ namespace Locus
 
             int firstFrameIndex = -1;
             int lastFrameIndex = -1;
-            firstFrameIndex = ReadProfilerDriverIntProperty("firstFrameIndex", -1);
-            lastFrameIndex = ReadProfilerDriverIntProperty("lastFrameIndex", -1);
+            firstFrameIndex = ProfilerDriver.firstFrameIndex;
+            lastFrameIndex = ProfilerDriver.lastFrameIndex;
 
             if (firstFrameIndex >= 0 && lastFrameIndex >= firstFrameIndex)
             {
@@ -1360,14 +1311,15 @@ namespace Locus
 
             int selectedThreadIndex = -1;
 
+            if (ProfilerDriver.enabled)
+            {
+                export.Error = "Stop Profiler recording before hierarchy analysis; name/path allocations would contaminate subsequent frames.";
+                return export;
+            }
+
             for (int threadIndex = 0; ; threadIndex++)
             {
-                using (HierarchyFrameDataView frameData = ProfilerDriver.GetHierarchyFrameDataView(
-                    export.ProfilerFrameIndex,
-                    threadIndex,
-                    HierarchyFrameDataView.ViewModes.Default,
-                    HierarchyFrameDataView.columnTotalTime,
-                    false))
+                using (var frameData = ProfilerDriver.GetRawFrameDataView(export.ProfilerFrameIndex, threadIndex))
                 {
                     if (!frameData.valid)
                         break;
@@ -1391,12 +1343,6 @@ namespace Locus
             {
                 export.ThreadMatched = false;
                 export.Error = "Requested thread was not found in this frame. Use GetProfilerThreads(frame) to discover thread indices.";
-                return export;
-            }
-
-            if (selectedThreadIndex < 0)
-            {
-                export.Error = "Profiler frame has no valid thread data.";
                 return export;
             }
 
@@ -1429,36 +1375,33 @@ namespace Locus
                 export.FrameFps = frameData.frameFps;
                 if (frameData.frameGpuTimeMs > 0) export.GpuFrameTimeMs = frameData.frameGpuTimeMs;
 
-                var rows = new List<RuntimeProfilerFrameRow>(256);
-                CollectProfilerHierarchyRows(frameData, rows);
-                if (!string.IsNullOrEmpty(export.NameContains))
-                    rows.RemoveAll(row => (row.Path ?? row.Name ?? "").IndexOf(export.NameContains, StringComparison.OrdinalIgnoreCase) < 0);
-                rows.Sort(delegate (RuntimeProfilerFrameRow left, RuntimeProfilerFrameRow right)
-                {
-                    if (export.SortBy == "self_ms") return right.SelfMs.CompareTo(left.SelfMs);
-                    if (export.SortBy == "gc_bytes") return right.GcBytes.CompareTo(left.GcBytes);
-                    if (export.SortBy == "calls") return right.Calls.CompareTo(left.Calls);
-                    return right.TotalMs.CompareTo(left.TotalMs);
-                });
-
-                int rowCount = normalizedTopCount > 0 ? Math.Min(normalizedTopCount, rows.Count) : 0;
-                for (int i = 0; i < rowCount; i++)
-                    export.Rows.Add(rows[i]);
-
-                if (rows.Count == 0)
+                CollectProfilerHierarchyRows(frameData, export);
+                if (normalizedTopCount > 0 && export.Rows.Count == 0)
                     export.Error = "Profiler hierarchy has no rows for selected thread.";
             }
 
             return export;
         }
 
-        private static void CollectProfilerHierarchyRows(
-            HierarchyFrameDataView frameData,
-            List<RuntimeProfilerFrameRow> rows)
+        private struct ProfilerHierarchyCandidate
         {
+            internal int Item;
+            internal double Score;
+            internal string Path;
+        }
+
+        private static void CollectProfilerHierarchyRows(HierarchyFrameDataView frameData, RuntimeProfilerFrameExport export)
+        {
+            if (export.TopCount == 0) return;
             int rootId = frameData.GetRootItemID();
             var stack = new Stack<int>();
             var children = new List<int>(64);
+            // Bounded min heap: scan numeric values, materialize only the winning rows.
+            var best = new ProfilerHierarchyCandidate[export.TopCount];
+            int count = 0;
+            int column = export.SortBy == "self_ms" ? HierarchyFrameDataView.columnSelfTime
+                : export.SortBy == "gc_bytes" ? HierarchyFrameDataView.columnGcMemory
+                : export.SortBy == "calls" ? HierarchyFrameDataView.columnCalls : HierarchyFrameDataView.columnTotalTime;
 
             frameData.GetItemChildren(rootId, children);
             for (int i = children.Count - 1; i >= 0; i--)
@@ -1467,33 +1410,67 @@ namespace Locus
             while (stack.Count > 0)
             {
                 int itemId = stack.Pop();
-                rows.Add(BuildProfilerHierarchyRow(frameData, itemId));
+                string path = string.IsNullOrEmpty(export.NameContains) ? null : frameData.GetItemPath(itemId);
+                if (path == null || path.IndexOf(export.NameContains, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    var candidate = new ProfilerHierarchyCandidate { Item = itemId,
+                        Score = GetProfilerHierarchyColumn(frameData, itemId, column), Path = path };
+                    if (count < best.Length)
+                    {
+                        int index = count++;
+                        while (index > 0 && CompareProfilerHierarchyCandidates(best[(index - 1) / 2], candidate) > 0)
+                        {
+                            best[index] = best[(index - 1) / 2];
+                            index = (index - 1) / 2;
+                        }
+                        best[index] = candidate;
+                    }
+                    else if (CompareProfilerHierarchyCandidates(candidate, best[0]) > 0)
+                    {
+                        int index = 0;
+                        while (index * 2 + 1 < count)
+                        {
+                            int child = index * 2 + 1;
+                            if (child + 1 < count && CompareProfilerHierarchyCandidates(best[child + 1], best[child]) < 0) child++;
+                            if (CompareProfilerHierarchyCandidates(best[child], candidate) >= 0) break;
+                            best[index] = best[child];
+                            index = child;
+                        }
+                        best[index] = candidate;
+                    }
+                }
 
                 children.Clear();
                 frameData.GetItemChildren(itemId, children);
                 for (int i = children.Count - 1; i >= 0; i--)
                     stack.Push(children[i]);
             }
+            Array.Sort(best, 0, count, ProfilerHierarchyCandidateComparer.Instance);
+            for (int i = 0; i < count; i++)
+                export.Rows.Add(BuildProfilerHierarchyRow(frameData, best[i].Item, best[i].Path));
+        }
+
+        private sealed class ProfilerHierarchyCandidateComparer : IComparer<ProfilerHierarchyCandidate>
+        {
+            internal static readonly ProfilerHierarchyCandidateComparer Instance = new ProfilerHierarchyCandidateComparer();
+            public int Compare(ProfilerHierarchyCandidate a, ProfilerHierarchyCandidate b) { return CompareProfilerHierarchyCandidates(b, a); }
+        }
+
+        private static int CompareProfilerHierarchyCandidates(ProfilerHierarchyCandidate a, ProfilerHierarchyCandidate b)
+        {
+            int score = a.Score.CompareTo(b.Score);
+            return score != 0 ? score : b.Item.CompareTo(a.Item);
         }
 
         private static RuntimeProfilerFrameRow BuildProfilerHierarchyRow(
             HierarchyFrameDataView frameData,
-            int itemId)
+            int itemId, string path)
         {
-            string path = "";
-            try
-            {
-                path = GetProfilerHierarchyItemPath(frameData, itemId);
-            }
-            catch
-            {
-            }
-
             return new RuntimeProfilerFrameRow
             {
                 Depth = frameData.GetItemDepth(itemId),
                 Name = frameData.GetItemName(itemId) ?? "",
-                Path = path,
+                Path = path ?? frameData.GetItemPath(itemId),
                 TotalMs = GetProfilerHierarchyColumn(frameData, itemId, HierarchyFrameDataView.columnTotalTime),
                 SelfMs = GetProfilerHierarchyColumn(frameData, itemId, HierarchyFrameDataView.columnSelfTime),
                 TotalPercent = GetProfilerHierarchyColumn(frameData, itemId, HierarchyFrameDataView.columnTotalPercent),
@@ -1517,22 +1494,6 @@ namespace Locus
             {
                 return 0;
             }
-        }
-
-        private static string GetProfilerHierarchyItemPath(HierarchyFrameDataView frameData, int itemId)
-        {
-            MethodInfo method = typeof(HierarchyFrameDataView).GetMethod(
-                "GetItemPath",
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-                null,
-                new[] { typeof(int) },
-                null
-            );
-            if (method == null)
-                return "";
-
-            object value = method.Invoke(frameData, new object[] { itemId });
-            return value != null ? value.ToString() : "";
         }
 
         private static string RunStatesResultDirectory()

@@ -33,7 +33,6 @@ namespace Locus
         private const int NativeInitialBufferSize = 64 * 1024;
         private const int MaxNativeRequestsPerUpdate = 16;
         private const int MaxNativeActiveManagedRequests = 32;
-        private const double NativeStatusPublishIntervalSeconds = 0.25;
         private const double NativeBackgroundHookRefreshIntervalSeconds = 1.0;
         private const string SessionKey_NativeGeneration = "Locus_NativeGeneration";
         private const string NativePipePrefix = @"\\.\pipe\";
@@ -53,7 +52,11 @@ namespace Locus
         private static long _nativeGeneration;
         private static byte[] _nativeBuffer;
         private static int _nativeActiveRequests;
-        private static double _lastNativeStatusPublishAt = -1.0;
+        private static bool _nativeExecutionTrackingAvailable = true;
+        private static bool _nativePublishedPlaying;
+        private static bool _nativePublishedPaused;
+        private static string _nativePublishedScene;
+        private static string _nativePublishedAdditionalScenes;
         private static double _lastNativeBackgroundHookCheckAt = -1.0;
         private static bool _nativeBackgroundHookApplied;
 
@@ -79,6 +82,9 @@ namespace Locus
 
         [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
         private static extern void locus_managed_heartbeat(long generation);
+
+        [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void locus_managed_execution(int active);
 
         [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
         private static extern void locus_set_capabilities(byte[] caps, int capsLen);
@@ -396,16 +402,16 @@ namespace Locus
 
         private static void NativePublishHeartbeat()
         {
-            double now = EditorApplication.timeSinceStartup;
-            if (_lastNativeStatusPublishAt < 0 || now - _lastNativeStatusPublishAt >= NativeStatusPublishIntervalSeconds)
-            {
-                RefreshCachedEditorState();
-                NativeSetManagedState(ManagedStateReady);
-                _lastNativeStatusPublishAt = now;
-                return;
-            }
-
+            // A fixed-cost pulse only. Scene enumeration, clocks, JSON and
+            // publication must not be part of the Editor heartbeat.
             locus_managed_heartbeat(_nativeGeneration);
+        }
+
+        private static void NativeReportExecution(bool active)
+        {
+            if (!_nativeBridgeActive || !_nativeExecutionTrackingAvailable) return;
+            try { locus_managed_execution(active ? 1 : 0); }
+            catch (EntryPointNotFoundException) { _nativeExecutionTrackingAvailable = false; }
         }
 
         private static void NativePublishEditorStatusNow()
@@ -415,7 +421,15 @@ namespace Locus
 
             RefreshCachedEditorState();
             NativeSetManagedState(ManagedStateReady);
-            _lastNativeStatusPublishAt = EditorApplication.timeSinceStartup;
+        }
+
+        private static void NativePublishChangedEditorState()
+        {
+            if (!_nativeBridgeActive) return;
+            if (_nativePublishedPlaying == _isPlaying && _nativePublishedPaused == _isPaused
+                && _nativePublishedScene == _activeScenePath
+                && _nativePublishedAdditionalScenes == _additionalOpenScenePathsStatus) return;
+            NativeSetManagedState(ManagedStateReady);
         }
 
         private static void NativeSetManagedState(int state)
@@ -427,6 +441,10 @@ namespace Locus
                 {
                     int statusLen = EncodeUtf8Reusing(status, ref _nativeEncodeBufferA);
                     locus_set_managed_state(state, _nativeGeneration, _nativeEncodeBufferA, statusLen);
+                    _nativePublishedPlaying = _isPlaying;
+                    _nativePublishedPaused = _isPaused;
+                    _nativePublishedScene = _activeScenePath;
+                    _nativePublishedAdditionalScenes = _additionalOpenScenePathsStatus;
                 }
             }
             catch (Exception ex)
@@ -543,7 +561,10 @@ namespace Locus
             bool wasApplied = _nativeBackgroundHookApplied;
             _nativeBackgroundHookApplied = rc > 0;
             if (_nativeBackgroundHookApplied && !wasApplied)
+            {
+                LocusEditorScheduling.RefreshInteractionMode();
                 Debug.Log("[Locus] Native background hook active (" + rc + " symbols).");
+            }
         }
 
         private static void NativeRefreshBackgroundHook(bool force)
@@ -559,7 +580,7 @@ namespace Locus
             if (NativeBackgroundHookEnabled())
                 NativeApplyBackgroundHook();
             else
-                NativeRestoreBackgroundHook();
+                NativeRestoreBackgroundHook(force);
         }
 
         private static void NativeRefreshBackgroundHook()
@@ -567,14 +588,19 @@ namespace Locus
             NativeRefreshBackgroundHook(false);
         }
 
-        private static void NativeRestoreBackgroundHook()
+        private static void NativeRestoreBackgroundHook(bool forceRefresh = false)
         {
             if (!_nativeBridgeActive)
                 return;
 
             int rc = NativeSetBackgroundHookActive(false);
             if (rc >= 0)
+            {
+                bool shouldRefresh = _nativeBackgroundHookApplied || forceRefresh;
                 _nativeBackgroundHookApplied = false;
+                if (shouldRefresh)
+                    LocusEditorScheduling.RefreshInteractionMode();
+            }
         }
 
         private static int NativeSetBackgroundHookActive(bool active)

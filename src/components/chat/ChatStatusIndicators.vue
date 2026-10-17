@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { BookOpen, CodeXml, Database, Plug, Zap, type IconNode } from "lucide";
+import { confirm } from "@tauri-apps/plugin-dialog";
+import { BookOpen, CodeXml, Database, Plug, Server, Zap, type IconNode } from "lucide";
+import { useClaudeConnectionStatus } from "../../composables/useClaudeConnectionStatus";
+import { useClaudePrewarm } from "../../composables/useClaudePrewarm";
+import { claudePrewarmSettings, connectClaudeSession } from "../../services/claudeConnection";
+import { useModelStore } from "../../stores/model";
+import { formatClaudeSshAddress } from "../../utils/claudeSshAddress";
 import { t } from "../../i18n";
 import { listWorkspaceAgentInjectedItems } from "../../services/agent";
 import {
@@ -19,7 +25,7 @@ import {
 } from "../../services/csharpLsp";
 import { normalizeAppError } from "../../services/errors";
 import type { WorkspaceRef } from "../../services/project";
-import { closeHeadlessUnityProject } from "../../services/unity";
+import { closeHeadlessUnityProject, restartUnresponsiveUnityProject } from "../../services/unity";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import {
   knowledgeGetEmbeddingStatus,
@@ -45,6 +51,7 @@ import type {
   UnityConnectionStatus,
   UnityEditorProcessState,
   UnityNativeBrokerStatus,
+  UnityHangDiagnosis,
   UnitySemanticState,
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
@@ -60,9 +67,9 @@ import {
   type ProjectCapabilityId,
 } from "../icons/projectIcons";
 
-type StatusId = "assetDb" | "unity" | "knowledge" | "code" | "hotReload" | "mcp";
+type StatusId = "assetDb" | "unity" | "knowledge" | "code" | "hotReload" | "mcp" | "claude";
 type StatusTone = "success" | "danger" | "warning" | "accent" | "muted";
-type StatusIcon = "database" | "unity" | "knowledge" | "code" | "hotReload" | "mcp";
+type StatusIcon = "database" | "unity" | "knowledge" | "code" | "hotReload" | "mcp" | "claude";
 type UnityPluginNotice = "missing" | "outdated";
 type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 type UnitySemanticPhaseTone = Record<string, StatusTone>;
@@ -73,6 +80,8 @@ interface StatusDetailRow {
   mono?: boolean;
   /** primary = key facts (emphasized); diagnostic = collapsed troubleshooting rows. */
   tier?: "primary" | "diagnostic";
+  /** Preserve line breaks (stack traces, note lists). */
+  multiline?: boolean;
 }
 
 interface StatusItem {
@@ -98,9 +107,14 @@ const STATUS_ICONS: Record<StatusIcon, IconNode> = {
   code: CodeXml,
   hotReload: Zap,
   mcp: Plug,
+  claude: Server,
 };
 
 const props = defineProps<{
+  sessionId?: string | null;
+  selectedModelId?: string;
+  active?: boolean;
+  isStreaming?: boolean;
   unityConnected?: boolean;
   unityPluginStatus?: UnityPluginNotice | null;
   unityPluginInstalling?: boolean;
@@ -114,6 +128,7 @@ const props = defineProps<{
   scanPhase?: AssetDbScanEvent | null;
   lastScanStats?: ScanStats | null;
   knowledgeAccessMode?: KnowledgeAccessMode;
+  knowledgeEnabled?: boolean;
   selectedAgentId?: string;
 }>();
 
@@ -145,6 +160,9 @@ const unitySemanticState = ref<UnitySemanticState | null>(null);
 const unitySemanticError = ref("");
 const unityHeadlessClosing = ref(false);
 const unityHeadlessCloseError = ref("");
+const unityRestarting = ref(false);
+const unityRestartError = ref("");
+let unityRestartVersion = 0;
 let unitySemanticPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
 let unitySemanticSeq = 0;
 let unitySemanticDisposed = false;
@@ -280,6 +298,82 @@ function unitySemanticSafetyLabel(action: string | null | undefined) {
   const key = `chat.status.unity.safety.${normalized}`;
   const label = t(key);
   return label === key ? normalized : label;
+}
+
+const UNITY_HANG_STACK_FRAMES = 12;
+
+function translatedOr(key: string, fallback: string, ...args: (string | number)[]): string {
+  const label = t(key, ...args);
+  return label === key ? fallback : label;
+}
+
+/** One-line verdict: what the main thread is doing, how busy it is, whose code. */
+function unityHangVerdictText(diagnosis: UnityHangDiagnosis): string {
+  if (diagnosis.status === "running") return t("chat.status.unity.hang.running");
+  if (diagnosis.status === "failed") return t("chat.status.unity.hang.failed");
+  const verdict = translatedOr(
+    `chat.status.unity.hang.verdict.${diagnosis.verdict || "unknown"}`,
+    t("chat.status.unity.hang.verdict.unknown"),
+  );
+  const details: string[] = [];
+  if (typeof diagnosis.cpuPercent === "number" && Number.isFinite(diagnosis.cpuPercent)) {
+    details.push(t("chat.status.unity.hang.cpu", Math.round(diagnosis.cpuPercent)));
+  }
+  const origin = diagnosis.location?.origin;
+  if (origin) {
+    const originLabel = translatedOr(`chat.status.unity.hang.origin.${origin}`, "");
+    if (originLabel) details.push(originLabel);
+  }
+  return details.length > 0
+    ? t("chat.status.unity.hang.withDetail", verdict, details.join(t("chat.status.unity.hang.detailSeparator")))
+    : verdict;
+}
+
+function unityHangPrimaryRows(diagnosis: UnityHangDiagnosis): StatusDetailRow[] {
+  const rows: StatusDetailRow[] = [{
+    label: t("chat.status.unity.hang.diagnosis"),
+    value: unityHangVerdictText(diagnosis),
+    tier: "primary",
+  }];
+  if (diagnosis.status === "complete" && diagnosis.location?.display) {
+    const unnamed = diagnosis.locationReason === "managed_unnamed";
+    rows.push({
+      label: t("chat.status.unity.hang.location"),
+      value: unnamed ? t("chat.status.unity.hang.unnamedManaged") : diagnosis.location.display,
+      mono: !unnamed,
+      tier: "primary",
+    });
+  }
+  return rows;
+}
+
+function unityHangDiagnosticRows(diagnosis: UnityHangDiagnosis): StatusDetailRow[] {
+  const rows: StatusDetailRow[] = [];
+  if (diagnosis.frames.length > 0) {
+    const shown = diagnosis.frames.slice(0, UNITY_HANG_STACK_FRAMES)
+      .map((frame) => `#${frame.index} ${frame.display}`);
+    if (diagnosis.frames.length > UNITY_HANG_STACK_FRAMES) shown.push("…");
+    rows.push({ label: t("chat.status.unity.hang.stack"), value: shown.join("\n"), mono: true, multiline: true });
+  }
+  if (diagnosis.waitingOn) {
+    rows.push({ label: t("chat.status.unity.hang.waitingOn"), value: diagnosis.waitingOn, mono: true });
+  }
+  if (diagnosis.source) {
+    const parts = [translatedOr(`chat.status.unity.hang.source.${diagnosis.source}`, diagnosis.source)];
+    if (diagnosis.sampleCount > 0) {
+      parts.push(diagnosis.stackStable === false
+        ? t("chat.status.unity.hang.samplesChanging", diagnosis.sampleCount)
+        : t("chat.status.unity.hang.samples", diagnosis.sampleCount));
+    }
+    rows.push({ label: t("chat.status.unity.hang.source"), value: parts.join(" · ") });
+  }
+  if (diagnosis.error) {
+    rows.push({ label: t("chat.status.unity.hang.error"), value: diagnosis.error, mono: true });
+  }
+  if (diagnosis.notes && diagnosis.notes.length > 0) {
+    rows.push({ label: t("chat.status.unity.hang.notes"), value: diagnosis.notes.join("\n"), multiline: true });
+  }
+  return rows;
 }
 
 function unitySemanticSourceLabel(source: string | null | undefined, confidence: string | null | undefined) {
@@ -439,6 +533,8 @@ const unityConnectionFallbackSummary = computed(() => {
 });
 
 const unitySummary = computed(() => {
+  if (unityRestarting.value) return t("chat.status.unity.restarting");
+  if (unitySemanticPhase.value === "unresponsive") return unitySemanticSummaryLabel(unitySemanticState.value!);
   if (unityPluginLabel.value) return unityPluginLabel.value;
   if (unityLaunchInFlight.value) return unityConnectionFallbackSummary.value;
   if (unitySemanticState.value) return unitySemanticSummaryLabel(unitySemanticState.value);
@@ -457,6 +553,8 @@ const unityFallbackTone = computed<StatusTone>(() =>
 );
 
 const unityTone = computed<StatusTone>(() => {
+  if (unityRestarting.value) return "accent";
+  if (unitySemanticPhase.value === "unresponsive") return "danger";
   if (props.unityPluginStatus) return "danger";
   if (unityLaunchInFlight.value) return "accent";
   if (unitySemanticState.value) {
@@ -484,7 +582,18 @@ const unityCanCloseHeadless = computed(() =>
   && unityEditorProcessState.value === "running",
 );
 
+const unityCanRestart = computed(() =>
+  isUnityProject.value && !!props.workspaceRef
+  && unitySemanticPhase.value === "unresponsive"
+  && unitySemanticState.value?.safety.recommendedAction === "diagnose_hang"
+  && unitySemanticState.value?.process.state === "running"
+  && typeof unitySemanticState.value?.process.pid === "number"
+  && typeof unitySemanticState.value?.process.pidCreatedAtMs === "number",
+);
+
 const unityActionLabel = computed(() => {
+  if (unityRestarting.value) return t("chat.status.unity.restarting");
+  if (unityCanRestart.value) return t("chat.status.unity.restart");
   if (props.unityPluginStatus) {
     if (props.unityPluginInstalling) return t("app.plugin.installing");
     return props.unityPluginStatus === "missing"
@@ -505,6 +614,7 @@ const unityActionLabel = computed(() => {
 });
 
 const unityActionTitle = computed(() => {
+  if (unityCanRestart.value || unityRestarting.value) return t("chat.status.unity.restartTitle");
   if (props.unityPluginStatus) return unityActionLabel.value;
   if (unityCanCloseHeadless.value) return t("chat.status.unity.closeHeadlessTitle");
   if (effectiveUnityLaunchState.value === "starting") return t("chat.status.unity.launchingTitle");
@@ -686,7 +796,7 @@ async function refreshStateProbeStatus() {
 const unityRows = computed<StatusDetailRow[]>(() => {
   const rows: StatusDetailRow[] = [];
   const status = props.unityConnectionStatus ?? null;
-  const semantic = unityLaunchInFlight.value ? null : unitySemanticState.value;
+  const semantic = unityLaunchInFlight.value && unitySemanticPhase.value !== "unresponsive" ? null : unitySemanticState.value;
   const phaseLabel = semantic ? unitySemanticPhaseLabel(semantic.phase) : "";
   const diagnostics: StatusDetailRow[] = [];
 
@@ -702,6 +812,14 @@ const unityRows = computed<StatusDetailRow[]>(() => {
       value: unitySemanticSafetyLabel(semantic.safety.recommendedAction),
       tier: "primary",
     });
+    if (semantic.phase === "unresponsive" && semantic.mainThread.heartbeatAgeMs != null) {
+      rows.push({ label: t("chat.status.unity.unresponsiveFor"),
+        value: t("chat.status.unity.seconds", Math.floor(semantic.mainThread.heartbeatAgeMs / 1000)), tier: "primary" });
+    }
+    if (semantic.phase === "unresponsive" && semantic.hangDiagnosis) {
+      rows.push(...unityHangPrimaryRows(semantic.hangDiagnosis));
+      diagnostics.push(...unityHangDiagnosticRows(semantic.hangDiagnosis));
+    }
     if (
       semantic.detail
       && (
@@ -750,7 +868,7 @@ const unityRows = computed<StatusDetailRow[]>(() => {
   if (status?.scenePath) {
     rows.push({ label: t("chat.status.unity.scene"), value: status.scenePath, mono: true });
   }
-  if (typeof status?.latencyMs === "number") {
+  if (semantic?.phase !== "unresponsive" && typeof status?.latencyMs === "number") {
     rows.push({ label: t("chat.status.unity.latency"), value: formatElapsed(status.latencyMs) });
   }
   if (status?.backgroundHook) {
@@ -762,6 +880,9 @@ const unityRows = computed<StatusDetailRow[]>(() => {
 
   // --- Diagnostics: only needed when troubleshooting; collapsed by default. ---
   if (semantic) {
+    if (semantic.mainThread.activeExecutions != null && semantic.mainThread.activeExecutions > 0) {
+      diagnostics.push({ label: t("chat.status.unity.activeExecutions"), value: String(semantic.mainThread.activeExecutions) });
+    }
     diagnostics.push({
       label: t("chat.status.unity.source"),
       value: unitySemanticSourceLabel(semantic.source, semantic.confidence),
@@ -1000,8 +1121,6 @@ const knowledgeRows = computed<StatusDetailRow[]>(() => {
   ];
 });
 
-// Until the first status fetch succeeds, assume the platform is supported so
-// the toggle stays reachable; a failing toggle then surfaces its error below.
 const codeSupported = computed(() =>
   csharpLsp.value ? csharpLsp.value.supported : true,
 );
@@ -1726,6 +1845,60 @@ async function toggleMcpServer(server: McpServerRuntimeStatus) {
   }
 }
 
+const claudeConnection = useClaudeConnectionStatus();
+const claudeModelStore = useModelStore();
+const claudeConnectBusy = ref(false);
+const claudeConnectError = ref("");
+watch(() => [claudeConnection.phase.value, claudePrewarmSettings.value.scope], () => {
+  claudeConnectError.value = "";
+});
+const claudeConnecting = computed(() => claudeConnectBusy.value
+  || claudeConnection.phase.value === "connecting" || claudeConnection.phase.value === "starting");
+const claudeConnectModel = computed(() => props.selectedModelId?.startsWith("claude_code/") ? props.selectedModelId
+  : (claudeModelStore.allModels.find(model => model.provider === "claude_code" && model.isDefault)
+    ?? claudeModelStore.allModels.find(model => model.provider === "claude_code"))?.id ?? "claude_code/");
+async function connectClaude() {
+  if (claudeConnectBusy.value || !props.workspaceRef || !claudeConnectModel.value) return;
+  claudeConnectBusy.value = true;
+  claudeConnectError.value = "";
+  const scope = claudePrewarmSettings.value.scope;
+  try {
+    await connectClaudeSession(claudeConnectModel.value, props.workspaceRef);
+  } catch (error) {
+    if (scope === claudePrewarmSettings.value.scope && claudeConnection.phase.value !== "ready") {
+      claudeConnectError.value = normalizeAppError(error).message;
+    }
+  } finally {
+    claudeConnectBusy.value = false;
+  }
+}
+useClaudePrewarm(() => ({ sessionId: props.sessionId ?? null, modelId: props.selectedModelId ?? "",
+  active: props.active !== false, busy: !!props.isStreaming, workspaceRef: props.workspaceRef }));
+const claudeSummary = computed(() => t(`chat.status.claude.${claudeConnection.phase.value}`));
+const claudeTone = computed<StatusTone>(() => {
+  const phase = claudeConnection.phase.value;
+  if (phase === "ready") return "success";
+  if (phase === "connecting" || phase === "starting") return "warning";
+  return "muted";
+});
+const claudeRows = computed<StatusDetailRow[]>(() => {
+  const status = claudeConnection.status.value;
+  if (!status) return [];
+  const target = formatClaudeSshAddress(status);
+  const rows: StatusDetailRow[] = [
+    { label: t("chat.status.claude.server"), value: target, mono: true },
+    { label: t("chat.status.claude.latency"), value: status.latencyMs == null ? "—" : `${Math.round(status.latencyMs)} ms`, mono: true },
+  ];
+  if (status.pool) {
+    const pool = status.pool;
+    rows.push({ label: t("chat.status.claude.pool"), value: t(`chat.status.claude.pool.${pool.state}`) });
+    if (pool.state !== "disabled") rows.push({ label: t("chat.status.claude.spares"), value: `${pool.ready} / ${pool.capacity}`, mono: true });
+    if (pool.starting) rows.push({ label: t("chat.status.claude.pool.warming"), value: String(pool.starting), mono: true });
+    rows.push({ label: t("chat.status.claude.sessions"), value: t("chat.status.claude.sessionCounts", pool.active, pool.retained) });
+  }
+  return rows;
+});
+
 const statusItems = computed<StatusItem[]>(() => {
   const items: StatusItem[] = [
   {
@@ -1753,13 +1926,13 @@ const statusItems = computed<StatusItem[]>(() => {
     rows: unityRows.value,
     actionLabel: unityActionLabel.value,
     actionTitle: unityActionTitle.value,
-    actionDisabled: props.unityPluginStatus
+    actionDisabled: unityRestarting.value || (unityCanRestart.value ? false : props.unityPluginStatus
       ? props.unityPluginInstalling
       : unityHeadlessClosing.value
         || unityRecompileWaitingConnection.value
         || effectiveUnityLaunchState.value !== "idle"
-        || !isUnityProject.value,
-    actionVariant: unityCanCloseHeadless.value
+        || !isUnityProject.value),
+    actionVariant: unityCanRestart.value || unityCanCloseHeadless.value
       ? "danger"
       : props.unityPluginStatus ? "neutral" : "primary",
   },
@@ -1822,15 +1995,35 @@ const statusItems = computed<StatusItem[]>(() => {
         },
       ]
     : []),
+  ...(claudeConnection.visible.value ? [{
+    id: "claude" as const,
+    icon: "claude" as const,
+    title: t("model.provider.claude_code.remote"),
+    summary: claudeSummary.value,
+    inlineLabel: claudeSummary.value,
+    tone: claudeTone.value,
+    rows: claudeRows.value,
+    actionLabel: claudeConnection.phase.value === "ready" ? ""
+      : t(claudeConnecting.value ? "chat.status.claude.connecting" : "chat.status.claude.connect"),
+    actionDisabled: claudeConnecting.value || !props.workspaceRef || !claudeConnectModel.value,
+    actionVariant: "neutral" as const,
+  }] : []),
   ];
   return items.filter((item) => (
-    !item.requiredCapability || hasProjectCapability(item.requiredCapability)
+    (item.id !== "knowledge" || props.knowledgeEnabled !== false)
+    && (item.id !== "code" || csharpLsp.value?.enabled === true)
+    && (item.id !== "hotReload" || hotReloadEnabled.value)
+    && (!item.requiredCapability || hasProjectCapability(item.requiredCapability))
   ));
 });
 
 const activeItem = computed(() =>
   statusItems.value.find((item) => item.id === activePopover.value) ?? null,
 );
+
+watch(() => activeItem.value?.id, (id) => {
+  if (!id) closePopover();
+});
 
 const activeMainRows = computed(() =>
   (activeItem.value?.rows ?? []).filter((row) => row.tier !== "diagnostic"),
@@ -1957,10 +2150,16 @@ async function loadKnowledgeStatus() {
 }
 
 function runStatusAction(item: StatusItem) {
-  if (item.id === "assetDb") {
+  if (item.id === "claude") {
+    void connectClaude();
+    return;
+  } else if (item.id === "assetDb") {
     emit("startScan");
   } else if (item.id === "unity") {
-    if (props.unityPluginStatus) {
+    if (unityCanRestart.value) {
+      void restartUnresponsiveUnity();
+      return;
+    } else if (props.unityPluginStatus) {
       emit("installPlugin");
     } else if (unityCanCloseHeadless.value) {
       void closeRunningHeadlessUnity();
@@ -1991,6 +2190,32 @@ async function closeRunningHeadlessUnity() {
     unityHeadlessCloseError.value = normalizeAppError(error).message;
   } finally {
     unityHeadlessClosing.value = false;
+  }
+}
+
+async function restartUnresponsiveUnity() {
+  const workspaceRef = props.workspaceRef;
+  const process = unitySemanticState.value?.process;
+  if (!workspaceRef || !unityCanRestart.value || unityRestarting.value
+    || process?.pid == null || process.pidCreatedAtMs == null) return;
+  const scope = { ...workspaceRef };
+  const version = ++unityRestartVersion;
+  const scopeKey = JSON.stringify(scope);
+  const isCurrentScope = () => !unitySemanticDisposed && version === unityRestartVersion && JSON.stringify(props.workspaceRef) === scopeKey;
+  unityRestarting.value = true;
+  unityRestartError.value = "";
+  try {
+    const approved = await confirm(t("chat.status.unity.restartConfirm"), {
+      title: t("chat.status.unity.restartTitle"), kind: "warning",
+      okLabel: t("chat.status.unity.restart"), cancelLabel: t("common.cancel"),
+    });
+    if (!approved || !isCurrentScope()) return;
+    await restartUnresponsiveUnityProject(scope, process.pid, process.pidCreatedAtMs);
+    if (isCurrentScope()) await refreshUnitySemanticState();
+  } catch (error) {
+    if (isCurrentScope()) unityRestartError.value = normalizeAppError(error).message;
+  } finally {
+    if (isCurrentScope()) unityRestarting.value = false;
   }
 }
 
@@ -2031,6 +2256,11 @@ onMounted(() => {
 watch(
   () => `${workspaceScopeKey()}::${projectServicesKey.value}`,
   () => {
+    unityRestartVersion++;
+    unityRestarting.value = false;
+    unityRestartError.value = "";
+    unitySemanticState.value = null;
+    void refreshUnitySemanticState();
     void bindCsharpLspStatus();
     void bindHotReloadStatus();
     void refreshHotReloadOptimization();
@@ -2052,6 +2282,7 @@ watch(
   () => [
     props.workingDir ?? "",
     projectServicesKey.value,
+    String(props.knowledgeEnabled ?? true),
     String(props.unityConnected ?? false),
     String(props.unityConnectionStatus?.checkedAtMs ?? 0),
     String(props.unityRecompiling ?? false),
@@ -2060,9 +2291,6 @@ watch(
     clearUnitySemanticPoll();
     void refreshUnitySemanticState();
     scheduleUnitySemanticPoll();
-    if (activePopover.value && !statusItems.value.some((item) => item.id === activePopover.value)) {
-      closePopover();
-    }
   },
 );
 
@@ -2088,45 +2316,47 @@ onUnmounted(() => {
 <template>
   <div class="chat-status-indicators" @click.stop>
     <div class="chat-status-icon-row">
-      <button
-        v-for="item in statusItems"
-        :key="item.id"
-        type="button"
-        class="chat-status-icon-btn ui-select-none"
-        :class="[
-          `tone-${item.tone}`,
-          {
-            active: activePopover === item.id,
-            'is-scanning': (item.id === 'assetDb' && isScanning)
-              || (item.id === 'unity' && unitySemanticBusy)
-              || (item.id === 'code' && codeTransitional)
-              || (item.id === 'hotReload' && hotReloadBusy),
-          },
-        ]"
-        :aria-label="`${item.title}: ${item.summary}`"
-        :aria-expanded="activePopover === item.id"
-        @click="togglePopover(item.id)"
-      >
-        <svg
-          class="chat-status-icon"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
-          focusable="false"
+      <template v-for="item in statusItems" :key="item.id">
+        <slot v-if="item.id === 'claude'" />
+        <button
+          type="button"
+          class="chat-status-icon-btn ui-select-none"
+          :class="[
+            `tone-${item.tone}`,
+            {
+              active: activePopover === item.id,
+              'is-scanning': (item.id === 'assetDb' && isScanning)
+                || (item.id === 'unity' && unitySemanticBusy)
+                || (item.id === 'code' && codeTransitional)
+                || (item.id === 'hotReload' && hotReloadBusy),
+            },
+          ]"
+          :aria-label="`${item.title}: ${item.summary}`"
+          :aria-expanded="activePopover === item.id"
+          @click="togglePopover(item.id)"
         >
-          <component
-            :is="tag"
-            v-for="([tag, attrs], idx) in statusIconNode(item.icon)"
-            :key="idx"
-            v-bind="attrs"
-          />
-        </svg>
-        <span class="chat-status-icon-label">{{ item.inlineLabel }}</span>
-      </button>
+          <svg
+            class="chat-status-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+            focusable="false"
+          >
+            <component
+              :is="tag"
+              v-for="([tag, attrs], idx) in statusIconNode(item.icon)"
+              :key="idx"
+              v-bind="attrs"
+            />
+          </svg>
+          <span class="chat-status-icon-label">{{ item.inlineLabel }}</span>
+        </button>
+      </template>
+      <slot v-if="!claudeConnection.visible.value" />
     </div>
 
     <Transition name="status-popover">
@@ -2228,15 +2458,21 @@ onUnmounted(() => {
         <dl v-if="activeMainRows.length > 0" class="chat-status-detail-list">
           <template v-for="row in activeMainRows" :key="`${row.label}:${row.value}`">
             <dt :class="{ 'is-primary': row.tier === 'primary' }">{{ row.label }}</dt>
-            <dd :class="{ 'is-mono': row.mono, 'is-primary': row.tier === 'primary' }">{{ row.value }}</dd>
+            <dd :class="{ 'is-mono': row.mono, 'is-primary': row.tier === 'primary', 'is-multiline': row.multiline }">{{ row.value }}</dd>
           </template>
         </dl>
+        <span v-if="activeItem.id === 'unity' && unityRestartError" class="chat-status-codeopt-error" role="alert">
+          {{ unityRestartError }}
+        </span>
+        <span v-if="activeItem.id === 'claude' && claudeConnectError" class="chat-status-codeopt-error">
+          {{ claudeConnectError }}
+        </span>
         <details v-if="activeDiagnosticRows.length > 0" class="chat-status-diagnostics">
           <summary>{{ diagnosticsLabel }}</summary>
           <dl class="chat-status-detail-list">
             <template v-for="row in activeDiagnosticRows" :key="`${row.label}:${row.value}`">
               <dt>{{ row.label }}</dt>
-              <dd :class="{ 'is-mono': row.mono }">{{ row.value }}</dd>
+              <dd :class="{ 'is-mono': row.mono, 'is-multiline': row.multiline }">{{ row.value }}</dd>
             </template>
           </dl>
         </details>
@@ -2484,6 +2720,12 @@ onUnmounted(() => {
   font-family: var(--font-mono-identifier);
   font-size: 11px;
   line-height: 1.4;
+}
+
+.chat-status-detail-list dd.is-multiline {
+  white-space: pre-wrap;
+  max-height: 220px;
+  overflow-y: auto;
 }
 
 .chat-status-detail-list dt.is-primary {

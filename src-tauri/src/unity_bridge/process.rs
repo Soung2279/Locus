@@ -204,6 +204,29 @@ pub async fn force_close_current_project_unity_processes(
     close_current_project_unity_processes_inner(project_path, timeout, true).await
 }
 
+/// Recovery is tied to the process the user actually confirmed. Do not close
+/// a replacement Editor or enumerate/kill every Unity process on the machine.
+pub(crate) async fn force_close_editor_identity(
+    project_path: &str, process_id: u32, created_at_ms: u64, timeout: Duration,
+) -> Result<UnityProjectProcessCloseResult, String> {
+    let project = project_path.to_string();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(windows)]
+        {
+            let current = query_current_project_editor_process_uncached(project);
+            if current.process_id != Some(process_id) {
+                return Err("Unity process changed; refresh its status before restarting".to_string());
+            }
+            probe_native::terminate_identity(process_id, created_at_ms, timeout)
+        }
+        #[cfg(not(windows))]
+        { let _ = (project, process_id, created_at_ms, timeout); Err("Unity recovery restart is only supported on Windows".to_string()) }
+    }).await.map_err(|error| error.to_string())??;
+    unity_process_probe_cache().lock().await.remove(&process_cache_key(project_path));
+    super::invalidate_closed_editor_status(project_path);
+    Ok(UnityProjectProcessCloseResult { process_ids: vec![process_id], forced_process_ids: vec![process_id] })
+}
+
 async fn close_current_project_unity_processes_inner(
     project_path: &str,
     timeout: Duration,
@@ -1038,6 +1061,8 @@ mod probe_native {
 
     unsafe extern "system" {
         fn CloseHandle(h_object: Handle) -> Bool;
+        fn TerminateProcess(h_process: Handle, exit_code: u32) -> Bool;
+        fn WaitForSingleObject(h_handle: Handle, milliseconds: Dword) -> Dword;
         fn OpenProcess(
             dw_desired_access: Dword,
             b_inherit_handle: Bool,
@@ -1099,6 +1124,26 @@ mod probe_native {
         pub(super) created_at_unix_ms: Option<u64>,
     }
 
+    pub(super) fn terminate_identity(process_id: u32, created_at_ms: u64, timeout: std::time::Duration) -> Result<(), String> {
+        const PROCESS_TERMINATE: Dword = 0x0001;
+        const SYNCHRONIZE: Dword = 0x0010_0000;
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, process_id) };
+        if raw.is_null() { return Err(format!("Cannot open Unity process for restart: {}", std::io::Error::last_os_error())); }
+        let handle = OwnedHandle(raw);
+        // Compare and terminate through the same kernel handle: PID reuse
+        // between validation and termination cannot target a new process.
+        if query_creation_unix_ms(&handle) != Some(created_at_ms) {
+            return Err("Unity process identity changed; restart was not performed".to_string());
+        }
+        if unsafe { TerminateProcess(handle.0, 1) } == 0 {
+            return Err(format!("Failed to stop the unresponsive Unity Editor: {}", std::io::Error::last_os_error()));
+        }
+        if unsafe { WaitForSingleObject(handle.0, timeout.as_millis().min(u32::MAX as u128 - 1) as u32) } != 0 {
+            return Err("Unity did not exit within the restart timeout".to_string());
+        }
+        Ok(())
+    }
+
     pub(super) fn working_set_bytes(process_id: u32) -> Option<u64> {
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, process_id) };
         if handle.is_null() { return None; }
@@ -1114,6 +1159,14 @@ mod probe_native {
     fn process_memory_reports_real_bytes_and_preserves_unavailable() {
         assert!(working_set_bytes(std::process::id()).is_some_and(|bytes| bytes > 0));
         assert_eq!(working_set_bytes(u32::MAX), None);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn restart_refuses_a_reused_process_identity_before_termination() {
+        let pid = std::process::id();
+        assert!(terminate_identity(pid, 0, std::time::Duration::from_millis(1)).is_err());
+        assert!(query_process_facts(pid).unwrap().alive);
     }
 
     /// Queries liveness, image path and creation time through a single

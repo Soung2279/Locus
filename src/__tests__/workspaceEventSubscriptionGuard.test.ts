@@ -18,6 +18,18 @@ function hasOwnerPrefix(expression: ts.Expression): boolean {
     && hasOwnerPrefix(expression.left);
 }
 
+// Only calls that register a handler own a listener. Passing the event name
+// elsewhere (Map lookups in a host transport, comparisons, emits) does not.
+const LISTENER_REGISTRATION_CALLS = new Set(["listen", "once", "on", "addEventListener", "subscribe"]);
+
+function registersListener(call: ts.CallExpression): boolean {
+  const callee = call.expression;
+  const name = ts.isIdentifier(callee)
+    ? callee.text
+    : ts.isPropertyAccessExpression(callee) ? callee.name.text : "";
+  return LISTENER_REGISTRATION_CALLS.has(name);
+}
+
 describe("workspace event transport boundary", () => {
   it("allows only the window hub to own a native workspace listener and requires named consumers", () => {
     const violations: string[] = [];
@@ -46,7 +58,7 @@ describe("workspace event transport boundary", () => {
             (ts.isIdentifier(first) && names.has(first.text))
             || (ts.isStringLiteral(first) && first.text === "locus://workspace-event")
           );
-          if (workspaceEvent) {
+          if (workspaceEvent && registersListener(node)) {
             if (path === "src/services/workspaceEventHub.ts" && node.expression.getText(ast) === "listen") {
               nativeListeners += 1;
             } else {

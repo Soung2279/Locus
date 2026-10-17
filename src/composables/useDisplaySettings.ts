@@ -10,6 +10,7 @@ export type ChatDiffReviewTarget = DiffReviewTarget;
 export type GitDiffReviewTarget = DiffReviewTarget;
 export type PlanApprovalTarget = "card" | "window";
 export type MemoryFileOpenTarget = "window" | "knowledge";
+export type ViewOpenTarget = "tab" | "window";
 export type WorkspaceDisplayMode = "single" | "multi";
 export type WorkspaceSectionVisibilityKind = "knowledge" | "collab" | "assets" | "views";
 export type KnowledgeFolderKind = "plan" | "memory" | "design" | "skill" | "reference";
@@ -150,6 +151,9 @@ export interface DisplaySettings {
   hideThinkingBlocks: boolean;
   /** Show View packages in the lower section of the session list */
   showViewsInSessionPanel: boolean;
+  /** Default target for user-initiated View opens. */
+  viewOpenTarget: ViewOpenTarget;
+  viewOpenOverrides: Record<string, ViewOpenTarget>;
   /** Merge Git tree status letters into colored file icons */
   mergeGitTreeStatusIcon: boolean;
   /** Hide Git command suggestions in Git terminal */
@@ -249,6 +253,8 @@ const defaults: DisplaySettings = {
   compactToolCalls: true,
   hideThinkingBlocks: true,
   showViewsInSessionPanel: false,
+  viewOpenTarget: "tab",
+  viewOpenOverrides: {},
   mergeGitTreeStatusIcon: true,
   hideGitCommandSuggestions: false,
   systemNotificationsEnabled: true,
@@ -280,6 +286,9 @@ function load(): DisplaySettings {
         ...defaults,
         ...parsed,
         workspaceDisplayMode: parsed.workspaceDisplayMode === "multi" ? "multi" : "single",
+        viewOpenTarget: parsed.viewOpenTarget === "window" ? "window" : "tab",
+        viewOpenOverrides: Object.fromEntries(Object.entries(parsed.viewOpenOverrides ?? {})
+          .filter(([, value]) => value === "tab" || value === "window")) as Record<string, ViewOpenTarget>,
         workspaceSectionVisibility: {
           ...defaultWorkspaceSectionVisibility,
           ...parsed.workspaceSectionVisibility,

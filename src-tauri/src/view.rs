@@ -42,6 +42,8 @@ const VIEW_STORAGE_REL_PATH: &str = ".locus/data/storage.json";
 
 mod workspace;
 mod single_file;
+mod icon;
+use icon::validate_view_icon;
 #[cfg(test)]
 mod single_file_tests;
 
@@ -343,6 +345,8 @@ pub struct ViewPackageSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_scope: Option<crate::plugin::PluginInstallScope>,
 }
 
@@ -395,6 +399,14 @@ pub struct ViewDeleteEntryRequest {
 pub struct ViewRenameEntryRequest {
     pub rel_path: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewUpdateMetadataRequest {
+    pub view_id: String,
+    pub name: String,
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1079,7 +1091,13 @@ pub struct UnitySerializedPropertyWriteResult {
     pub read: UnitySerializedPropertyReadResult,
     pub saved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persisted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_snapshot: Option<UnitySerializedPropertySnapshot>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refresh_object: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1302,7 +1320,7 @@ pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        validate_view_icon_name(icon)?;
+        validate_view_icon(icon)?;
     }
     normalize_package_rel_path(&manifest.entry)?;
     if !manifest.style.is_empty() {
@@ -1332,20 +1350,6 @@ pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
         }
     }
 
-    Ok(())
-}
-
-fn validate_view_icon_name(icon: &str) -> Result<(), String> {
-    let len = icon.chars().count();
-    if len == 0 || len > 64 {
-        return Err("View icon must be between 1 and 64 characters.".to_string());
-    }
-    if !icon
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-    {
-        return Err(format!("Invalid View icon name: {}", icon));
-    }
     Ok(())
 }
 
@@ -1683,6 +1687,7 @@ fn summary_from_manifest_with_source(
         temporary,
         source: source.to_string(),
         plugin_id,
+        plugin_name: None,
         plugin_scope,
     }
 }
@@ -1719,7 +1724,7 @@ fn summary_from_plugin_view_source(
     manifest: &ViewManifest,
 ) -> ViewPackageSummary {
     let summary_root = plugin_view_summary_root(source);
-    summary_from_manifest_with_source(
+    let mut summary = summary_from_manifest_with_source(
         &summary_root,
         &source.root,
         manifest,
@@ -1728,7 +1733,9 @@ fn summary_from_plugin_view_source(
         Some(source.plugin_id.clone()),
         Some(source.scope),
         Some(plugin_view_default_display_path(source)),
-    )
+    );
+    summary.plugin_name = Some(source.plugin_name.clone());
+    summary
 }
 
 fn plugin_view_source_for_root(
@@ -2392,6 +2399,22 @@ fn set_view_manifest_name(package_root: &str, name: &str) -> Result<(), String> 
     manifest.name = normalize_view_name(name)?;
     validate_view_manifest(&manifest)?;
     write_manifest_to_root(&root, &manifest)
+}
+
+pub fn update_view_metadata_sync(
+    working_dir: &str,
+    request: ViewUpdateMetadataRequest,
+) -> Result<ViewPackageSummary, String> {
+    let _guard = lock_view_mutations();
+    let detail = read_view_sync(working_dir, &request.view_id)?;
+    ensure_no_plugin_managed_views(std::iter::once(&detail.summary), "configure")?;
+    let root = PathBuf::from(&detail.summary.package_root);
+    let mut manifest = detail.manifest;
+    manifest.name = normalize_view_name(&request.name)?;
+    manifest.icon = request.icon.map(|icon| icon.trim().to_string()).filter(|icon| !icon.is_empty());
+    validate_view_manifest(&manifest)?;
+    write_manifest_to_root(&root, &manifest)?;
+    Ok(read_view_sync(working_dir, &request.view_id)?.summary)
 }
 
 fn remove_view_package_root(views_root: &Path, root: &Path, label: &str) -> Result<(), String> {
@@ -3485,7 +3508,7 @@ pub fn create_view_sync_with_scope(
         metadata.name = Some(normalize_view_name(name)?);
     }
     if let Some(icon) = request.icon.as_deref() {
-        validate_view_icon_name(icon.trim())?;
+        validate_view_icon(icon.trim())?;
         metadata.icon = Some(icon.trim().to_string());
     }
     if let Some(unity) = request.unity {
@@ -4230,9 +4253,10 @@ fn sanitize_view_host_label(label: &str) -> Result<String, String> {
     let is_locus_view_host = normalized.starts_with(VIEW_WINDOW_LABEL_PREFIX)
         && normalized.len() > VIEW_WINDOW_LABEL_PREFIX.len()
         && !normalized.starts_with(VIEW_CONTENT_WINDOW_LABEL_PREFIX);
-    let is_unity_embed_view_host = normalized.starts_with(UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX)
-        && normalized.len() > UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX.len();
-    let is_workbench_host = normalized == MAIN_WINDOW_LABEL || normalized.starts_with("workbench-");
+    let is_unity_embed_view_host = (normalized.starts_with(UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX)
+        && normalized.len() > UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX.len())
+        || crate::unity_embed_webview::contains(normalized);
+    let is_workbench_host = is_view_workbench_window(normalized);
     if !is_locus_view_host && !is_unity_embed_view_host && !is_workbench_host {
         return Err(format!("Invalid View host window label: {}", label));
     }
@@ -4252,7 +4276,7 @@ fn view_workspace_ref_for_root(
     ))
 }
 
-fn view_workspace_scope_key(workspace_ref: &crate::workspace_service::WorkspaceRef) -> String {
+pub(crate) fn view_workspace_scope_key(workspace_ref: &crate::workspace_service::WorkspaceRef) -> String {
     let base=format!(
         "{}@{}",
         workspace_ref.checkout_id,
@@ -4300,7 +4324,12 @@ pub fn set_view_tab_host_scoped_sync(
     scope_key: &str,
 ) -> Result<(), String> {
     let host_label = sanitize_view_host_label(&request.host_label)?;
-    if !host_label.eq(MAIN_WINDOW_LABEL) && !host_label.starts_with("workbench-") {
+    if let Some(surface) = crate::unity_embed_webview::snapshot().into_iter().find(|s| s.label == host_label) {
+        if view_workspace_scope_key(&surface.workspace_ref) != scope_key {
+            return Err("Embedded View host belongs to a different checkout runtime".into());
+        }
+    }
+    if !is_view_workbench_window(&host_label) {
         let mut scopes = view_host_scopes()
             .lock()
             .map_err(|_| "View host scope registry is unavailable".to_string())?;
@@ -4599,6 +4628,12 @@ fn focus_view_host_window(
 
 
 
+pub(crate) fn is_view_workbench_window(label: &str) -> bool {
+    label == MAIN_WINDOW_LABEL
+        || label.starts_with("workbench-")
+        || crate::workspace_window::is_workspace_window(label)
+}
+
 pub async fn open_view_in_workbench(
     app_handle: &AppHandle,
     working_dir: &str,
@@ -4621,12 +4656,12 @@ pub async fn open_view_in_workbench_on_window(
     let host_url = view_host_url_for_tab_id_scoped(&id, &workspace_ref);
     let windows = app_handle.webview_windows();
     let label = target_label
-        .filter(|label| (*label == MAIN_WINDOW_LABEL || label.starts_with("workbench-")) && windows.contains_key(*label))
+        .filter(|label| (is_view_workbench_window(label) && windows.contains_key(*label)) || crate::unity_embed_webview::matches_workspace(label, &workspace_ref))
         .map(str::to_string)
         .or_else(|| windows
         .iter()
         .find_map(|(label, window)| {
-            let is_workbench = label == MAIN_WINDOW_LABEL || label.starts_with("workbench-");
+            let is_workbench = is_view_workbench_window(label);
             (is_workbench && window.is_focused().unwrap_or(false)).then(|| label.clone())
         }))
         .or_else(|| {
@@ -4637,7 +4672,7 @@ pub async fn open_view_in_workbench_on_window(
         .or_else(|| {
             windows
                 .keys()
-                .find(|label| label.starts_with("workbench-"))
+                .find(|label| is_view_workbench_window(label))
                 .cloned()
         })
         .ok_or_else(|| "Workbench window is unavailable.".to_string())?;
@@ -4657,9 +4692,8 @@ pub async fn open_view_in_workbench_on_window(
     }
 
 
-    let window = app_handle
-        .get_webview_window(&label)
-        .ok_or_else(|| format!("Workbench window is unavailable: {label}"))?;
+    let window = app_handle.get_webview_window(&label);
+    if window.is_none() && !crate::unity_embed_webview::matches_workspace(&label, &workspace_ref) { return Err(format!("Workbench window is unavailable: {label}")); }
     app_handle
         .emit_to(
             &label,
@@ -4676,8 +4710,7 @@ pub async fn open_view_in_workbench_on_window(
             }),
         )
         .map_err(|error| format!("Failed to open View in Workbench: {error}"))?;
-    let _ = window.show();
-    let _ = window.set_focus();
+    if let Some(window) = window { let _ = window.show(); let _ = window.set_focus(); }
 
     Ok(ViewRunResult {
         id,
@@ -6017,6 +6050,48 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
+    #[test]
+    fn view_open_accepts_workspace_and_shared_workbench_windows() {
+        for label in ["main", "workspace-app-project", "workbench-shared-child"] {
+            assert!(super::is_view_workbench_window(label), "{label}");
+            assert_eq!(super::sanitize_view_host_label(label).unwrap(), label);
+        }
+        for label in ["settings", "workspace-page-assets", "view-log"] {
+            assert!(!super::is_view_workbench_window(label), "{label}");
+        }
+    }
+
+    #[test]
+    fn view_metadata_update_preserves_source_and_identity() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_str().unwrap();
+        let component = "<script setup>const value = 42;</script>\n<template><main>{{ value }}</main></template>\n";
+        let detail = super::create_view_sync_with_scope(working_dir, super::ViewCreateRequest {
+            id: "metadata-test".into(), name: Some("Original".into()),
+            component: Some(component.into()), ..Default::default()
+        }, false).unwrap();
+        let updated = super::update_view_metadata_sync(working_dir, super::ViewUpdateMetadataRequest {
+            view_id: detail.summary.id.clone(), name: " Renamed ".into(), icon: Some("Settings2".into()),
+        }).unwrap();
+        assert_eq!(updated.id, detail.summary.id);
+        assert_eq!(updated.package_root, detail.summary.package_root);
+        assert_eq!(updated.display_path, detail.summary.display_path);
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(updated.icon.as_deref(), Some("Settings2"));
+        let source_path = PathBuf::from(&updated.manifest_path);
+        let raw = std::fs::read_to_string(&source_path).unwrap();
+        assert!(raw.contains("const value = 42;"));
+        assert!(raw.contains("<main>{{ value }}</main>"));
+        assert!(super::update_view_metadata_sync(working_dir, super::ViewUpdateMetadataRequest {
+            view_id: updated.id.clone(), name: "Invalid change".into(), icon: Some("x".repeat(40_000)),
+        }).is_err());
+        assert_eq!(std::fs::read_to_string(&source_path).unwrap(), raw);
+        let cleared = super::update_view_metadata_sync(working_dir, super::ViewUpdateMetadataRequest {
+            view_id: updated.id, name: updated.name, icon: None,
+        }).unwrap();
+        assert_eq!(cleared.icon.as_deref(), Some("View"));
+    }
+
     fn default_test_view_package_root(working_dir: &str) -> PathBuf {
         PathBuf::from(working_dir)
             .join(VIEW_ROOT_RELATIVE)
@@ -6178,6 +6253,7 @@ mod tests {
         assert_eq!(view.source, "pluginProject");
         assert_eq!(view.api_version, LEGACY_VIEW_API_VERSION);
         assert_eq!(view.plugin_id.as_deref(), Some("com.example.view-plugin"));
+        assert_eq!(view.plugin_name.as_deref(), Some("Plugin Views"));
         assert_eq!(
             view.plugin_scope,
             Some(crate::plugin::PluginInstallScope::Project)
@@ -6239,6 +6315,11 @@ mod tests {
         )
         .expect_err("plugin views should not be renamed directly");
         assert!(rename_error.contains("managed by plugin"));
+
+        let config_error = super::update_view_metadata_sync(&working_dir, super::ViewUpdateMetadataRequest {
+            view_id: moved_view.id.clone(), name: "Renamed".into(), icon: Some("Settings".into()),
+        }).expect_err("plugin metadata remains plugin managed");
+        assert!(config_error.contains("managed by plugin"));
     }
 
     #[test]
@@ -7646,7 +7727,11 @@ pub async fn request_frontend_execution(app_handle: &AppHandle, working_dir: &st
     if code.len() > 256 * 1024 { return Err("Frontend code exceeds 256 KiB".to_string()); }
     let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
     let label = window_label.unwrap_or(MAIN_WINDOW_LABEL);
-    let window = app_handle.get_webview_window(label).ok_or_else(|| format!("Locus window is not open: {label}"))?;
+    let native = crate::unity_embed_webview::snapshot().into_iter().find(|surface| surface.label == label);
+    if let Some(surface) = &native {
+        if surface.workspace_ref != workspace_ref { return Err("Frontend target belongs to another workspace generation".into()); }
+    }
+    if native.is_none() && app_handle.get_webview_window(label).is_none() { return Err(format!("Locus window is not open: {label}")); }
     let store = app_handle.state::<Arc<ViewAutomationStore>>();
     let request_id = format!("frontend-{}", uuid::Uuid::new_v4());
     let (tx, mut rx) = tokio::sync::oneshot::channel();
@@ -7655,7 +7740,7 @@ pub async fn request_frontend_execution(app_handle: &AppHandle, working_dir: &st
     let event = serde_json::json!({ "requestId": request_id, "code": code, "workspaceRef": workspace_ref, "targetLabel": label, "timeoutMs": timeout_ms });
     let started = Instant::now();
     loop {
-        if let Err(error) = window.emit("locus-frontend-request", event.clone()) { store.cancel(&request_id); return Err(error.to_string()); }
+        if let Err(error) = app_handle.emit_to(label, "locus-frontend-request", event.clone()) { store.cancel(&request_id); return Err(error.to_string()); }
         match tokio::time::timeout(Duration::from_millis(200), &mut rx).await {
             Ok(Ok(reply)) => return if reply.ok { Ok(reply.result.unwrap_or(serde_json::Value::Null)) } else { Err(reply.error.unwrap_or_else(|| "Frontend execution failed".to_string())) },
             Ok(Err(_)) => { store.cancel(&request_id); return Err("Frontend response channel closed".to_string()); },
@@ -7668,6 +7753,15 @@ pub async fn request_frontend_execution(app_handle: &AppHandle, working_dir: &st
 #[cfg(target_os = "windows")]
 pub async fn capture_frontend_window(app_handle: &AppHandle, label: &str, clip: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
     use base64::Engine as _;
+    if crate::unity_embed_webview::contains(label) {
+        let mut params = serde_json::json!({ "format": "png", "fromSurface": true, "captureBeyondViewport": false });
+        if let Some(clip) = clip { params["clip"] = clip; }
+        let payload = crate::unity_embed_webview::devtools(app_handle, label, "Page.captureScreenshot", params).await?;
+        let data = payload["data"].as_str().ok_or("Screenshot response did not include image data")?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?;
+        let dimensions = png_dimensions(&bytes);
+        return Ok(serde_json::json!({ "data": data, "mimeType": "image/png", "width": dimensions.map(|v| v.0), "height": dimensions.map(|v| v.1) }));
+    }
     use webview2_com::{ CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR, Microsoft::Web::WebView2::Win32::ICoreWebView2 };
     let window = app_handle.get_webview_window(label).ok_or_else(|| format!("Locus window not found: {label}"))?;
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();

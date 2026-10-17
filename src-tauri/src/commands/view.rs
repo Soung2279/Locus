@@ -8,7 +8,7 @@ use crate::view::{
     complete_view_automation_request, create_view_folder_sync, create_view_sync_with_scope,
     delete_view_entry_sync, emit_view_reload_for_scope,
     emit_view_tree_changed_for_scope, export_view_package_sync, import_view_package_sync, list_view_tree_sync, list_views_sync, move_view_entry_sync, open_view_frontend_log_sync,
-    open_view_unity_embed_window, parse_view_create_request, read_view_frontend_log_sync,
+    parse_view_create_request, read_view_frontend_log_sync,
     read_view_sync, reload_view_sync, rename_view_entry_sync, set_view_tab_host_scoped_sync,
     view_fs_access as view_fs_access_impl,
     view_fs_append_file as view_fs_append_file_impl, view_fs_copy_file as view_fs_copy_file_impl,
@@ -197,6 +197,22 @@ pub async fn view_export_package(
 }
 
 #[tauri::command]
+pub async fn view_update_metadata(
+    request: crate::view::ViewUpdateMetadataRequest,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, ProjectRegistry>,
+    app_handle: AppHandle,
+) -> Result<ViewPackageSummary, AppError> {
+    let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
+    let summary = crate::view::update_view_metadata_sync(&view_scope_root(&scope), request)
+        .map_err(AppError::from)?;
+    let event_scope = crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime());
+    emit_view_reload_for_scope(&app_handle, &event_scope, &summary);
+    emit_view_tree_changed_for_scope(&app_handle, &event_scope);
+    Ok(summary)
+}
+
+#[tauri::command]
 pub async fn view_import_package(
     request: ViewImportPackageRequest,
     workspace_ref: WorkspaceRef,
@@ -231,11 +247,20 @@ pub async fn view_reload(
     registry: State<'_, ProjectRegistry>,
     app_handle: AppHandle,
 ) -> Result<ViewPackageSummary, AppError> {
+    view_reload_borrowed(view_id, workspace_ref, registry, &app_handle).await
+}
+
+pub(crate) async fn view_reload_borrowed(
+    view_id: String,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, ProjectRegistry>,
+    app_handle: &AppHandle,
+) -> Result<ViewPackageSummary, AppError> {
     let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
     let working_dir = view_scope_root(&scope);
     let summary = reload_view_sync(&working_dir, &view_id).map_err(AppError::from)?;
     emit_view_reload_for_scope(
-        &app_handle,
+        app_handle,
         &crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime()),
         &summary,
     );
@@ -254,7 +279,10 @@ pub async fn view_run(
     let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
     let working_dir = view_scope_root(&scope);
     if let Some(label) = window_label.as_deref() {
-        if (label != "main" && !label.starts_with("workbench-")) || app_handle.get_webview_window(label).is_none() {
+        if !crate::unity_embed_webview::matches_workspace(label, &workspace_ref)
+            && (!crate::view::is_view_workbench_window(label)
+                || app_handle.get_webview_window(label).is_none())
+        {
             return Err(AppError::from(format!("Workbench window is unavailable: {label}")));
         }
     }
@@ -270,9 +298,8 @@ pub async fn view_run_in_unity(
     registry: State<'_, ProjectRegistry>,
     app_handle: AppHandle,
 ) -> Result<ViewRunResult, AppError> {
-    let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    let working_dir = view_scope_root(&scope);
-    open_view_unity_embed_window(&app_handle, &working_dir, &view_id)
+    let _scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
+    crate::native_view::open(&app_handle, workspace_ref, &view_id)
         .await
         .map_err(Into::into)
 }
@@ -284,11 +311,7 @@ pub async fn view_set_tab_host(
     registry: State<'_, ProjectRegistry>,
 ) -> Result<(), AppError> {
     let _scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    let scope_key = format!(
-        "{}@{}",
-        workspace_ref.checkout_id,
-        workspace_ref.expected_generation.unwrap_or_default()
-    );
+    let scope_key = crate::view::view_workspace_scope_key(&workspace_ref);
     set_view_tab_host_scoped_sync(request, &scope_key).map_err(Into::into)
 }
 

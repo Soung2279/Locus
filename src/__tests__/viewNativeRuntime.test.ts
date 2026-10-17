@@ -6,6 +6,7 @@ import { compileViewPackageSource, scopeViewCss } from "../components/view/viewC
 import { createViewRuntimeComponent, type ViewRuntimeApi } from "../components/view/viewRuntime";
 import { createViewExecutionScope } from "../components/view/viewExecutionScope";
 import type { ViewPackageDetail } from "../services/view";
+import * as ipc from "../services/ipc";
 
 const apps: App[] = [];
 afterEach(() => { apps.splice(0).forEach((app) => app.unmount()); document.body.innerHTML = ""; vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -31,6 +32,38 @@ function mount(component: ReturnType<typeof prepare>["component"], pinia = creat
 }
 
 describe("native View runtime", () => {
+  it("shares scoped document editing between runtime imports, view and locus", async () => {
+    let content = "---\nlevel: 1\n---\n# Character\n";
+    let revision = "1";
+    vi.spyOn(ipc, "ipcInvoke").mockImplementation(async (command, args) => {
+      expect(args?.workspaceRef).toEqual(workspaceRef);
+      if (command === "view_document_write") {
+        const request = args!.request as { content: string; expectedRevision: string };
+        expect(request.expectedRevision).toBe(revision);
+        content = request.content; revision = "2";
+      } else expect(command).toBe("view_document_read");
+      return { reference: { kind: "workspace", path: "Docs/role.md" }, path: "F:/project/Docs/role.md", content, revision, readOnly: false, reservedKeys: [] };
+    });
+    const pkg = detail(`<script setup lang="ts">
+      import { ref } from "vue";
+      import { documents, view } from "@locus/view-runtime";
+      import { locus } from "@locus/frontend";
+      const result = ref("ready");
+      async function save() {
+        if (documents !== view.documents || documents !== locus.documents) throw new Error("Different document SDK instances");
+        const doc = await documents.read(documents.workspace("Docs/role.md"));
+        const saved = await documents.setProperties(doc.reference, { level: 2 }, { expectedRevision: doc.revision });
+        result.value = String(saved.properties.level);
+      }
+    </script><template><button @click="save">{{ result }}</button></template>`);
+    const prepared = prepare(pkg);
+    const { root } = mount(prepared.component);
+    root.querySelector("button")!.click();
+    await vi.waitFor(() => expect(root.querySelector("button")!.textContent).toBe("2"));
+    expect(content).toBe("---\nlevel: 2\n---\n# Character\n");
+    prepared.scope.dispose();
+  });
+
   it("mounts a single Vue entry with inline metadata, native controls and scoped styles, without bootstrap or CSS files", async () => {
     const source = `<view>{"name":"Counter"}</view>
       <script setup lang="ts">

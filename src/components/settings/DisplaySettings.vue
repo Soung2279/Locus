@@ -11,6 +11,7 @@ import {
   type KnowledgeFolderKind,
   type MemoryFileOpenTarget,
   type PlanApprovalTarget,
+  type ViewOpenTarget,
   type WorkspaceDisplayMode,
   type WorkspaceSectionVisibilityKind,
 } from "../../composables/useDisplaySettings";
@@ -108,6 +109,11 @@ const planApprovalTargetOptions = computed(() => [
 const memoryFileOpenTargetOptions = computed(() => [
   { value: "window", label: t("settings.display.memoryFileOpenWindow") },
   { value: "knowledge", label: t("settings.display.memoryFileOpenKnowledge") },
+]);
+
+const viewOpenTargetOptions = computed(() => [
+  { value: "tab", label: t("settings.display.viewOpenTab") },
+  { value: "window", label: t("settings.display.viewOpenWindow") },
 ]);
 
 const assetRefClickActionOptions = computed(() => [
@@ -424,6 +430,18 @@ onMounted(async () => {
         @update:model-value="setDisplay('showViewsInSessionPanel', $event)"
       />
       <span>{{ t("settings.display.showViewsInSessionPanel") }}</span>
+    </div>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.viewOpenTarget") }}</span>
+      <BaseSegmented
+        class="choice-segmented"
+        :model-value="display.viewOpenTarget"
+        :options="viewOpenTargetOptions"
+        :aria-label="t('settings.display.viewOpenTarget')"
+        size="sm"
+        @update:model-value="setDisplay('viewOpenTarget', $event as ViewOpenTarget)"
+      />
     </div>
 
   </div>

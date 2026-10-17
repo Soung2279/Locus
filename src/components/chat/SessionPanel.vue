@@ -17,6 +17,7 @@ import {
 import { withInternalTreePreview } from "../explorer/internalTreePreview";
 import { AppWindow, Archive, Box, Check, ChevronRight, FileSearch, Folder, FolderInput, FolderOpen, FolderPlus, GitBranch, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, PencilLine, Save, Settings2, Sparkles, Trash2, X } from "lucide";
 import { t } from "../../i18n";
+import { nodeContainsPluginView, viewPluginAttribution } from "../view/viewTreeActions";
 import { buildSessionTree } from "./sessionTree";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseContextMenu from "../ui/BaseContextMenu.vue";
@@ -24,6 +25,9 @@ import LucideIcon from "../icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "../icons/locusViewIcons";
 import { formatShortcut, useKeyboardShortcuts } from "../../composables/useKeyboardShortcuts";
 import { normalizeAppError } from "../../services/errors";
+import { useOpenView } from "../../composables/useOpenView";
+import ViewResourceActions from "../view/ViewResourceActions.vue";
+import type { ViewResourceAction } from "../view/viewResourceActions";
 import {
   checkViewOpenRequirements,
   normalizeViewError,
@@ -32,7 +36,6 @@ import {
   viewMoveEntry,
   viewRenameEntry,
   viewRequiresUnityConnection,
-  viewRun,
   viewRunInUnity,
   viewTree,
   viewUnityConnectionRequiredError,
@@ -176,6 +179,15 @@ function persistExpandedState() {
 
 const { state: shortcutState } = useKeyboardShortcuts();
 const notificationStore = useNotificationStore();
+const openViewPackage = useOpenView();
+const viewResourceActions = ref<InstanceType<typeof ViewResourceActions> | null>(null);
+async function runViewResourceAction(action: ViewResourceAction) {
+  const menu = viewCtxMenu.value;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (menu?.kind !== "view" || !menu.node.view || !workspaceRef) return;
+  closeViewContextMenu();
+  await viewResourceActions.value?.run(action, { view: menu.node.view, workspaceRef });
+}
 const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
 const newChatTitle = computed(() =>
@@ -562,7 +574,7 @@ async function openView(view: ViewPackageSummary) {
       notifyViewOpenError(requirementError);
       return;
     }
-    await viewRun(workspaceRef, view.id);
+    await openViewPackage(workspaceRef, view.id);
   } catch (error) {
     const err = normalizeViewError(error, { viewName: view.name });
     notificationStore.addNotice("error", err.message, {
@@ -714,6 +726,7 @@ async function submitViewCreateFolder() {
 async function beginRenameViewEntry() {
   const menu = viewCtxMenu.value;
   if (!menu || menu.kind === "root") return;
+  if (nodeContainsPluginView(menu.node)) return;
   closeViewCreateFolder();
   viewDeleteConfirm.value = null;
   viewRenameDraft.value = {
@@ -823,6 +836,7 @@ async function submitMoveViewEntry(targetDirRelPath: string) {
 function requestDeleteViewEntry() {
   const menu = viewCtxMenu.value;
   if (!menu || menu.kind === "root") return;
+  if (nodeContainsPluginView(menu.node)) return;
   viewDeleteConfirm.value = {
     x: menu.x,
     y: menu.y,
@@ -2100,6 +2114,7 @@ function ctxArchive() {
       </Transition>
     </Teleport>
 
+    <ViewResourceActions ref="viewResourceActions" @changed="loadViews" />
     <BaseContextMenu
       v-if="viewCtxMenu"
       class="sp-ctx-menu"
@@ -2110,16 +2125,25 @@ function ctxArchive() {
     >
       <template v-if="viewCtxMenu.kind === 'root' || viewCtxMenu.kind === 'folder'">
         <button type="button" class="sp-ctx-item" @click="beginCreateViewFolder"><LucideIcon :icon="FolderPlus" :size="13" />{{ t('view.tree.createFolder') }}</button>
-        <div v-if="viewCtxMenu.kind === 'folder'" class="sp-ctx-sep"></div>
+        <div
+          v-if="viewCtxMenu.kind === 'folder' && (!nodeContainsPluginView(viewCtxMenu.node) || viewMoveTargets.length)"
+          class="sp-ctx-sep"
+        ></div>
       </template>
       <button
-        v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'"
+        v-if="(viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view') && !nodeContainsPluginView(viewCtxMenu.node)"
         type="button"
         class="sp-ctx-item"
         @click.stop="beginRenameViewEntry"
       >
         <LucideIcon :icon="PencilLine" :size="13" />
         {{ t('view.tree.rename') }}
+      </button>
+      <button v-if="viewCtxMenu.kind === 'view'" type="button" @click="runViewResourceAction('configure')">
+        <LucideIcon :icon="Settings2" :size="13" />{{ t('view.config.title') }}
+      </button>
+      <button v-if="viewCtxMenu.kind === 'view' && !nodeContainsPluginView(viewCtxMenu.node)" type="button" @click="runViewResourceAction('export')">
+        <LucideIcon :icon="Save" :size="13" />{{ t('view.action.export') }}
       </button>
       <button
         v-if="(viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view') && viewMoveTargets.length"
@@ -2130,7 +2154,10 @@ function ctxArchive() {
         <LucideIcon :icon="FolderInput" :size="13" />
         {{ t('view.tree.moveTo') }}
       </button>
-      <div v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'" class="sp-ctx-sep"></div>
+      <div
+        v-if="viewCtxMenu.kind === 'view' && (!nodeContainsPluginView(viewCtxMenu.node) || viewMoveTargets.length)"
+        class="sp-ctx-sep"
+      ></div>
       <button
         v-if="viewCtxMenu.kind === 'view'"
         type="button"
@@ -2149,9 +2176,18 @@ function ctxArchive() {
         <LucideIcon :icon="FolderOpen" :size="13" />
         {{ t('view.action.reveal') }}
       </button>
-      <div v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'" class="sp-ctx-sep"></div>
+      <div
+        v-if="viewCtxMenu.kind === 'view' || (viewCtxMenu.kind === 'folder' && !nodeContainsPluginView(viewCtxMenu.node))"
+        class="sp-ctx-sep"
+      ></div>
+      <div
+        v-if="viewCtxMenu.kind === 'view' && viewPluginAttribution(viewCtxMenu.node.view)"
+        class="base-context-menu-label"
+      >
+        {{ viewPluginAttribution(viewCtxMenu.node.view) }}
+      </div>
       <button
-        v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'"
+        v-if="(viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view') && !nodeContainsPluginView(viewCtxMenu.node)"
         type="button"
         class="sp-ctx-item danger"
         @click.stop="requestDeleteViewEntry"

@@ -9,7 +9,6 @@ import { getLocusRuntime, type RuntimeUnsubscribe } from "../../services/locusRu
 import {
   checkViewOpenRequirements,
   normalizeViewError,
-  viewRun,
   viewTree,
   type ViewFolderSummary,
   type ViewPackageSummary,
@@ -23,6 +22,7 @@ import {
 import LucideIcon from "../icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "../icons/locusViewIcons";
 import { useWorkspaceEventScope } from "../../composables/useWorkspaceEventScope";
+import { useOpenView } from "../../composables/useOpenView";
 
 const workspaceEventSignal = useWorkspaceEventScope();
 
@@ -68,6 +68,7 @@ const open = ref(false);
 const pickerRef = ref<HTMLElement | null>(null);
 const { state: shortcutState } = useKeyboardShortcuts();
 const notificationStore = useNotificationStore();
+const openViewPackage = useOpenView();
 const workspaceContextStore = useWorkspaceContextStore();
 const viewSummaries = ref<ViewPackageSummary[]>([]);
 const viewFolders = ref<ViewFolderSummary[]>([]);
@@ -350,7 +351,7 @@ async function openView(view: ViewPackageSummary) {
       return;
     }
     open.value = false;
-    await viewRun(workspaceRef, view.id);
+    await openViewPackage(workspaceRef, view.id);
   } catch (error) {
     const err = normalizeViewError(error, { viewName: view.name });
     notificationStore.addNotice("error", err.message, {

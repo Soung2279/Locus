@@ -16,7 +16,6 @@ import { withInternalTreePreview } from "./explorer/internalTreePreview";
 import { VIEW_TREE_INTERNAL_DRAG_TYPE, viewWorkspaceDragReference, type ViewWorkspaceDragPayload } from "./view/viewWorkspaceDrag";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
-  Box,
   Check,
   ChevronRight,
   Download,
@@ -49,7 +48,6 @@ import {
   viewRead,
   viewRenameEntry,
   viewRequiresUnityConnection,
-  viewRun,
   viewRunInUnity,
   viewTree,
   type ViewFolderSummary,
@@ -63,6 +61,11 @@ import BaseButton from "./ui/BaseButton.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
 import { compileViewPackage } from "./view/viewCompilation";
 import { useWorkspaceEventScope } from "../composables/useWorkspaceEventScope";
+import { useOpenView } from "../composables/useOpenView";
+import ViewResourceMenuItems from "./view/ViewResourceMenuItems.vue";
+import ViewResourceActions from "./view/ViewResourceActions.vue";
+import type { ViewResourceAction } from "./view/viewResourceActions";
+import { nodeContainsPluginView } from "./view/viewTreeActions";
 
 const workspaceEventSignal = useWorkspaceEventScope();
 
@@ -137,6 +140,19 @@ const VIEW_TREE_INDENT_BASE_PX = 12;
 const VIEW_TREE_INDENT_STEP_PX = 20;
 
 const notificationStore = useNotificationStore();
+const openPreferredView = useOpenView();
+const viewResourceActions = ref<InstanceType<typeof ViewResourceActions> | null>(null);
+
+async function runViewResourceAction(action: ViewResourceAction) {
+  const menu = contextMenu.value;
+  if (menu?.kind !== "view" || !menu.node.view) return;
+  if (action === "rename") { await beginRenameFromContext(); return; }
+  if (action === "delete") { requestDeleteEntry(); return; }
+  if (action === "unity") { await openContextViewInUnity(); return; }
+  if (action === "export") { await exportViewPackageFromContext(); return; }
+  closeContextMenu();
+  await viewResourceActions.value?.run(action, { view: menu.node.view, workspaceRef: requireWorkspaceRef() });
+}
 const views = ref<ViewPackageSummary[]>([]);
 const folders = ref<ViewFolderSummary[]>([]);
 const treeOrder = ref<string[]>([]);
@@ -887,15 +903,6 @@ function viewNodeParentRelPath(node: ViewTreeNode): string {
   return viewPathDirname(node.relPath);
 }
 
-function isPluginView(view: ViewPackageSummary | null | undefined): boolean {
-  return !!view?.pluginId || !!view?.source?.startsWith("plugin");
-}
-
-function nodeContainsPluginView(node: ViewTreeNode): boolean {
-  if (node.kind === "view") return isPluginView(node.view);
-  return node.children.some(nodeContainsPluginView);
-}
-
 function contextNodeEditable(node: ViewTreeNode): boolean {
   return !nodeContainsPluginView(node);
 }
@@ -1209,7 +1216,7 @@ async function openViewPackage(view: ViewPackageSummary) {
       });
       return;
     }
-    await viewRun(requireWorkspaceRef(), view.id);
+    await openPreferredView(requireWorkspaceRef(), view.id);
   } catch (runError) {
     const err = normalizeViewError(runError, { viewName: view.name });
     notificationStore.addNotice("error", err.message, {
@@ -1683,80 +1690,31 @@ onUnmounted(() => {
         </section>
       </div>
 
+      <ViewResourceActions ref="viewResourceActions" @changed="loadViews" />
       <BaseContextMenu
         v-if="contextMenu"
         class="view-ctx-menu"
         :x="contextMenu.x"
         :y="contextMenu.y"
-        :min-width="132"
+        :min-width="156"
         @close="closeContextMenu"
       >
-            <template v-if="contextMenu.kind === 'root' || contextMenu.kind === 'folder'">
-              <button type="button" class="view-ctx-item" @click="importViewPackageFromContext">
-                <LucideIcon :icon="Upload" :size="13" />
-                {{ importing ? t("view.action.importing") : t("view.action.import") }}
-              </button>
-              <button type="button" class="view-ctx-item" @click="beginCreateFolderFromContext">
-                <LucideIcon :icon="FolderPlus" :size="13" />
-                {{ t("view.tree.createFolder") }}
-              </button>
-              <div class="view-ctx-sep"></div>
-            </template>
-            <button
-              v-if="
-                (contextMenu.kind === 'folder' || contextMenu.kind === 'view') &&
-                contextNodeEditable(contextMenu.node)
-              "
-              type="button"
-              class="view-ctx-item"
-              @click.stop="beginRenameFromContext"
-            >
-              <LucideIcon :icon="PencilLine" :size="13" />
-              {{ t("view.tree.rename") }}
-            </button>
-            <div
-              v-if="
-                (contextMenu.kind === 'folder' || contextMenu.kind === 'view') &&
-                contextNodeEditable(contextMenu.node)
-              "
-              class="view-ctx-sep"
-            ></div>
-            <button
-              v-if="contextMenu.kind === 'view'"
-              type="button"
-              class="view-ctx-item"
-              @click.stop="openContextViewInUnity"
-            >
-              <LucideIcon :icon="Box" :size="13" />
-              {{ t("view.action.openInUnity") }}
-            </button>
-            <button
-              v-if="contextMenu.kind === 'view'"
-              type="button"
-              class="view-ctx-item"
-              :disabled="!!exportingViewId"
-              @click.stop="exportViewPackageFromContext"
-            >
-              <LucideIcon :icon="Download" :size="13" />
-              {{
-                exportingViewId === contextMenu.node.view?.id
-                  ? t("view.action.exporting")
-                  : t("view.action.export")
-              }}
-            </button>
-            <div v-if="contextMenu.kind === 'view'" class="view-ctx-sep"></div>
-            <button
-              v-if="
-                (contextMenu.kind === 'folder' || contextMenu.kind === 'view') &&
-                contextNodeEditable(contextMenu.node)
-              "
-              type="button"
-              class="view-ctx-item danger"
-              @click.stop="requestDeleteEntry"
-            >
-              <LucideIcon :icon="Trash2" :size="13" />
-              {{ t("view.tree.delete") }}
-            </button>
+        <ViewResourceMenuItems v-if="contextMenu.kind === 'view' && contextMenu.node.view"
+          :view="contextMenu.node.view" :busy="!!exportingViewId || running"
+          @action="runViewResourceAction" />
+        <template v-else>
+          <button type="button" @click="importViewPackageFromContext">
+            <LucideIcon :icon="Upload" :size="13" />{{ importing ? t('view.action.importing') : t('view.action.import') }}
+          </button>
+          <button type="button" @click="beginCreateFolderFromContext">
+            <LucideIcon :icon="FolderPlus" :size="13" />{{ t('view.tree.createFolder') }}
+          </button>
+          <template v-if="contextMenu.kind === 'folder' && contextNodeEditable(contextMenu.node)">
+            <div class="base-context-menu-separator" />
+            <button type="button" @click="beginRenameFromContext"><LucideIcon :icon="PencilLine" :size="13" />{{ t('view.tree.rename') }}</button>
+            <button type="button" class="danger" @click="requestDeleteEntry"><LucideIcon :icon="Trash2" :size="13" />{{ t('view.tree.delete') }}</button>
+          </template>
+        </template>
       </BaseContextMenu>
 
       <Teleport to="body">

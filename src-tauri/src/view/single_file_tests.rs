@@ -131,6 +131,32 @@ fn single_file_metadata_and_create_overrides_stay_in_the_vue_file() {
 }
 
 #[test]
+fn single_file_svg_icon_survives_create_reload_rename_and_export_import() {
+    let workspace = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let output = tempdir().unwrap();
+    let dir = workspace.path().to_str().unwrap();
+    let svg = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M2 2l20 20"/></svg>"#;
+    let mut input = request("svg-icon.vue");
+    input.icon = Some(svg.into());
+    let created = create_view_sync(dir, input).unwrap();
+    assert_eq!(created.summary.icon.as_deref(), Some(svg));
+    let raw = std::fs::read_to_string(Path::new(&created.summary.package_root).join("svg-icon.vue")).unwrap();
+    assert_eq!(single_file::metadata(&raw).unwrap().icon.as_deref(), Some(svg));
+    set_view_manifest_name(&created.summary.package_root, "SVG Icon").unwrap();
+    assert_eq!(reload_view_sync(dir, "svg-icon").unwrap().icon.as_deref(), Some(svg));
+    let archive = export_view_package_sync(dir, ViewExportPackageRequest {
+        view_id: "svg-icon".into(),
+        file_path: output.path().join("svg-icon.zip").to_string_lossy().into(),
+    }).unwrap();
+    let imported = import_view_package_sync(destination.path().to_str().unwrap(), ViewImportPackageRequest {
+        file_path: archive,
+        target_dir_rel_path: None,
+    }).unwrap();
+    assert_eq!(imported.summary.icon.as_deref(), Some(svg));
+}
+
+#[test]
 fn single_file_export_import_and_plugin_copy_preserve_one_source_file() {
     let workspace = tempdir().unwrap();
     let destination = tempdir().unwrap();

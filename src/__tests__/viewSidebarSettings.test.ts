@@ -104,7 +104,7 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain("view-package-reloaded");
     expect(service).toContain("icon?: string | null;");
     expect(frontendSdk).toContain("request: viewService.ViewCreateRequest");
-    expect(icons).toContain("InspectionPanel");
+    expect(icons).toContain("LOCUS_VIEW_ICON_LIBRARY = icons");
   });
 
   it("renders the View management page as a directory tree", () => {

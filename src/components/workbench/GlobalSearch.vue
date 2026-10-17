@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from "vue";
-import { Search, Settings2, X } from "lucide";
+import { Search, ListFilter, X } from "lucide";
 import { locale, t } from "../../i18n";
 import { formatRelativeDate } from "../../composables/useFormatters";
 import { useGlobalSearch } from "../../composables/useGlobalSearch";
 import { useGlobalSearchSettings } from "../../composables/useGlobalSearchSettings";
-import { globalSearchHitKey, searchHighlightParts, type GlobalSearchResult, type GlobalSearchTarget } from "../../services/globalSearch";
+import { useGlobalSearchShortcut } from "../../composables/useSearchScope";
+import { GLOBAL_SEARCH_SOURCES, globalSearchHitKey, searchHighlightParts, type GlobalSearchResult, type GlobalSearchTarget } from "../../services/globalSearch";
 import { normalizeAppError } from "../../services/errors";
 import BaseButton from "../ui/BaseButton.vue";
+import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 
 const props = defineProps<{
@@ -16,17 +18,26 @@ const props = defineProps<{
   ownerWindow?: Window;
   openResult: (result: GlobalSearchResult) => Promise<void>;
 }>();
-const emit = defineEmits<{ settings: [] }>();
 const owner = props.ownerWindow ?? window;
-const { state: settings } = useGlobalSearchSettings();
+const { state: settings, set } = useGlobalSearchSettings();
 const { results, searching, hasMore, errors, search, cancel, loadMore, empty } = useGlobalSearch();
 const visible = ref(false);
+useGlobalSearchShortcut(owner, {
+  enabled: () => props.active && settings.enabled,
+  open: () => { void show(); },
+});
 const query = ref("");
 const composing = ref(false);
 const opening = ref(false);
 const openError = ref("");
 const input = ref<HTMLInputElement | null>(null);
 const panel = ref<HTMLElement | null>(null);
+const filterTrigger = ref<HTMLElement | null>(null);
+const filterPanel = ref<HTMLElement | null>(null);
+const filtersOpen = ref(false);
+const filterStyle = ref({ left: "0px", top: "0px", maxHeight: "0px" });
+const filterId = useId();
+const filtered = computed(() => GLOBAL_SEARCH_SOURCES.some((source) => !settings[source]) || !settings.includeArchived);
 const scroll = ref<HTMLElement | null>(null);
 const scrollTop = ref(0);
 const selectedKey = ref("");
@@ -40,7 +51,7 @@ let previousFocus: HTMLElement | null = null;
 const keyOf = (hit: GlobalSearchResult) => hit.target.projectId + globalSearchHitKey(hit);
 const selectedIndex = computed(() => Math.max(0, results.value.findIndex((hit) => keyOf(hit) === selectedKey.value)));
 const selected = computed(() => results.value[selectedIndex.value]);
-const hasScope = computed(() => settings.knowledgeTitle || settings.knowledgeContent || settings.sessionTitle || settings.sessionContent);
+const hasScope = computed(() => GLOBAL_SEARCH_SOURCES.some((source) => settings[source]));
 const showProjectName = computed(() => new Set(props.targets.map((target) => target.projectId)).size > 1);
 const MAX_RESULTS_HEIGHT = 432;
 const RESULT_HEIGHT = 54;
@@ -71,6 +82,7 @@ const activeDescendant = computed(() => visibleRows.value.some((row) => row.inde
   ? `${listId}-${selectedIndex.value}` : undefined);
 function categoryLabel(hit: GlobalSearchResult): string {
   if (hit.kind === "session") return t("globalSearch.session");
+  if (hit.kind === "file" || hit.kind === "view") return t(`globalSearch.${hit.kind}`);
   return hit.docType ? t(`knowledge.type.${hit.docType}`) : t("globalSearch.knowledge");
 }
 const resultParts = computed(() => visibleRows.value.map((row) => {
@@ -127,6 +139,7 @@ watch(visible, (open) => {
 });
 
 async function show() {
+  closeFilters();
   if (!visible.value) {
     previousFocus = owner.document.activeElement as HTMLElement | null;
     visible.value = true;
@@ -139,10 +152,36 @@ async function show() {
 function close(restoreFocus = true) {
   if (!visible.value) return;
   visible.value = false;
+  closeFilters();
   cancel();
   if (restoreFocus && previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
 }
-function openSettings() { close(false); emit("settings"); }
+function positionFilters() {
+  const anchor = filterTrigger.value?.getBoundingClientRect();
+  if (!anchor) return;
+  const width = Math.min(272, owner.innerWidth - 32);
+  const top = anchor.bottom + 8;
+  filterStyle.value = {
+    left: `${Math.max(8, Math.min(anchor.right - width, owner.innerWidth - width - 8))}px`,
+    top: `${top}px`,
+    maxHeight: `${Math.max(0, owner.innerHeight - top - 8)}px`,
+  };
+}
+function closeFilters(restoreFocus = false) {
+  filtersOpen.value = false;
+  if (restoreFocus) filterTrigger.value?.querySelector("button")?.focus();
+}
+async function toggleFilters() {
+  if (filtersOpen.value) { closeFilters(); return; }
+  positionFilters();
+  filtersOpen.value = true;
+  await nextTick();
+  filterPanel.value?.querySelector<HTMLButtonElement>('[role="checkbox"]')?.focus();
+}
+function resetFilters() {
+  for (const source of GLOBAL_SEARCH_SOURCES) set(source, true);
+  set("includeArchived", true);
+}
 async function select(hit = selected.value) {
   if (!hit || opening.value || composing.value) return;
   opening.value = true;
@@ -176,12 +215,12 @@ function movePage(direction: number) {
 }
 function onKeydown(event: KeyboardEvent) {
   if (!props.active || !settings.enabled || event.isComposing || event.keyCode === 229) return;
-  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "f") {
-    event.preventDefault(); event.stopImmediatePropagation(); void show(); return;
-  }
   if (!visible.value) return;
   if (event.key === "Escape") {
-    event.preventDefault(); event.stopImmediatePropagation(); close(); return;
+    event.preventDefault(); event.stopImmediatePropagation();
+    if (filtersOpen.value) closeFilters(true);
+    else close();
+    return;
   }
   if (event.target !== input.value) return;
   if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -195,12 +234,17 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 function onOutside(event: Event) {
-  if (visible.value && !event.composedPath().includes(panel.value!)) close(false);
+  if (!visible.value) return;
+  const path = event.composedPath();
+  if (path.includes(filterPanel.value!) || path.includes(filterTrigger.value!)) return;
+  if (filtersOpen.value) closeFilters();
+  if (!path.includes(panel.value!)) close(false);
 }
 onMounted(() => {
   owner.addEventListener("keydown", onKeydown, true);
   owner.addEventListener("pointerdown", onOutside, true);
   owner.addEventListener("focusin", onOutside);
+  owner.addEventListener("resize", positionFilters);
 });
 onUnmounted(() => {
   cancel();
@@ -208,6 +252,7 @@ onUnmounted(() => {
   owner.removeEventListener("keydown", onKeydown, true);
   owner.removeEventListener("pointerdown", onOutside, true);
   owner.removeEventListener("focusin", onOutside);
+  owner.removeEventListener("resize", positionFilters);
 });
 </script>
 
@@ -221,9 +266,13 @@ onUnmounted(() => {
           :aria-activedescendant="activeDescendant"
           :aria-label="t('settings.tab.globalSearch')" :placeholder="t('globalSearch.placeholder')"
           @compositionstart="composing = true" @compositionend="composing = false" />
-        <BaseButton class="search-icon-button" :aria-label="t('globalSearch.settings')" :title="t('globalSearch.settings')" @click="openSettings">
-          <LucideIcon :icon="Settings2" :size="16" />
-        </BaseButton>
+        <span ref="filterTrigger" class="search-filter-trigger">
+          <BaseButton class="search-icon-button search-filter-button" :class="{ filtered }"
+            :aria-label="t('globalSearch.filters')" :title="t('globalSearch.filters')" aria-haspopup="dialog"
+            :aria-expanded="filtersOpen" :aria-controls="filtersOpen ? filterId : undefined" @click="toggleFilters">
+            <LucideIcon :icon="ListFilter" :size="16" />
+          </BaseButton>
+        </span>
         <BaseButton class="search-icon-button" :aria-label="t('globalSearch.close')" :title="t('globalSearch.close')" @click="close()">
           <LucideIcon :icon="X" :size="18" />
         </BaseButton>
@@ -259,6 +308,21 @@ onUnmounted(() => {
         </template>
       </div>
     </section>
+    <section v-if="visible && filtersOpen" :id="filterId" ref="filterPanel" class="search-filter-panel"
+      :style="filterStyle" role="dialog" :aria-label="t('globalSearch.filters')">
+      <div class="search-filter-heading">
+        <span>{{ t('globalSearch.filters') }}</span>
+        <BaseButton :disabled="!filtered" @click="resetFilters">{{ t('globalSearch.resetFilters') }}</BaseButton>
+      </div>
+      <label v-for="source in GLOBAL_SEARCH_SOURCES" :key="source" class="search-filter-option">
+        <BaseCheckbox :model-value="settings[source]" :aria-label="t(`globalSearch.${source}`)" @update:model-value="set(source, $event)" />
+        <span>{{ t(`globalSearch.${source}`) }}</span>
+      </label>
+      <label class="search-filter-option search-filter-archived">
+        <BaseCheckbox :model-value="settings.includeArchived" :aria-label="t('globalSearch.includeArchived')" @update:model-value="set('includeArchived', $event)" />
+        <span>{{ t('globalSearch.includeArchived') }}</span>
+      </label>
+    </section>
   </Teleport>
 </template>
 
@@ -269,6 +333,14 @@ onUnmounted(() => {
 .search-input::placeholder { color: var(--text-secondary); }
 .search-icon-button { width: 28px; height: 28px; padding: 4px; border-color: transparent; }
 .search-icon-button:focus-visible { outline: 1px solid var(--accent-color); }
+.search-filter-trigger { display: flex; }
+.search-filter-button.filtered { color: var(--accent-color); }
+.search-filter-button[aria-expanded="true"] { background: var(--hover-bg); border-color: var(--border-strong); }
+.search-filter-panel { position: fixed; z-index: 1801; box-sizing: border-box; width: min(272px, calc(100vw - 32px)); padding: 8px; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--panel-bg); color: var(--text-color); box-shadow: 0 8px 24px color-mix(in srgb, var(--text-color) 12%, transparent); font-size: 12px; }
+.search-filter-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 6px 6px; font-weight: 500; }
+.search-filter-option { display: flex; align-items: center; gap: 8px; padding: 7px 6px; border-radius: 4px; cursor: pointer; }
+.search-filter-option:hover { background: var(--hover-bg); }
+.search-filter-archived { margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--border-color); border-radius: 0; }
 .search-results { display: flex; flex-direction: column; min-height: 0; overflow: hidden; border-top: 1px solid var(--border-color); }
 .search-scroll { overflow-x: hidden; overflow-y: auto; min-height: 0; flex: 0 1 auto; overscroll-behavior: contain; overflow-anchor: none; }
 .search-list { position: relative; }

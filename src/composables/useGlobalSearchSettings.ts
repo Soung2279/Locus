@@ -1,10 +1,11 @@
 import { reactive, readonly } from "vue";
 import type { GlobalSearchSource } from "../services/globalSearch";
 
-export type GlobalSearchSettings = Record<GlobalSearchSource | "enabled", boolean>;
+export type GlobalSearchSettings = Record<GlobalSearchSource | "enabled" | "includeArchived", boolean>;
 const STORAGE_KEY = "locus-global-search-settings";
 const defaults: GlobalSearchSettings = {
   enabled: true, knowledgeTitle: true, knowledgeContent: true, sessionTitle: true, sessionContent: true,
+  fileName: true, viewName: true, includeArchived: true,
 };
 export function normalizeGlobalSearchSettings(value: unknown): GlobalSearchSettings {
   const record = value && typeof value === "object" ? value as Partial<GlobalSearchSettings> : {};

@@ -29,10 +29,65 @@ beforeEach(() => {
   }));
   const { set } = useGlobalSearchSettings();
   for (const field of ["enabled", "knowledgeTitle", "knowledgeContent", "sessionTitle", "sessionContent"] as const) set(field, true);
+  set("fileName", false); set("viewName", false); set("includeArchived", true);
 });
 afterEach(() => { apps.splice(0).forEach((app) => app.unmount()); document.body.replaceChildren(); vi.useRealTimers(); });
 
 describe("global search keyboard interaction", () => {
+  it("filters files and views in place, persists changes, and closes filters before search", async () => {
+    const { set } = useGlobalSearchSettings();
+    set("fileName", true); set("viewName", true);
+    vi.mocked(searchGlobalPage).mockImplementation(async request => ({
+      matches: request.source === "fileName" || request.source === "viewName" ? [{
+        kind: request.source === "fileName" ? "file" : "view", id: request.source, title: `Shader ${request.source}`,
+        excerpt: "Assets/Shader.vue", field: "title", docType: null, path: "Assets/Shader.vue", messageId: null, archived: false, modifiedAt: 1_700_000_000_000,
+      }] : [], nextCursor: null,
+    }));
+    const props = mount(); key("f", { ctrlKey: true }); await nextTick();
+    const input = document.querySelector<HTMLInputElement>(".search-input")!;
+    input.value = "shader"; input.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(120); await nextTick();
+    expect([...document.querySelectorAll(".search-result-category")].map(row => row.textContent)).toEqual(["globalSearch.file", "globalSearch.view"]);
+    const trigger = document.querySelector<HTMLButtonElement>(".search-filter-button")!;
+    trigger.click(); await nextTick();
+    const checkbox = document.querySelector<HTMLButtonElement>('.search-filter-panel [aria-label="globalSearch.fileName"]')!;
+    expect(document.querySelector(".global-search")).not.toBeNull();
+    checkbox.focus(); checkbox.click(); await vi.advanceTimersByTimeAsync(120); await nextTick();
+    expect(document.querySelector(".search-filter-panel")).not.toBeNull();
+    expect([...document.querySelectorAll(".search-result-category")].map(row => row.textContent)).toEqual(["globalSearch.view"]);
+    expect(JSON.parse(localStorage.getItem("locus-global-search-settings")!).fileName).toBe(false);
+    expect(trigger.classList.contains("filtered")).toBe(true);
+    key("Escape"); await nextTick();
+    expect(document.querySelector(".search-filter-panel")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(document.querySelector(".global-search")).not.toBeNull();
+    input.focus(); key("Enter"); await vi.advanceTimersByTimeAsync(0);
+    expect(props.openResult).toHaveBeenCalledWith(expect.objectContaining({ kind: "view", id: "viewName" }));
+  });
+
+  it("keeps the query when clearing all sources and resets filters without leaving search", async () => {
+    mount(); key("f", { ctrlKey: true }); await nextTick();
+    const input = document.querySelector<HTMLInputElement>(".search-input")!;
+    input.value = "shader"; input.dispatchEvent(new Event("input", { bubbles: true }));
+    const trigger = document.querySelector<HTMLButtonElement>(".search-filter-button")!;
+    trigger.click(); await nextTick();
+    for (const option of document.querySelectorAll<HTMLButtonElement>('.search-filter-panel [aria-checked="true"]')) option.click();
+    await vi.advanceTimersByTimeAsync(120); await nextTick();
+    expect(input.value).toBe("shader");
+    expect(document.querySelector(".search-state")?.textContent).toBe("globalSearch.noScope");
+    document.querySelector<HTMLButtonElement>(".search-filter-heading button")!.click();
+    await vi.advanceTimersByTimeAsync(120); await nextTick();
+    expect(document.querySelectorAll('.search-filter-panel [aria-checked="true"]')).toHaveLength(7);
+    expect(trigger.classList.contains("filtered")).toBe(false);
+    expect(document.querySelector(".search-result")).not.toBeNull();
+    input.dispatchEvent(new Event("pointerdown", { bubbles: true })); await nextTick();
+    expect(document.querySelector(".search-filter-panel")).toBeNull();
+    expect(document.querySelector(".global-search")).not.toBeNull();
+    trigger.click(); await nextTick();
+    document.body.dispatchEvent(new Event("pointerdown", { bubbles: true })); await nextTick();
+    expect(document.querySelector(".search-filter-panel")).toBeNull();
+    expect(document.querySelector(".global-search")).toBeNull();
+  });
   it("identifies sessions and every document category with text, including untyped documents", async () => {
     const types = ["design", "plan", "memory", "skill", "reference", null] as const;
     vi.mocked(searchGlobalPage).mockImplementation(async (request) => ({

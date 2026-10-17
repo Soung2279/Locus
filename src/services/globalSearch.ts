@@ -2,9 +2,10 @@ import { ipcInvoke } from "./ipc";
 import type { WorkspaceRef } from "./project";
 import type { KnowledgeDocumentType } from "../types";
 
-export type GlobalSearchSource = "knowledgeTitle" | "knowledgeContent" | "sessionTitle" | "sessionContent";
+export const GLOBAL_SEARCH_SOURCES = ["knowledgeTitle", "knowledgeContent", "sessionTitle", "sessionContent", "fileName", "viewName"] as const;
+export type GlobalSearchSource = typeof GLOBAL_SEARCH_SOURCES[number];
 export interface GlobalSearchHit {
-  kind: "knowledge" | "session";
+  kind: "knowledge" | "session" | "file" | "view";
   id: string;
   title: string;
   /** Matching content when available; otherwise a short document/message preview. */

@@ -17,6 +17,8 @@ use std::{
 };
 use tauri::{AppHandle, State};
 
+mod resources;
+
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GlobalSearchSource {
@@ -24,6 +26,8 @@ pub enum GlobalSearchSource {
     KnowledgeContent,
     SessionTitle,
     SessionContent,
+    FileName,
+    ViewName,
 }
 
 #[derive(Serialize)]
@@ -83,6 +87,9 @@ pub async fn global_search(
         GlobalSearchSource::KnowledgeTitle | GlobalSearchSource::KnowledgeContent
     );
     let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    if is_knowledge && !crate::workspace::knowledge_enabled(&working_dir) {
+        return Ok(GlobalSearchPage { matches: Vec::new(), next_cursor: None });
+    }
     let db_path = if is_knowledge {
         let index = scope
             .runtime()
@@ -107,6 +114,15 @@ pub async fn global_search(
     let permit = WORKERS.acquire().await.map_err(|e| e.to_string())?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        match source {
+            GlobalSearchSource::FileName => return resources::search_files_page(
+                std::path::Path::new(&working_dir), &query, cursor.as_deref(),
+            ),
+            GlobalSearchSource::ViewName => return resources::search_views_page(
+                &working_dir, &query, cursor.as_deref(),
+            ),
+            _ => {}
+        }
         if let Some(path) = db_path {
             return search_knowledge_page(
                 &path,

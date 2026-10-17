@@ -5,7 +5,8 @@ import { normalizeGlobalSearchSettings } from "../composables/useGlobalSearchSet
 import { searchHighlightParts, type GlobalSearchHit, type GlobalSearchPage, type GlobalSearchRequest, type GlobalSearchTarget } from "../services/globalSearch";
 
 const targets: GlobalSearchTarget[] = ["a", "b"].map((id) => ({ projectId: id, projectName: id, workspaceRef: { checkoutId: id, expectedGeneration: 1 } }));
-const all = normalizeGlobalSearchSettings(null);
+const defaults = normalizeGlobalSearchSettings(null);
+const all = { ...defaults, fileName: false, viewName: false };
 const titleOnly = { ...all, knowledgeContent: false, sessionContent: false };
 function hit(id: string, kind: "session" | "knowledge" = "session"): GlobalSearchHit {
   return { id, kind, title: id, excerpt: id, field: "title", docType: null, path: null, messageId: null, archived: false, modifiedAt: 1_700_000_000_000 };
@@ -19,6 +20,36 @@ beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
 
 describe("global search scheduling", () => {
+  it("searches files and views independently across projects and honors the archived filter", async () => {
+    const fetch = vi.fn(async (request: GlobalSearchRequest): Promise<GlobalSearchPage> => ({
+      matches: [{ ...hit("shared-id"), kind: request.source === "fileName" ? "file" : request.source === "viewName" ? "view" : "session" }], nextCursor: null,
+    }));
+    const search = useGlobalSearch(fetch);
+    search.search("character", targets, { ...defaults, knowledgeTitle: false, knowledgeContent: false, sessionContent: false, includeArchived: false });
+    await vi.advanceTimersByTimeAsync(120);
+    expect(fetch).toHaveBeenCalledTimes(6);
+    expect(fetch.mock.calls.every(([request]) => !request.archived)).toBe(true);
+    expect(search.results.value).toHaveLength(6);
+    expect(new Set(search.results.value.map(result => result.kind))).toEqual(new Set(["file", "view", "session"]));
+    search.search("character", targets, { ...defaults, knowledgeTitle: false, knowledgeContent: false, sessionTitle: false, sessionContent: false, fileName: false });
+    await vi.advanceTimersByTimeAsync(120);
+    expect(search.results.value).toHaveLength(2);
+    expect(search.results.value.every(result => result.kind === "view")).toBe(true);
+  });
+
+  it("does not publish an in-flight file response after its filter is disabled", async () => {
+    const old = deferred<GlobalSearchPage>();
+    const fetch = vi.fn((request: GlobalSearchRequest) => request.source === "fileName" ? old.promise : Promise.resolve({ matches: [], nextCursor: null }));
+    const search = useGlobalSearch(fetch);
+    search.search("character", targets, defaults);
+    await vi.advanceTimersByTimeAsync(120);
+    search.search("character", targets, { ...defaults, fileName: false });
+    await vi.advanceTimersByTimeAsync(120);
+    old.resolve({ matches: [{ ...hit("stale"), kind: "file" }], nextCursor: "stale-page" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(search.results.value).toEqual([]);
+    expect(fetch.mock.calls.filter(([request]) => request.source === "fileName")).toHaveLength(1);
+  });
   it("combines title and content hits for the same document without merging different projects", async () => {
     const fetch = vi.fn(async (request: GlobalSearchRequest): Promise<GlobalSearchPage> => ({
       matches: [{ ...hit("shared-id", "knowledge"), field: request.source === "knowledgeTitle" ? "title" : "content", excerpt: request.source }],
@@ -123,7 +154,8 @@ describe("literal highlighting and settings", () => {
     expect(searchHighlightParts(text, ".*")).toEqual([{ text, match: false }]);
   });
   it("restores missing settings without converting invalid strings into booleans", () => {
-    expect(normalizeGlobalSearchSettings({ enabled: false, sessionContent: "false" })).toEqual({ ...all, enabled: false });
-    expect(normalizeGlobalSearchSettings(null)).toEqual(all);
+    expect(normalizeGlobalSearchSettings({ enabled: false, sessionContent: "false" })).toEqual({ ...defaults, enabled: false });
+    expect(normalizeGlobalSearchSettings(null)).toEqual(defaults);
+    expect(normalizeGlobalSearchSettings({ knowledgeTitle: false })).toMatchObject({ knowledgeTitle: false, fileName: true, viewName: true, includeArchived: true });
   });
 });

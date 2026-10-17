@@ -5,10 +5,12 @@ import BaseButton from "../ui/BaseButton.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import {
   detectShortcutPlatform,
+  createDefaultShortcutSettings,
   formatShortcut,
   formatShortcutParts,
   parseShortcutEvent,
   useKeyboardShortcuts,
+  type ShortcutDefinition,
   type ShortcutAction,
 } from "../../composables/useKeyboardShortcuts";
 import {
@@ -53,6 +55,13 @@ const runningSendModeOptions = computed(() => [
 ]);
 
 const shortcutRows = computed(() => [
+  ...(["findInContext", "globalSearch"] as const).map((action) => ({
+    action,
+    title: t(`settings.shortcuts.${action}Title`),
+    desc: t(`settings.shortcuts.${action}Desc`),
+    chords: [formatShortcutParts(state[action])],
+    titleText: formatShortcut(state[action]),
+  })),
   {
     action: "newChat" as const,
     title: t("settings.shortcuts.newChatTitle"),
@@ -88,6 +97,7 @@ function stopRecording() {
 
 function handleRecordKeydown(action: ShortcutAction, event: KeyboardEvent) {
   if (!isRecording(action)) return;
+  if (event.isComposing || event.keyCode === 229) return;
 
   if (event.key === "Escape" && action !== "cancelRun") {
     event.preventDefault();
@@ -104,12 +114,27 @@ function handleRecordKeydown(action: ShortcutAction, event: KeyboardEvent) {
     return;
   }
 
+  const conflict = conflictingAction(action, shortcut);
+  if (conflict) {
+    captureError.value = t("settings.shortcuts.conflict", conflict.title);
+    return;
+  }
   setShortcut(action, shortcut);
-  captureError.value = "";
-  recordingAction.value = null;
+  stopRecording();
+}
+
+function conflictingAction(action: ShortcutAction, shortcut: ShortcutDefinition) {
+  return shortcutRows.value.find((row) => row.action !== action
+    && formatShortcut(state[row.action]) === formatShortcut(shortcut));
 }
 
 function handleReset(action: ShortcutAction) {
+  const conflict = conflictingAction(action, createDefaultShortcutSettings()[action]);
+  if (conflict) {
+    captureError.value = t("settings.shortcuts.conflict", conflict.title);
+    return;
+  }
+  captureError.value = "";
   resetShortcut(action);
   if (isRecording(action)) {
     stopRecording();
@@ -186,6 +211,7 @@ function handleReset(action: ShortcutAction) {
             class="shortcut-btn"
             type="button"
             @click="startRecording(row.action)"
+            :data-shortcut-recording="isRecording(row.action) ? 'true' : undefined"
             @keydown="handleRecordKeydown(row.action, $event)"
             @blur="isRecording(row.action) ? stopRecording() : undefined"
           >

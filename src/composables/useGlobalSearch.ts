@@ -1,9 +1,10 @@
 import { computed, shallowRef } from "vue";
 import { normalizeAppError } from "../services/errors";
-import { globalSearchHitKey, searchGlobalPage, type GlobalSearchResult, type GlobalSearchTarget, type GlobalSearchRequest, type GlobalSearchSource } from "../services/globalSearch";
+import { GLOBAL_SEARCH_SOURCES, globalSearchHitKey, searchGlobalPage, type GlobalSearchResult, type GlobalSearchTarget, type GlobalSearchRequest, type GlobalSearchSource } from "../services/globalSearch";
 import type { GlobalSearchSettings } from "./useGlobalSearchSettings";
 
-type Family = "knowledge" | "session";
+const families = ["knowledge", "session", "file", "view"] as const;
+type Family = typeof families[number];
 interface Lane { source: GlobalSearchSource; archived: boolean; cursor: string | null; target: GlobalSearchTarget }
 interface Run {
   query: string;
@@ -23,7 +24,7 @@ export function useGlobalSearch(fetchPage = searchGlobalPage) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   // Serialize each family even across query changes. A burst of typing cannot
   // fill the Rust worker queue with obsolete searches.
-  const tails: Record<Family, Promise<void>> = { knowledge: Promise.resolve(), session: Promise.resolve() };
+  const tails: Record<Family, Promise<void>> = { knowledge: Promise.resolve(), session: Promise.resolve(), file: Promise.resolve(), view: Promise.resolve() };
 
   function cancel() {
     clearTimeout(timer);
@@ -79,7 +80,7 @@ export function useGlobalSearch(fetchPage = searchGlobalPage) {
   }
   function resume(current: Run) {
     searching.value = true;
-    const tasks = (["knowledge", "session"] as const).map((family) => {
+    const tasks = families.map((family) => {
       tails[family] = tails[family].then(() => scan(current, family));
       return tails[family];
     });
@@ -93,18 +94,18 @@ export function useGlobalSearch(fetchPage = searchGlobalPage) {
     errors.value = [];
     const text = query.trim();
     if (!settings.enabled || !targets.length || !text || text.length > 200) return;
-    const lanes: Run["lanes"] = { knowledge: [], session: [] };
-    for (const source of ["knowledgeTitle", "knowledgeContent", "sessionTitle", "sessionContent"] as const) {
+    const lanes: Run["lanes"] = { knowledge: [], session: [], file: [], view: [] };
+    for (const source of GLOBAL_SEARCH_SOURCES) {
       if (!settings[source]) continue;
-      const family = source.startsWith("knowledge") ? "knowledge" : "session";
+      const family: Family = source.startsWith("knowledge") ? "knowledge" : source.startsWith("session") ? "session" : source === "fileName" ? "file" : "view";
       for (const value of targets) {
         const target = { ...value, workspaceRef: { ...value.workspaceRef } };
         lanes[family].push({ source, archived: false, cursor: null, target });
-        if (family === "session") lanes[family].push({ source, archived: true, cursor: null, target });
+        if (family === "session" && settings.includeArchived) lanes[family].push({ source, archived: true, cursor: null, target });
       }
     }
-    if (!lanes.knowledge.length && !lanes.session.length) return;
-    const current: Run = { query: text, lanes, hits: { knowledge: [], session: [] }, ordered: [], keys: new Set(), limit: 40 };
+    if (!families.some((family) => lanes[family].length)) return;
+    const current: Run = { query: text, lanes, hits: { knowledge: [], session: [], file: [], view: [] }, ordered: [], keys: new Set(), limit: 40 };
     run = current;
     searching.value = true;
     timer = setTimeout(() => resume(current), 120);

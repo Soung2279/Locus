@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 
-export type ShortcutAction = "newChat" | "cancelRun";
+export type ShortcutAction = "newChat" | "cancelRun" | "findInContext" | "globalSearch";
 export type ShortcutPlatform = "default" | "mac";
 
 export interface ShortcutDefinition {
@@ -36,6 +36,8 @@ function snapshotSettings(settings: ShortcutSettings): ShortcutSettings {
   return {
     newChat: cloneShortcut(settings.newChat),
     cancelRun: cloneShortcut(settings.cancelRun),
+    findInContext: cloneShortcut(settings.findInContext),
+    globalSearch: cloneShortcut(settings.globalSearch),
   };
 }
 
@@ -51,6 +53,8 @@ export function createDefaultShortcutSettings(
 ): ShortcutSettings {
   const useMeta = platform === "mac";
   return {
+    findInContext: { ctrl: !useMeta, meta: useMeta, alt: false, shift: false, key: "f" },
+    globalSearch: { ctrl: !useMeta, meta: useMeta, alt: false, shift: true, key: "f" },
     newChat: {
       ctrl: !useMeta,
       meta: useMeta,
@@ -98,6 +102,8 @@ function normalizeShortcutSettings(raw: unknown): ShortcutSettings {
   return {
     newChat: normalizeShortcut(record.newChat, defaults.newChat),
     cancelRun: normalizeShortcut(record.cancelRun, defaults.cancelRun, false),
+    findInContext: normalizeShortcut(record.findInContext, defaults.findInContext),
+    globalSearch: normalizeShortcut(record.globalSearch, defaults.globalSearch),
   };
 }
 
@@ -122,6 +128,13 @@ function saveShortcutSettings(settings: ShortcutSettings) {
 }
 
 const state = reactive<ShortcutSettings>(loadShortcutSettings());
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key !== STORAGE_KEY) return;
+    try { Object.assign(state, normalizeShortcutSettings(JSON.parse(event.newValue ?? "null"))); }
+    catch { /* Ignore invalid settings from another window. */ }
+  });
+}
 
 function keyLabel(key: string): string {
   switch (key) {
